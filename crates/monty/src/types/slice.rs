@@ -12,8 +12,8 @@ use crate::{
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings, StringId},
-    resource::ResourceTracker,
-    types::{AttrCallResult, PyTrait, Type},
+    resource::{ResourceError, ResourceTracker},
+    types::{AttrCallResult, PyTrait, ReprError, Type},
     value::Value,
 };
 
@@ -214,8 +214,13 @@ impl PyTrait for Slice {
         None
     }
 
-    fn py_eq(&self, other: &Self, _heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
-        self.start == other.start && self.stop == other.stop && self.step == other.step
+    fn py_eq(
+        &self,
+        other: &Self,
+        _heap: &mut Heap<impl ResourceTracker>,
+        _interns: &Interns,
+    ) -> Result<bool, ResourceError> {
+        Ok(self.start == other.start && self.stop == other.stop && self.step == other.step)
     }
 
     fn py_bool(&self, _heap: &Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
@@ -229,14 +234,15 @@ impl PyTrait for Slice {
         _heap: &Heap<impl ResourceTracker>,
         _heap_ids: &mut AHashSet<HeapId>,
         _interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         f.write_str("slice(")?;
         format_option_i64(f, self.start)?;
         f.write_str(", ")?;
         format_option_i64(f, self.stop)?;
         f.write_str(", ")?;
         format_option_i64(f, self.step)?;
-        f.write_char(')')
+        f.write_char(')')?;
+        Ok(())
     }
 
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {

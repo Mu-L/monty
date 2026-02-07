@@ -3,13 +3,13 @@ use std::fmt::Write;
 use ahash::AHashSet;
 use hashbrown::HashTable;
 
-use super::{MontyIter, PyTrait};
+use super::{MontyIter, PyTrait, ReprError};
 use crate::{
     args::ArgValues,
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings},
-    resource::ResourceTracker,
+    resource::{ResourceError, ResourceTracker},
     types::Type,
     value::{EitherStr, Value},
 };
@@ -126,9 +126,9 @@ impl SetStorage {
         };
 
         // Check if value already exists
-        let existing = self
-            .indices
-            .find(hash, |&idx| value.py_eq(&self.entries[idx].value, heap, interns));
+        let existing = self.indices.find(hash, |&idx| {
+            value.py_eq(&self.entries[idx].value, heap, interns).unwrap_or(false)
+        });
 
         if existing.is_some() {
             // Value already in set, drop the new value
@@ -154,7 +154,7 @@ impl SetStorage {
 
         let entry = self.indices.entry(
             hash,
-            |&idx| value.py_eq(&self.entries[idx].value, heap, interns),
+            |&idx| value.py_eq(&self.entries[idx].value, heap, interns).unwrap_or(false),
             |&idx| self.entries[idx].hash,
         );
 
@@ -237,7 +237,9 @@ impl SetStorage {
 
         Ok(self
             .indices
-            .find(hash, |&idx| value.py_eq(&self.entries[idx].value, heap, interns))
+            .find(hash, |&idx| {
+                value.py_eq(&self.entries[idx].value, heap, interns).unwrap_or(false)
+            })
             .is_some())
     }
 
@@ -265,19 +267,30 @@ impl SetStorage {
     }
 
     /// Compares two sets for equality.
-    fn eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         if self.len() != other.len() {
-            return false;
+            return Ok(false);
         }
 
-        // Check that every element in self is in other
-        for entry in &self.entries {
-            match other.contains(&entry.value, heap, interns) {
-                Ok(true) => {}
-                _ => return false,
+        // Guard against deep nesting (non-cyclic structures that would overflow stack)
+        heap.try_inc_data_recursion()?;
+        let result = (|| {
+            // Check that every element in self is in other
+            for entry in &self.entries {
+                match other.contains(&entry.value, heap, interns) {
+                    Ok(true) => {}
+                    _ => return Ok(false),
+                }
             }
-        }
-        true
+            Ok(true)
+        })();
+        heap.dec_data_recursion();
+        result
     }
 
     /// Returns true if this set is a subset of other.
@@ -401,10 +414,14 @@ impl SetStorage {
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
         type_name: &str,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         if self.is_empty() {
-            return write!(f, "{type_name}()");
+            write!(f, "{type_name}()")?;
+            return Ok(());
         }
+
+        // Guard against deep nesting (non-cyclic structures that would overflow stack)
+        let _guard = heap.enter_data_recursion()?;
 
         // frozenset needs type prefix: frozenset({...}), but set doesn't: {...}
         let needs_prefix = type_name != "set";
@@ -591,7 +608,12 @@ impl PyTrait for Set {
         Some(self.len())
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         self.0.eq(&other.0, heap, interns)
     }
 
@@ -609,7 +631,7 @@ impl PyTrait for Set {
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         self.0.repr_fmt(f, heap, heap_ids, interns, "set")
     }
 
@@ -1094,7 +1116,12 @@ impl PyTrait for FrozenSet {
         Some(self.len())
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         self.0.eq(&other.0, heap, interns)
     }
 
@@ -1112,7 +1139,7 @@ impl PyTrait for FrozenSet {
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         self.0.repr_fmt(f, heap, heap_ids, interns, "frozenset")
     }
 

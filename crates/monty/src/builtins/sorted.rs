@@ -55,7 +55,7 @@ pub fn builtin_sorted(heap: &mut Heap<impl ResourceTracker>, args: ArgValues, in
     for i in 1..items.len() {
         let mut j = i;
         while j > 0 {
-            match items[j - 1].py_cmp(&items[j], heap, interns) {
+            match items[j - 1].py_cmp(&items[j], heap, interns)? {
                 Some(Ordering::Greater) => {
                     items.swap(j - 1, j);
                     j -= 1;

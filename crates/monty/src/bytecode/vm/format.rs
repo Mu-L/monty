@@ -18,7 +18,7 @@ impl<T: ResourceTracker, P: PrintWriter> VM<'_, T, P> {
 
         for part in parts {
             // Each part should be a string (interned or heap-allocated)
-            let part_str = part.py_str(self.heap, self.interns);
+            let part_str = part.py_str(self.heap, self.interns)?;
             result.push_str(&part_str);
             part.drop_with_heap(self.heap);
         }
@@ -78,17 +78,17 @@ impl<T: ResourceTracker, P: PrintWriter> VM<'_, T, P> {
                 0 => format_with_spec(&value, &spec, self.heap, self.interns),
                 // !s - convert to str, format as string
                 1 => {
-                    let s = value.py_str(self.heap, self.interns);
+                    let s = value.py_str(self.heap, self.interns)?;
                     format_string(&s, &spec).map_err(Into::into)
                 }
                 // !r - convert to repr, format as string
                 2 => {
-                    let s = value.py_repr(self.heap, self.interns);
+                    let s = value.py_repr(self.heap, self.interns)?;
                     format_string(&s, &spec).map_err(Into::into)
                 }
                 // !a - convert to ascii, format as string
                 3 => {
-                    let s = ascii_escape(&value.py_repr(self.heap, self.interns));
+                    let s = ascii_escape(&value.py_repr(self.heap, self.interns)?);
                     format_string(&s, &spec).map_err(Into::into)
                 }
                 _ => format_with_spec(&value, &spec, self.heap, self.interns),
@@ -109,11 +109,11 @@ impl<T: ResourceTracker, P: PrintWriter> VM<'_, T, P> {
         } else {
             // No format spec - just convert based on conversion flag
             match conversion {
-                0 => value.py_str(self.heap, self.interns).into_owned(),
-                1 => value.py_str(self.heap, self.interns).into_owned(),
-                2 => value.py_repr(self.heap, self.interns).into_owned(),
-                3 => ascii_escape(&value.py_repr(self.heap, self.interns)),
-                _ => value.py_str(self.heap, self.interns).into_owned(),
+                0 => value.py_str(self.heap, self.interns)?.into_owned(),
+                1 => value.py_str(self.heap, self.interns)?.into_owned(),
+                2 => value.py_repr(self.heap, self.interns)?.into_owned(),
+                3 => ascii_escape(&value.py_repr(self.heap, self.interns)?),
+                _ => value.py_str(self.heap, self.interns)?.into_owned(),
             }
         };
 
@@ -137,7 +137,7 @@ impl<T: ResourceTracker, P: PrintWriter> VM<'_, T, P> {
             }
             _ => {
                 // Dynamic format spec - parse the string
-                let spec_str = spec_value.py_str(self.heap, self.interns);
+                let spec_str = spec_value.py_str(self.heap, self.interns)?;
                 spec_str.parse::<ParsedFormatSpec>().map_err(|invalid| {
                     // Only fetch type in error path
                     let value_type = value_for_error.py_type(self.heap);

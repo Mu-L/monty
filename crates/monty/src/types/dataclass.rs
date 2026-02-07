@@ -2,14 +2,14 @@ use std::fmt::Write;
 
 use ahash::AHashSet;
 
-use super::{Dict, PyTrait};
+use super::{Dict, PyTrait, ReprError};
 use crate::{
     args::ArgValues,
     defer_drop,
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapId},
     intern::{Interns, StringId},
-    resource::ResourceTracker,
+    resource::{ResourceError, ResourceTracker},
     types::{AttrCallResult, Type},
     value::{EitherStr, Value},
 };
@@ -207,9 +207,14 @@ impl PyTrait for Dataclass {
         None
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         // Dataclasses are equal if they have the same name and equal attrs
-        self.name == other.name && self.attrs.py_eq(&other.attrs, heap, interns)
+        Ok(self.name == other.name && self.attrs.py_eq(&other.attrs, heap, interns)?)
     }
 
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
@@ -228,7 +233,10 @@ impl PyTrait for Dataclass {
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
+        // Guard against deep nesting (non-cyclic structures that would overflow stack)
+        let _guard = heap.enter_data_recursion()?;
+
         // Format: ClassName(field1=value1, field2=value2, ...)
         // Only declared fields are shown, not dynamically added attributes
         f.write_str(self.name(interns))?;
@@ -254,7 +262,8 @@ impl PyTrait for Dataclass {
             }
         }
 
-        f.write_char(')')
+        f.write_char(')')?;
+        Ok(())
     }
 
     fn py_call_attr(

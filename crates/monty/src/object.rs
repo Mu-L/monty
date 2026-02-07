@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt::{self, Write},
     hash::{Hash, Hasher},
 };
@@ -395,7 +396,10 @@ impl MontyObject {
                         Self::from_value_inner(inner, heap, visited, interns)
                     }
                     HeapData::Closure(..) | HeapData::FunctionDefaults(..) => {
-                        Self::Repr(object.py_repr(heap, interns).into_owned())
+                        let repr = object
+                            .py_repr(heap, interns)
+                            .map_or_else(|_| "<...>".to_owned(), Cow::into_owned);
+                        Self::Repr(repr)
                     }
                     HeapData::Range(range) => {
                         // Represent Range as a repr string since MontyObject doesn't have a Range variant
@@ -469,7 +473,12 @@ impl MontyObject {
             Value::Builtin(Builtins::Function(f)) => Self::BuiltinFunction(*f),
             #[cfg(feature = "ref-count-panic")]
             Value::Dereferenced => panic!("Dereferenced found while converting to MontyObject"),
-            _ => Self::Repr(object.py_repr(heap, interns).into_owned()),
+            _ => {
+                let repr = object
+                    .py_repr(heap, interns)
+                    .map_or_else(|_| "<...>".to_owned(), Cow::into_owned);
+                Self::Repr(repr)
+            }
         }
     }
 

@@ -350,3 +350,21 @@ assert lst == ['X', 'y', 'z'], 'setitem with False'
 lst = ['x', 'y', 'z']
 lst[True] = 'Y'
 assert lst == ['x', 'Y', 'z'], 'setitem with True'
+
+# === Self-referential structures ===
+# Cycle detection in repr
+x = []
+x.append(x)
+assert repr(x) == '[[...]]', 'self-referential list repr shows ellipsis'
+
+# Self-referential equality uses identity short-circuit
+x = []
+x.append(x)
+assert x == x, 'self-referential list equals itself (identity)'
+
+# Nested self-reference
+x = []
+y = [x]
+x.append(y)
+assert repr(x) == '[[[...]]]', 'nested self-ref shows ellipsis at cycle point'
+assert x == x, 'nested self-ref equals itself'

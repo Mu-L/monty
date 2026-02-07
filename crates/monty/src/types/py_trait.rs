@@ -7,7 +7,7 @@
 /// The trait is designed to work with `enum_dispatch` for efficient virtual
 /// dispatch on `HeapData` without boxing overhead.
 use std::borrow::Cow;
-use std::{cmp::Ordering, fmt::Write};
+use std::{cmp::Ordering, fmt, fmt::Write};
 
 use ahash::AHashSet;
 
@@ -22,6 +22,31 @@ use crate::{
     resource::ResourceTracker,
     value::{EitherStr, Value},
 };
+
+/// Error type for repr operations that can fail due to recursion or formatting.
+///
+/// `py_repr_fmt` can fail due to either:
+/// - Formatting errors (writing to the output buffer)
+/// - Recursion depth exceeded (deeply nested but non-cyclic structures)
+#[derive(Debug)]
+pub enum ReprError {
+    /// A formatting error occurred while writing to the output.
+    Fmt(fmt::Error),
+    /// Maximum recursion depth was exceeded.
+    Recursion(ResourceError),
+}
+
+impl From<fmt::Error> for ReprError {
+    fn from(e: fmt::Error) -> Self {
+        Self::Fmt(e)
+    }
+}
+
+impl From<ResourceError> for ReprError {
+    fn from(e: ResourceError) -> Self {
+        Self::Recursion(e)
+    }
+}
 
 /// Result of calling an attribute method via `py_call_attr_raw`.
 ///
@@ -93,7 +118,15 @@ pub trait PyTrait {
     /// computation for dict key lookups.
     ///
     /// The `interns` parameter provides access to interned string content.
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool;
+    ///
+    /// # Errors
+    /// Returns `ResourceError::Recursion` if maximum recursion depth is exceeded.
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError>;
 
     /// Python comparison (`<`, `>`, etc.).
     ///
@@ -102,8 +135,16 @@ pub trait PyTrait {
     /// computation for dict key lookups.
     ///
     /// The `interns` parameter provides access to interned string content.
-    fn py_cmp(&self, _other: &Self, _heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> Option<Ordering> {
-        None
+    ///
+    /// # Errors
+    /// Returns `ResourceError::Recursion` if maximum recursion depth is exceeded.
+    fn py_cmp(
+        &self,
+        _other: &Self,
+        _heap: &mut Heap<impl ResourceTracker>,
+        _interns: &Interns,
+    ) -> Result<Option<Ordering>, ResourceError> {
+        Ok(None)
     }
 
     /// Pushes any contained `HeapId`s onto the stack for reference counting.
@@ -136,27 +177,46 @@ pub trait PyTrait {
     /// * `heap` - The heap for resolving value references
     /// * `heap_ids` - Set of heap IDs currently being repr'd (for cycle detection)
     /// * `interns` - The interned strings table for looking up string/bytes literals
+    ///
+    /// # Errors
+    /// Returns `ReprError::Fmt` on formatting errors, or `ReprError::Recursion` if
+    /// maximum recursion depth is exceeded (for deeply nested but non-cyclic structures).
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result;
+    ) -> Result<(), ReprError>;
 
     /// Returns the Python `repr()` string for this value.
     ///
     /// Convenience wrapper around `py_repr_fmt` that returns an owned string.
-    fn py_repr(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Cow<'static, str> {
+    ///
+    /// # Errors
+    /// Returns `ResourceError` if maximum recursion depth is exceeded.
+    fn py_repr(
+        &self,
+        heap: &Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<Cow<'static, str>, ResourceError> {
         let mut s = String::new();
         let mut heap_ids = AHashSet::new();
-        // Unwrap is safe: writing to String never fails
-        self.py_repr_fmt(&mut s, heap, &mut heap_ids, interns).unwrap();
-        Cow::Owned(s)
+        match self.py_repr_fmt(&mut s, heap, &mut heap_ids, interns) {
+            Ok(()) => Ok(Cow::Owned(s)),
+            Err(ReprError::Fmt(_)) => {
+                // Writing to String should never fail, but handle it gracefully
+                Ok(Cow::Borrowed("<repr error>"))
+            }
+            Err(ReprError::Recursion(e)) => Err(e),
+        }
     }
 
     /// Returns the Python `str()` string for this value.
-    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Cow<'static, str> {
+    ///
+    /// # Errors
+    /// Returns `ResourceError` if maximum recursion depth is exceeded.
+    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Result<Cow<'static, str>, ResourceError> {
         self.py_repr(heap, interns)
     }
 

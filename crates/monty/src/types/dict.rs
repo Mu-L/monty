@@ -7,13 +7,13 @@ use std::{
 use ahash::AHashSet;
 use hashbrown::{HashTable, hash_table::Entry};
 
-use super::{List, MontyIter, PyTrait, Tuple};
+use super::{List, MontyIter, PyTrait, ReprError, Tuple};
 use crate::{
     args::{ArgValues, KwargsValues},
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings},
-    resource::ResourceTracker,
+    resource::{ResourceError, ResourceTracker},
     types::Type,
     value::{EitherStr, Value},
 };
@@ -298,7 +298,7 @@ impl Dict {
 
         let entry = self.indices.entry(
             hash,
-            |v| key.py_eq(&self.entries[*v].key, heap, interns),
+            |v| key.py_eq(&self.entries[*v].key, heap, interns).unwrap_or(false),
             |index| self.entries[*index].hash,
         );
 
@@ -438,7 +438,9 @@ impl Dict {
 
         let opt_index = self
             .indices
-            .find(hash, |v| key.py_eq(&self.entries[*v].key, heap, interns))
+            .find(hash, |v| {
+                key.py_eq(&self.entries[*v].key, heap, interns).unwrap_or(false)
+            })
             .copied();
         Ok((opt_index, hash))
     }
@@ -501,23 +503,34 @@ impl PyTrait for Dict {
         Some(self.len())
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         if self.len() != other.len() {
-            return false;
+            return Ok(false);
         }
 
-        // Check that all keys in self exist in other with equal values
-        for entry in &self.entries {
-            match other.get(&entry.key, heap, interns) {
-                Ok(Some(other_v)) => {
-                    if !entry.value.py_eq(other_v, heap, interns) {
-                        return false;
+        // Guard against deep nesting (non-cyclic structures that would overflow stack)
+        heap.try_inc_data_recursion()?;
+        let result = (|| {
+            // Check that all keys in self exist in other with equal values
+            for entry in &self.entries {
+                match other.get(&entry.key, heap, interns) {
+                    Ok(Some(other_v)) => {
+                        if !entry.value.py_eq(other_v, heap, interns)? {
+                            return Ok(false);
+                        }
                     }
+                    _ => return Ok(false),
                 }
-                _ => return false,
             }
-        }
-        true
+            Ok(true)
+        })();
+        heap.dec_data_recursion();
+        result
     }
 
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
@@ -549,10 +562,14 @@ impl PyTrait for Dict {
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         if self.is_empty() {
-            return f.write_str("{}");
+            f.write_str("{}")?;
+            return Ok(());
         }
+
+        // Guard against deep nesting (non-cyclic structures that would overflow stack)
+        let _guard = heap.enter_data_recursion()?;
 
         f.write_char('{')?;
         let mut first = true;
@@ -565,7 +582,8 @@ impl PyTrait for Dict {
             f.write_str(": ")?;
             entry.value.py_repr_fmt(f, heap, heap_ids, interns)?;
         }
-        f.write_char('}')
+        f.write_char('}')?;
+        Ok(())
     }
 
     fn py_getitem(&self, key: &Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Value> {

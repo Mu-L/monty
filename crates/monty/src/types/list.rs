@@ -2,7 +2,7 @@ use std::{cmp::Ordering, fmt::Write};
 
 use ahash::AHashSet;
 
-use super::{MontyIter, PyTrait};
+use super::{MontyIter, PyTrait, ReprError};
 use crate::{
     args::ArgValues,
     builtins::Builtins,
@@ -287,16 +287,27 @@ impl PyTrait for List {
         Ok(())
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         if self.items.len() != other.items.len() {
-            return false;
+            return Ok(false);
         }
-        for (i1, i2) in self.items.iter().zip(&other.items) {
-            if !i1.py_eq(i2, heap, interns) {
-                return false;
+        // Guard against deep nesting - use manual inc/dec due to borrow conflicts with guard
+        heap.try_inc_data_recursion()?;
+        let result = (|| {
+            for (i1, i2) in self.items.iter().zip(&other.items) {
+                if !i1.py_eq(i2, heap, interns)? {
+                    return Ok(false);
+                }
             }
-        }
-        true
+            Ok(true)
+        })();
+        heap.dec_data_recursion();
+        result
     }
 
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
@@ -323,7 +334,7 @@ impl PyTrait for List {
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         repr_sequence_fmt('[', ']', &self.items, f, heap, heap_ids, interns)
     }
 
@@ -538,7 +549,7 @@ fn list_remove(
     // Find the first matching element
     let mut found_idx = None;
     for (i, item) in list.items.iter().enumerate() {
-        if value.py_eq(item, heap, interns) {
+        if value.py_eq(item, heap, interns)? {
             found_idx = Some(i);
             break;
         }
@@ -616,7 +627,7 @@ fn list_index(
 
     // Search for the value in the specified range
     for (i, item) in list.items[start..end].iter().enumerate() {
-        if value.py_eq(item, heap, interns) {
+        if value.py_eq(item, heap, interns)? {
             value.drop_with_heap(heap);
             let idx = i64::try_from(start + i).expect("index exceeds i64::MAX");
             return Ok(Value::Int(idx));
@@ -641,7 +652,7 @@ fn list_count(
     let count = list
         .items
         .iter()
-        .filter(|item| value.py_eq(item, heap, interns))
+        .filter(|item| value.py_eq(item, heap, interns).unwrap_or(false))
         .count();
 
     value.drop_with_heap(heap);
@@ -840,15 +851,26 @@ pub(crate) fn do_list_sort(
             if sort_error.is_some() {
                 return Ordering::Equal;
             }
-            if let Some(ord) = keys[a].py_cmp(&keys[b], heap, interns) {
-                if reverse { ord.reverse() } else { ord }
-            } else {
-                sort_error = Some(ExcType::type_error(format!(
-                    "'<' not supported between instances of '{}' and '{}'",
-                    keys[a].py_type(heap),
-                    keys[b].py_type(heap)
-                )));
-                Ordering::Equal
+            match keys[a].py_cmp(&keys[b], heap, interns) {
+                Ok(Some(ord)) => {
+                    if reverse {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                }
+                Ok(None) => {
+                    sort_error = Some(ExcType::type_error(format!(
+                        "'<' not supported between instances of '{}' and '{}'",
+                        keys[a].py_type(heap),
+                        keys[b].py_type(heap)
+                    )));
+                    Ordering::Equal
+                }
+                Err(e) => {
+                    sort_error = Some(e.into());
+                    Ordering::Equal
+                }
             }
         });
     } else {
@@ -856,15 +878,26 @@ pub(crate) fn do_list_sort(
             if sort_error.is_some() {
                 return Ordering::Equal;
             }
-            if let Some(ord) = items[a].py_cmp(&items[b], heap, interns) {
-                if reverse { ord.reverse() } else { ord }
-            } else {
-                sort_error = Some(ExcType::type_error(format!(
-                    "'<' not supported between instances of '{}' and '{}'",
-                    items[a].py_type(heap),
-                    items[b].py_type(heap)
-                )));
-                Ordering::Equal
+            match items[a].py_cmp(&items[b], heap, interns) {
+                Ok(Some(ord)) => {
+                    if reverse {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                }
+                Ok(None) => {
+                    sort_error = Some(ExcType::type_error(format!(
+                        "'<' not supported between instances of '{}' and '{}'",
+                        items[a].py_type(heap),
+                        items[b].py_type(heap)
+                    )));
+                    Ordering::Equal
+                }
+                Err(e) => {
+                    sort_error = Some(e.into());
+                    Ordering::Equal
+                }
             }
         });
     }
@@ -955,6 +988,11 @@ fn call_key_function(
 /// * `heap` - The heap for resolving value references
 /// * `heap_ids` - Set of heap IDs being repr'd (for cycle detection)
 /// * `interns` - The interned strings table for looking up string/bytes literals
+///
+/// Formats a sequence of values for repr.
+///
+/// Adds a recursion depth guard to prevent stack overflow on deeply nested
+/// (but non-cyclic) structures like 10,000 nested lists `[[[...]]]`.
 pub(crate) fn repr_sequence_fmt(
     start: char,
     end: char,
@@ -963,7 +1001,10 @@ pub(crate) fn repr_sequence_fmt(
     heap: &Heap<impl ResourceTracker>,
     heap_ids: &mut AHashSet<HeapId>,
     interns: &Interns,
-) -> std::fmt::Result {
+) -> Result<(), ReprError> {
+    // Guard against deep nesting (non-cyclic structures that would overflow stack)
+    let _guard = heap.enter_data_recursion()?;
+
     f.write_char(start)?;
     let mut iter = items.iter();
     if let Some(first) = iter.next() {
@@ -973,7 +1014,8 @@ pub(crate) fn repr_sequence_fmt(
             item.py_repr_fmt(f, heap, heap_ids, interns)?;
         }
     }
-    f.write_char(end)
+    f.write_char(end)?;
+    Ok(())
 }
 
 /// Helper to extract items from a slice for list/tuple slicing.

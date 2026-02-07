@@ -85,7 +85,7 @@ fn builtin_min_max(
         while let Some(item) = iter.for_next(heap, interns)? {
             defer_drop_mut!(item, heap);
 
-            let Some(ordering) = result.py_cmp(item, heap, interns) else {
+            let Some(ordering) = result.py_cmp(item, heap, interns)? else {
                 return Err(ord_not_supported(result, item, heap));
             };
 
@@ -103,7 +103,7 @@ fn builtin_min_max(
         for item in positional {
             defer_drop_mut!(item, heap);
 
-            let Some(ordering) = result.py_cmp(item, heap, interns) else {
+            let Some(ordering) = result.py_cmp(item, heap, interns)? else {
                 return Err(ord_not_supported(result, item, heap));
             };
 

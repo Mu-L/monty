@@ -290,7 +290,7 @@ pub fn format_with_spec(
 
         // String formatting (including InternString and heap strings)
         (_, None | Some('s')) if value_type == Type::Str => {
-            let s = value.py_str(heap, interns);
+            let s = value.py_str(heap, interns)?;
             Ok(format_string(&s, spec)?)
         }
 
@@ -299,7 +299,7 @@ pub fn format_with_spec(
 
         // No type specifier: convert to string and format
         (_, None) => {
-            let s = value.py_str(heap, interns);
+            let s = value.py_str(heap, interns)?;
             Ok(format_string(&s, spec)?)
         }
 

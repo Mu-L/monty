@@ -69,7 +69,7 @@ use std::fmt::Write;
 
 use ahash::AHashSet;
 
-use super::{MontyIter, PyTrait, Type, str::Str};
+use super::{MontyIter, PyTrait, ReprError, Type, str::Str};
 use crate::{
     args::ArgValues,
     exception_private::{ExcType, RunResult, SimpleException},
@@ -299,8 +299,13 @@ impl PyTrait for Bytes {
         Ok(Value::Int(i64::from(byte)))
     }
 
-    fn py_eq(&self, other: &Self, _heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
-        self.0 == other.0
+    fn py_eq(
+        &self,
+        other: &Self,
+        _heap: &mut Heap<impl ResourceTracker>,
+        _interns: &Interns,
+    ) -> Result<bool, crate::resource::ResourceError> {
+        Ok(self.0 == other.0)
     }
 
     /// Bytes don't contain nested heap references.
@@ -318,8 +323,9 @@ impl PyTrait for Bytes {
         _heap: &Heap<impl ResourceTracker>,
         _heap_ids: &mut AHashSet<HeapId>,
         _interns: &Interns,
-    ) -> std::fmt::Result {
-        bytes_repr_fmt(&self.0, f)
+    ) -> Result<(), ReprError> {
+        bytes_repr_fmt(&self.0, f)?;
+        Ok(())
     }
 
     fn py_call_attr(

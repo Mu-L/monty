@@ -5,6 +5,7 @@ use std::{
     hash::{Hash, Hasher},
     mem::{ManuallyDrop, discriminant},
     ptr::addr_of,
+    sync::atomic::{AtomicU16, Ordering},
     vec,
 };
 
@@ -19,7 +20,7 @@ use crate::{
     resource::{ResourceError, ResourceTracker},
     types::{
         AttrCallResult, Bytes, Dataclass, Dict, FrozenSet, List, LongInt, Module, MontyIter, NamedTuple, Path, PyTrait,
-        Range, Set, Slice, Str, Tuple, Type,
+        Range, ReprError, Set, Slice, Str, Tuple, Type,
     },
     value::{EitherStr, Value},
 };
@@ -241,23 +242,41 @@ impl HeapData {
                 fs.compute_hash(heap, interns)
             }
             Self::Tuple(t) => {
+                // Guard against deep nesting - if limit exceeded, treat as unhashable
+                if heap.try_inc_data_recursion().is_err() {
+                    return None;
+                }
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
                 // Tuple is hashable only if all elements are hashable
                 for obj in t.as_vec() {
-                    let h = obj.py_hash(heap, interns)?;
-                    h.hash(&mut hasher);
+                    let h = obj.py_hash(heap, interns);
+                    if h.is_none() {
+                        heap.dec_data_recursion();
+                        return None;
+                    }
+                    h.unwrap().hash(&mut hasher);
                 }
+                heap.dec_data_recursion();
                 Some(hasher.finish())
             }
             Self::NamedTuple(nt) => {
+                // Guard against deep nesting - if limit exceeded, treat as unhashable
+                if heap.try_inc_data_recursion().is_err() {
+                    return None;
+                }
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
                 // Hash only by elements (not type_name) to match equality semantics
                 for obj in nt.as_vec() {
-                    let h = obj.py_hash(heap, interns)?;
-                    h.hash(&mut hasher);
+                    let h = obj.py_hash(heap, interns);
+                    if h.is_none() {
+                        heap.dec_data_recursion();
+                        return None;
+                    }
+                    h.unwrap().hash(&mut hasher);
                 }
+                heap.dec_data_recursion();
                 Some(hasher.finish())
             }
             Self::Closure(f, _, _) | Self::FunctionDefaults(f, _) => {
@@ -402,7 +421,12 @@ impl PyTrait for HeapData {
         }
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         match (self, other) {
             (Self::Str(a), Self::Str(b)) => a.py_eq(b, heap, interns),
             (Self::Bytes(a), Self::Bytes(b)) => a.py_eq(b, heap, interns),
@@ -414,22 +438,32 @@ impl PyTrait for HeapData {
                 let nt_items = nt.as_vec();
                 let t_items = t.as_vec();
                 if nt_items.len() != t_items.len() {
-                    return false;
+                    return Ok(false);
                 }
-                nt_items
-                    .iter()
-                    .zip(t_items.iter())
-                    .all(|(a, b)| a.py_eq(b, heap, interns))
+                // Guard against deep nesting
+                heap.try_inc_data_recursion()?;
+                let result = (|| {
+                    for (a, b) in nt_items.iter().zip(t_items.iter()) {
+                        if !a.py_eq(b, heap, interns)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                })();
+                heap.dec_data_recursion();
+                result
             }
             (Self::Dict(a), Self::Dict(b)) => a.py_eq(b, heap, interns),
             (Self::Set(a), Self::Set(b)) => a.py_eq(b, heap, interns),
             (Self::FrozenSet(a), Self::FrozenSet(b)) => a.py_eq(b, heap, interns),
-            (Self::Closure(a_id, a_cells, _), Self::Closure(b_id, b_cells, _)) => *a_id == *b_id && a_cells == b_cells,
-            (Self::FunctionDefaults(a_id, _), Self::FunctionDefaults(b_id, _)) => *a_id == *b_id,
+            (Self::Closure(a_id, a_cells, _), Self::Closure(b_id, b_cells, _)) => {
+                Ok(*a_id == *b_id && a_cells == b_cells)
+            }
+            (Self::FunctionDefaults(a_id, _), Self::FunctionDefaults(b_id, _)) => Ok(*a_id == *b_id),
             (Self::Range(a), Self::Range(b)) => a.py_eq(b, heap, interns),
             (Self::Dataclass(a), Self::Dataclass(b)) => a.py_eq(b, heap, interns),
             // LongInt equality
-            (Self::LongInt(a), Self::LongInt(b)) => a == b,
+            (Self::LongInt(a), Self::LongInt(b)) => Ok(a == b),
             // Slice equality
             (Self::Slice(a), Self::Slice(b)) => a.py_eq(b, heap, interns),
             // Path equality
@@ -440,8 +474,8 @@ impl PyTrait for HeapData {
             | (Self::Iter(_), Self::Iter(_))
             | (Self::Module(_), Self::Module(_))
             | (Self::Coroutine(_), Self::Coroutine(_))
-            | (Self::GatherFuture(_), Self::GatherFuture(_)) => false,
-            _ => false, // Different types are never equal
+            | (Self::GatherFuture(_), Self::GatherFuture(_)) => Ok(false),
+            _ => Ok(false), // Different types are never equal
         }
     }
 
@@ -529,7 +563,7 @@ impl PyTrait for HeapData {
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         match self {
             Self::Str(s) => s.py_repr_fmt(f, heap, heap_ids, interns),
             Self::Bytes(b) => b.py_repr_fmt(f, heap, heap_ids, interns),
@@ -540,37 +574,57 @@ impl PyTrait for HeapData {
             Self::Set(s) => s.py_repr_fmt(f, heap, heap_ids, interns),
             Self::FrozenSet(fs) => fs.py_repr_fmt(f, heap, heap_ids, interns),
             Self::Closure(f_id, _, _) | Self::FunctionDefaults(f_id, _) => {
-                interns.get_function(*f_id).py_repr_fmt(f, interns, 0)
+                interns.get_function(*f_id).py_repr_fmt(f, interns, 0)?;
+                Ok(())
             }
             // Cell repr shows the contained value's type
-            Self::Cell(v) => write!(f, "<cell: {} object>", v.py_type(heap)),
+            Self::Cell(v) => {
+                write!(f, "<cell: {} object>", v.py_type(heap))?;
+                Ok(())
+            }
             Self::Range(r) => r.py_repr_fmt(f, heap, heap_ids, interns),
             Self::Slice(s) => s.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::Exception(e) => e.py_repr_fmt(f),
+            Self::Exception(e) => {
+                e.py_repr_fmt(f)?;
+                Ok(())
+            }
             Self::Dataclass(dc) => dc.py_repr_fmt(f, heap, heap_ids, interns),
-            Self::Iter(_) => write!(f, "<iterator>"),
-            Self::LongInt(li) => write!(f, "{li}"),
-            Self::Module(m) => write!(f, "<module '{}'>", interns.get_str(m.name())),
+            Self::Iter(_) => {
+                write!(f, "<iterator>")?;
+                Ok(())
+            }
+            Self::LongInt(li) => {
+                write!(f, "{li}")?;
+                Ok(())
+            }
+            Self::Module(m) => {
+                write!(f, "<module '{}'>", interns.get_str(m.name()))?;
+                Ok(())
+            }
             Self::Coroutine(coro) => {
                 let func = interns.get_function(coro.func_id);
                 let name = interns.get_str(func.name.name_id);
-                write!(f, "<coroutine object {name}>")
+                write!(f, "<coroutine object {name}>")?;
+                Ok(())
             }
-            Self::GatherFuture(gather) => write!(f, "<gather({})>", gather.item_count()),
+            Self::GatherFuture(gather) => {
+                write!(f, "<gather({})>", gather.item_count())?;
+                Ok(())
+            }
             Self::Path(p) => p.py_repr_fmt(f, heap, heap_ids, interns),
         }
     }
 
-    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Cow<'static, str> {
+    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Result<Cow<'static, str>, ResourceError> {
         match self {
             // Strings return their value directly without quotes
             Self::Str(s) => s.py_str(heap, interns),
             // LongInt returns its string representation
-            Self::LongInt(li) => Cow::Owned(li.to_string()),
+            Self::LongInt(li) => Ok(Cow::Owned(li.to_string())),
             // Exceptions return just the message (or empty string if no message)
-            Self::Exception(e) => Cow::Owned(e.py_str()),
+            Self::Exception(e) => Ok(Cow::Owned(e.py_str())),
             // Paths return the path string without the PosixPath() wrapper
-            Self::Path(p) => Cow::Owned(p.as_str().to_owned()),
+            Self::Path(p) => Ok(Cow::Owned(p.as_str().to_owned())),
             // All other types use repr
             _ => self.py_repr(heap, interns),
         }
@@ -855,17 +909,25 @@ pub(crate) struct Heap<T: ResourceTracker> {
     may_have_cycles: bool,
     /// Number of GC applicable allocations since the last GC.
     allocations_since_gc: u32,
+    /// Tracks recursion depth for container operations (repr, eq, cmp, hash).
+    /// Uses AtomicU16 for thread safety with Python bindings.
+    /// Prevents stack overflow from deeply nested (but not cyclic) structures.
+    data_recursion_depth: AtomicU16,
 }
 
 impl<T: ResourceTracker + serde::Serialize> serde::Serialize for Heap<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Heap", 5)?;
+        let mut state = serializer.serialize_struct("Heap", 6)?;
         state.serialize_field("entries", &self.entries)?;
         state.serialize_field("free_list", &self.free_list)?;
         state.serialize_field("tracker", &self.tracker)?;
         state.serialize_field("may_have_cycles", &self.may_have_cycles)?;
         state.serialize_field("allocations_since_gc", &self.allocations_since_gc)?;
+        state.serialize_field(
+            "data_recursion_depth",
+            &self.data_recursion_depth.load(Ordering::Relaxed),
+        )?;
         state.end()
     }
 }
@@ -879,6 +941,8 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
             tracker: T,
             may_have_cycles: bool,
             allocations_since_gc: u32,
+            #[serde(default)]
+            data_recursion_depth: u16,
         }
         let fields = HeapFields::<T>::deserialize(deserializer)?;
         Ok(Self {
@@ -887,6 +951,7 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
             tracker: fields.tracker,
             may_have_cycles: fields.may_have_cycles,
             allocations_since_gc: fields.allocations_since_gc,
+            data_recursion_depth: AtomicU16::new(fields.data_recursion_depth),
         })
     }
 }
@@ -923,6 +988,34 @@ macro_rules! restore_data {
 /// eventually collecting reference cycles.
 const GC_INTERVAL: u32 = 100_000;
 
+/// Maximum recursion depth for data structure operations (repr, eq, cmp, hash).
+/// Matches CPython's default sys.getrecursionlimit() of 1000.
+#[cfg(not(debug_assertions))]
+pub const MAX_DATA_RECURSION_DEPTH: u16 = 1000;
+
+/// Debug builds use lower limit due to larger stack frames (no inlining, debug info).
+/// This matches the parser's debug recursion limit.
+#[cfg(debug_assertions)]
+pub const MAX_DATA_RECURSION_DEPTH: u16 = 35;
+
+/// RAII guard that decrements data recursion depth on drop.
+///
+/// Created by `Heap::enter_data_recursion()` when entering recursive
+/// container operations. Automatically decrements depth when dropped,
+/// ensuring correct cleanup even on early returns or errors.
+pub struct DataRecursionGuard<'a> {
+    depth: &'a AtomicU16,
+}
+
+impl Drop for DataRecursionGuard<'_> {
+    fn drop(&mut self) {
+        // Saturating sub in case of underflow (shouldn't happen with correct usage)
+        let _ = self
+            .depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+    }
+}
+
 impl<T: ResourceTracker> Heap<T> {
     /// Creates a new heap with the given resource tracker.
     ///
@@ -934,6 +1027,7 @@ impl<T: ResourceTracker> Heap<T> {
             tracker,
             may_have_cycles: false,
             allocations_since_gc: 0,
+            data_recursion_depth: AtomicU16::new(0),
         }
     }
 
@@ -960,6 +1054,63 @@ impl<T: ResourceTracker> Heap<T> {
     #[inline]
     pub fn mark_potential_cycle(&mut self) {
         self.may_have_cycles = true;
+    }
+
+    /// Enters a recursive data structure operation (repr, eq, hash, etc).
+    ///
+    /// Returns a guard that decrements the depth on drop. Returns
+    /// `Err(ResourceError::Recursion)` if depth limit exceeded.
+    ///
+    /// This is used to prevent stack overflow from deeply nested (but not cyclic)
+    /// structures. For example, 10,000 nested lists `[[[...]]]` would overflow
+    /// the Rust stack without this protection.
+    ///
+    /// Use this for operations that take `&Heap` (like `py_repr_fmt`). For operations
+    /// that take `&mut Heap` (like `py_eq`), use `try_inc_data_recursion` and
+    /// `dec_data_recursion` manually to avoid borrow conflicts.
+    #[inline]
+    pub fn enter_data_recursion(&self) -> Result<DataRecursionGuard<'_>, ResourceError> {
+        let current = self.data_recursion_depth.load(Ordering::Relaxed);
+        if current >= MAX_DATA_RECURSION_DEPTH {
+            return Err(ResourceError::Recursion {
+                limit: MAX_DATA_RECURSION_DEPTH as usize,
+                depth: current as usize,
+            });
+        }
+        self.data_recursion_depth.store(current + 1, Ordering::Relaxed);
+        Ok(DataRecursionGuard {
+            depth: &self.data_recursion_depth,
+        })
+    }
+
+    /// Increments data recursion depth, returning error if limit exceeded.
+    ///
+    /// This is the non-RAII version for use in methods that take `&mut Heap`.
+    /// You MUST call `dec_data_recursion` on every return path after calling this.
+    ///
+    /// For methods that take `&Heap`, prefer `enter_data_recursion` which returns
+    /// an RAII guard for automatic cleanup.
+    #[inline]
+    pub fn try_inc_data_recursion(&mut self) -> Result<(), ResourceError> {
+        let current = self.data_recursion_depth.load(Ordering::Relaxed);
+        if current >= MAX_DATA_RECURSION_DEPTH {
+            return Err(ResourceError::Recursion {
+                limit: MAX_DATA_RECURSION_DEPTH as usize,
+                depth: current as usize,
+            });
+        }
+        self.data_recursion_depth.store(current + 1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Decrements data recursion depth.
+    ///
+    /// Must be called after `try_inc_data_recursion` on every return path.
+    #[inline]
+    pub fn dec_data_recursion(&mut self) {
+        let _ = self
+            .data_recursion_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
     }
 
     /// Returns the number of GC-tracked allocations since the last garbage collection.
@@ -1030,34 +1181,40 @@ impl<T: ResourceTracker> Heap<T> {
 
     /// Decrements the reference count and frees the value (plus children) once it hits zero.
     ///
-    /// When an value is freed, its slot ID is added to the free list for reuse by
-    /// future allocations. Uses recursion for child cleanup - avoiding repeated Vec
-    /// allocations and benefiting from call stack locality.
+    /// When a value is freed, its slot ID is added to the free list for reuse by
+    /// future allocations. Uses an iterative work list to avoid stack overflow on
+    /// deeply nested structures (e.g., 10,000 nested lists would overflow with recursion).
     ///
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
     pub fn dec_ref(&mut self, id: HeapId) {
-        let slot = self.entries.get_mut(id.index()).expect("Heap::dec_ref: slot missing");
-        let entry = slot.as_mut().expect("Heap::dec_ref: object already freed");
-        if entry.refcount > 1 {
-            entry.refcount -= 1;
-        } else if let Some(value) = slot.take() {
-            // refcount == 1, free the value and add slot to free list for reuse
-            self.free_list.push(id);
+        let mut work_list = vec![id];
 
-            // Notify tracker of freed memory
-            if let Some(ref data) = value.data {
-                self.tracker.on_free(|| data.py_estimate_size());
+        while let Some(current_id) = work_list.pop() {
+            let slot = self
+                .entries
+                .get_mut(current_id.index())
+                .expect("Heap::dec_ref: slot missing");
+            let entry = slot.as_mut().expect("Heap::dec_ref: object already freed");
+
+            if entry.refcount > 1 {
+                entry.refcount -= 1;
+                continue;
             }
 
-            // Collect child IDs and mark Values as Dereferenced (when ref-count-panic enabled)
-            if let Some(mut data) = value.data {
-                let mut child_ids = Vec::new();
-                data.py_dec_ref_ids(&mut child_ids);
-                drop(data);
-                // Recursively decrement children
-                for child_id in child_ids {
-                    self.dec_ref(child_id);
+            // refcount == 1, free the value and add slot to free list for reuse
+            if let Some(value) = slot.take() {
+                self.free_list.push(current_id);
+
+                // Notify tracker of freed memory
+                if let Some(ref data) = value.data {
+                    self.tracker.on_free(|| data.py_estimate_size());
+                }
+
+                // Collect child IDs and mark Values as Dereferenced (when ref-count-panic enabled)
+                // Push children to work_list instead of recursing
+                if let Some(mut data) = value.data {
+                    data.py_dec_ref_ids(&mut work_list);
                 }
             }
         }
@@ -1219,6 +1376,39 @@ impl<T: ResourceTracker> Heap<T> {
             // Restore in reverse order
             restore_data!(self, right, right_data, "with_two (right)");
             restore_data!(self, left, left_data, "with_two (left)");
+            result
+        }
+    }
+
+    /// Executes a fallible operation on two heap values by temporarily taking ownership.
+    ///
+    /// Like `with_two`, but for closures that return `Result`. Always restores the data
+    /// to the heap regardless of whether the closure succeeds or fails.
+    ///
+    /// This ensures heap consistency even when operations like `py_eq` return
+    /// `Err(ResourceError::Recursion)` for deeply nested structures.
+    pub fn with_two_result<F, R, E>(&mut self, left: HeapId, right: HeapId, f: F) -> Result<R, E>
+    where
+        F: FnOnce(&mut Self, &HeapData, &HeapData) -> Result<R, E>,
+    {
+        if left == right {
+            // Same value - take data once and pass it twice
+            let data = take_data!(self, left, "with_two_result");
+
+            let result = f(self, &data, &data);
+
+            restore_data!(self, left, data, "with_two_result");
+            result
+        } else {
+            // Different values - take both
+            let left_data = take_data!(self, left, "with_two_result (left)");
+            let right_data = take_data!(self, right, "with_two_result (right)");
+
+            let result = f(self, &left_data, &right_data);
+
+            // Restore in reverse order - always restore even on error
+            restore_data!(self, right, right_data, "with_two_result (right)");
+            restore_data!(self, left, left_data, "with_two_result (left)");
             result
         }
     }

@@ -12,8 +12,8 @@ use crate::{
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapData, HeapId},
     intern::Interns,
-    resource::ResourceTracker,
-    types::{PyTrait, Type},
+    resource::{ResourceError, ResourceTracker},
+    types::{PyTrait, ReprError, Type},
     value::Value,
 };
 
@@ -269,19 +269,24 @@ impl PyTrait for Range {
         Ok(Value::Int(offset))
     }
 
-    fn py_eq(&self, other: &Self, _heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        _heap: &mut Heap<impl ResourceTracker>,
+        _interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         // Compare ranges by their actual sequences, not parameters.
         // Two ranges are equal if they produce the same elements.
         let len1 = self.len();
         let len2 = other.len();
         if len1 != len2 {
-            return false;
+            return Ok(false);
         }
         // Same length - compare first element and step (if non-empty)
         if len1 == 0 {
-            return true; // Both empty
+            return Ok(true); // Both empty
         }
-        self.start == other.start && self.step == other.step
+        Ok(self.start == other.start && self.step == other.step)
     }
 
     fn py_bool(&self, _heap: &Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
@@ -294,12 +299,13 @@ impl PyTrait for Range {
         _heap: &Heap<impl ResourceTracker>,
         _heap_ids: &mut AHashSet<HeapId>,
         _interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         if self.step == 1 {
-            write!(f, "range({}, {})", self.start, self.stop)
+            write!(f, "range({}, {})", self.start, self.stop)?;
         } else {
-            write!(f, "range({}, {}, {})", self.start, self.stop, self.step)
+            write!(f, "range({}, {}, {})", self.start, self.stop, self.step)?;
         }
+        Ok(())
     }
 
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {

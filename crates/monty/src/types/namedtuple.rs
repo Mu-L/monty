@@ -19,12 +19,12 @@ use std::fmt::Write;
 
 use ahash::AHashSet;
 
-use super::PyTrait;
+use super::{PyTrait, ReprError};
 use crate::{
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapId},
     intern::{Interns, StringId},
-    resource::ResourceTracker,
+    resource::{ResourceError, ResourceTracker},
     types::{AttrCallResult, Type},
     value::{EitherStr, Value},
 };
@@ -179,18 +179,29 @@ impl PyTrait for NamedTuple {
         }
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         // Compare only by items (not type_name) to match tuple semantics
         // This allows sys.version_info == (3, 14, 0, 'final', 0) to work
         if self.items.len() != other.items.len() {
-            return false;
+            return Ok(false);
         }
-        for (i1, i2) in self.items.iter().zip(&other.items) {
-            if !i1.py_eq(i2, heap, interns) {
-                return false;
+        // Guard against deep nesting (non-cyclic structures that would overflow stack)
+        heap.try_inc_data_recursion()?;
+        let result = (|| {
+            for (i1, i2) in self.items.iter().zip(&other.items) {
+                if !i1.py_eq(i2, heap, interns)? {
+                    return Ok(false);
+                }
             }
-        }
-        true
+            Ok(true)
+        })();
+        heap.dec_data_recursion();
+        result
     }
 
     /// Pushes all heap IDs contained in this named tuple onto the stack.
@@ -221,7 +232,10 @@ impl PyTrait for NamedTuple {
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
+        // Guard against deep nesting (non-cyclic structures that would overflow stack)
+        let _guard = heap.enter_data_recursion()?;
+
         // Format: type_name(field1=value1, field2=value2, ...)
         write!(f, "{}(", self.name.as_str(interns))?;
 
@@ -236,7 +250,8 @@ impl PyTrait for NamedTuple {
             value.py_repr_fmt(f, heap, heap_ids, interns)?;
         }
 
-        f.write_char(')')
+        f.write_char(')')?;
+        Ok(())
     }
 
     fn py_getattr(

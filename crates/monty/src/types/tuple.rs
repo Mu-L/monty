@@ -14,7 +14,7 @@ use std::fmt::Write;
 use ahash::AHashSet;
 
 use super::{
-    MontyIter, PyTrait,
+    MontyIter, PyTrait, ReprError,
     list::{get_slice_items, repr_sequence_fmt},
 };
 use crate::{
@@ -22,7 +22,7 @@ use crate::{
     exception_private::{ExcType, RunResult},
     heap::{DropWithHeap, Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings},
-    resource::ResourceTracker,
+    resource::{ResourceError, ResourceTracker},
     types::Type,
     value::{EitherStr, Value},
 };
@@ -164,16 +164,27 @@ impl PyTrait for Tuple {
         Ok(self.items[idx].clone_with_heap(heap))
     }
 
-    fn py_eq(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    fn py_eq(
+        &self,
+        other: &Self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<bool, ResourceError> {
         if self.items.len() != other.items.len() {
-            return false;
+            return Ok(false);
         }
-        for (i1, i2) in self.items.iter().zip(&other.items) {
-            if !i1.py_eq(i2, heap, interns) {
-                return false;
+        // Guard against deep nesting (non-cyclic structures that would overflow stack)
+        heap.try_inc_data_recursion()?;
+        let result = (|| {
+            for (i1, i2) in self.items.iter().zip(&other.items) {
+                if !i1.py_eq(i2, heap, interns)? {
+                    return Ok(false);
+                }
             }
-        }
-        true
+            Ok(true)
+        })();
+        heap.dec_data_recursion();
+        result
     }
 
     fn py_add(
@@ -235,7 +246,7 @@ impl PyTrait for Tuple {
         heap: &Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         repr_sequence_fmt('(', ')', &self.items, f, heap, heap_ids, interns)
     }
 }
@@ -254,7 +265,7 @@ fn tuple_index(
 
     // Search for the value in the specified range
     for (i, item) in tuple.as_vec()[start..end].iter().enumerate() {
-        if value.py_eq(item, heap, interns) {
+        if value.py_eq(item, heap, interns)? {
             value.drop_with_heap(heap);
             let idx = i64::try_from(start + i).expect("index exceeds i64::MAX");
             return Ok(Value::Int(idx));
@@ -279,7 +290,7 @@ fn tuple_count(
     let count = tuple
         .as_vec()
         .iter()
-        .filter(|item| value.py_eq(item, heap, interns))
+        .filter(|item| value.py_eq(item, heap, interns).unwrap_or(false))
         .count();
 
     value.drop_with_heap(heap);

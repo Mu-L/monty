@@ -15,7 +15,7 @@ use crate::{
     intern::{Interns, StaticStrings, StringId},
     os::OsFunction,
     resource::ResourceTracker,
-    types::{AttrCallResult, PyTrait, Str, Type},
+    types::{AttrCallResult, PyTrait, ReprError, Str, Type},
     value::{EitherStr, Value},
 };
 
@@ -406,8 +406,13 @@ impl PyTrait for Path {
         None
     }
 
-    fn py_eq(&self, other: &Self, _heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
-        self.path == other.path
+    fn py_eq(
+        &self,
+        other: &Self,
+        _heap: &mut Heap<impl ResourceTracker>,
+        _interns: &Interns,
+    ) -> Result<bool, crate::resource::ResourceError> {
+        Ok(self.path == other.path)
     }
 
     fn py_bool(&self, _heap: &Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
@@ -421,9 +426,10 @@ impl PyTrait for Path {
         _heap: &Heap<impl ResourceTracker>,
         _heap_ids: &mut AHashSet<HeapId>,
         _interns: &Interns,
-    ) -> std::fmt::Result {
+    ) -> Result<(), ReprError> {
         // Format like: PosixPath('/usr/bin')
-        write!(f, "PosixPath('{}')", self.path)
+        write!(f, "PosixPath('{}')", self.path)?;
+        Ok(())
     }
 
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {

@@ -323,9 +323,12 @@ impl ExcType {
     /// Creates a KeyError for a missing dict key.
     ///
     /// For string keys, uses the raw string value without extra quoting.
+    /// If recursion limit is hit during py_str, falls back to a generic representation.
     #[must_use]
     pub(crate) fn key_error(key: &Value, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> RunError {
-        let key_str = key.py_str(heap, interns).into_owned();
+        let key_str = key
+            .py_str(heap, interns)
+            .map_or_else(|_| "<key>".to_owned(), Cow::into_owned);
         SimpleException::new_msg(Self::KeyError, key_str).into()
     }
 

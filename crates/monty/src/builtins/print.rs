@@ -49,7 +49,7 @@ pub fn builtin_print(
         } else {
             print.stdout_push(' ')?;
         }
-        print.stdout_write(value.py_str(heap, interns))?;
+        print.stdout_write(value.py_str(heap, interns)?)?;
         value.drop_with_heap(heap);
     }
 

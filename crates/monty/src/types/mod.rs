@@ -33,7 +33,7 @@ pub(crate) use module::Module;
 pub(crate) use namedtuple::NamedTuple;
 pub(crate) use path::Path;
 pub(crate) use property::Property;
-pub(crate) use py_trait::{AttrCallResult, PyTrait};
+pub(crate) use py_trait::{AttrCallResult, PyTrait, ReprError};
 pub(crate) use range::Range;
 pub(crate) use set::{FrozenSet, Set};
 pub(crate) use slice::Slice;

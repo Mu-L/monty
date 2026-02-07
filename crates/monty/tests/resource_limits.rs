@@ -494,6 +494,64 @@ recurse(5)
     assert!(result.is_ok(), "should not exceed recursion depth limit");
 }
 
+/// Test that deep nesting in data structures (not function calls) triggers RecursionError.
+///
+/// This protects against stack overflow when traversing deeply nested structures
+/// like `[[[...1500 levels...]]]`. Unlike function recursion limits (which the user
+/// can configure), data recursion is checked internally to prevent Rust stack overflow.
+#[test]
+#[cfg_attr(
+    feature = "ref-count-panic",
+    ignore = "resource exhaustion doesn't guarantee heap state consistency"
+)]
+fn deep_data_structure_recursion_error() {
+    // Build a deeply nested list structure (1500 levels deep)
+    // Debug builds have limit of 35, release builds have 1000
+    let code = r"
+x = []
+for _ in range(1500):
+    x = [x]
+repr(x)  # This triggers deep recursion in py_repr_fmt
+";
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], vec![]).unwrap();
+
+    let result = ex.run(vec![], LimitedTracker::new(ResourceLimits::new()), &mut StdPrint);
+
+    assert!(result.is_err(), "deep nesting should trigger RecursionError");
+    let exc = result.unwrap_err();
+    assert_eq!(exc.exc_type(), ExcType::RecursionError);
+    assert!(
+        exc.message()
+            .is_some_and(|m| m.contains("maximum recursion depth exceeded")),
+        "expected recursion depth error from deep data, got: {exc}"
+    );
+}
+
+/// Test that deep nesting triggers RecursionError on equality comparison.
+#[test]
+#[cfg_attr(
+    feature = "ref-count-panic",
+    ignore = "resource exhaustion doesn't guarantee heap state consistency"
+)]
+fn deep_data_structure_eq_recursion_error() {
+    // Build two deeply nested list structures and compare them
+    let code = r"
+a = []
+b = []
+for _ in range(1500):
+    a = [a]
+    b = [b]
+a == b  # This triggers deep recursion in py_eq
+";
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], vec![]).unwrap();
+
+    let result = ex.run(vec![], LimitedTracker::new(ResourceLimits::new()), &mut StdPrint);
+
+    assert!(result.is_err(), "deep nesting should trigger RecursionError");
+    let exc = result.unwrap_err();
+    assert_eq!(exc.exc_type(), ExcType::RecursionError);
+}
+
 // === BigInt large result pre-check tests ===
 // These tests verify that operations that would produce very large BigInt results
 // are rejected before the computation begins, preventing DoS attacks.
