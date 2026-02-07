@@ -47,11 +47,11 @@ Store a recursion counter in `Heap` using `Cell<u16>` to allow incrementing with
 
 ### Key Design Decisions
 
-1. **Counter type**: `Cell<u16>` - allows mutation through shared ref, u16 matches parser limit type
-2. **Default limit**: 200 (matching `MAX_NESTING_DEPTH` for consistency with parser)
-3. **Debug limit**: 35 (matching debug parser limit due to larger stack frames)
-4. **Error type**: Return `RecursionError` via existing error mechanisms
-5. **Check location**: At container entry points before recursing into children
+1. **Counter type**: `Cell<u16>` - allows mutation through shared ref
+2. **Default limit**: 1000 (matching CPython's `sys.getrecursionlimit()` and Monty's call stack limit)
+3. **Debug limit**: 35 (due to larger stack frames in debug builds - matches parser)
+4. **Error type**: Return `RecursionError` via existing `ResourceError::Recursion`
+5. **Check location**: Only at container entry points (list, tuple, dict, set, frozenset), NOT on every `Value::Ref` access - this prevents over-counting when containers hold leaf types
 
 ## Implementation Plan
 
@@ -114,9 +114,10 @@ data_recursion_depth: Cell<u16>,
 Add constant at module level (near top of file):
 ```rust
 /// Maximum recursion depth for data structure operations (repr, eq, cmp, hash).
-/// Matches `MAX_NESTING_DEPTH` from parser for consistency.
+/// Matches CPython's default sys.getrecursionlimit() of 1000.
 #[cfg(not(debug_assertions))]
-pub const MAX_DATA_RECURSION_DEPTH: u16 = 200;
+pub const MAX_DATA_RECURSION_DEPTH: u16 = 1000;
+/// Debug builds use lower limit due to larger stack frames (no inlining, debug info).
 #[cfg(debug_assertions)]
 pub const MAX_DATA_RECURSION_DEPTH: u16 = 35;
 ```
@@ -204,19 +205,15 @@ fn py_repr_fmt(
 ) -> Result<(), ReprError>;  // Changed from std::fmt::Result
 ```
 
-In `Value::py_repr_fmt` for the `Ref` case:
+**Guard placement**: The guard should be placed in container implementations (List, Tuple, Dict, Set, FrozenSet), NOT in `Value::Ref` dispatch. This prevents over-counting when containers hold leaf types.
+
+In `List::py_repr_fmt` (and similar for Tuple, Dict, Set, FrozenSet):
 ```rust
-Self::Ref(id) => {
-    if heap_ids.contains(id) {
-        // Existing cycle detection...
-        Ok(())
-    } else {
-        let _guard = heap.enter_data_recursion()?;  // Returns ReprError::Recursion on overflow
-        heap_ids.insert(*id);
-        let result = heap.get(*id).py_repr_fmt(f, heap, heap_ids, interns);
-        heap_ids.remove(id);
-        result
-    }
+fn py_repr_fmt(&self, f: &mut impl Write, heap: &Heap<...>, heap_ids: &mut AHashSet<HeapId>, interns: &Interns) -> Result<(), ReprError> {
+    let _guard = heap.enter_data_recursion()?;  // Only containers increment depth
+    f.write_char('[')?;
+    // ... format items ...
+    f.write_char(']')
 }
 ```
 
@@ -285,11 +282,15 @@ fn py_eq(&self, other: &Self, _heap: &mut Heap<impl ResourceTracker>, _interns: 
 
 Update all call sites in the VM and elsewhere to handle the Result.
 
+**Preserve identity short-circuit**: The existing `py_eq` already has `if *id1 == *id2 { return true; }` at line 229 of value.rs. This must be preserved so self-referential structures like `x = []; x.append(x); x == x` return `True` without triggering recursion.
+
 ### Step 4: Update compute_hash_if_immutable
 
 **File: `crates/monty/src/heap.rs`**
 
-Change to return `Result<Option<u64>, ResourceError>` or check depth before recursive hash calls.
+Add depth guard for recursive hashing of **tuple AND frozenset**. Both can contain nested containers and need protection.
+
+Change to return `Result<Option<u64>, ResourceError>` and add guard in tuple/frozenset hash computation.
 
 ### Step 5: Add Tests
 
@@ -297,8 +298,9 @@ Change to return `Result<Option<u64>, ResourceError>` or check depth before recu
 
 Test that deeply nested structures raise RecursionError:
 ```python
+# Use a value > 1000 to exceed the limit
 x = []
-for _ in range(1000):
+for _ in range(1500):
     x = [x]
 repr(x)
 """
@@ -311,6 +313,12 @@ RecursionError: maximum recursion depth exceeded
 """
 ```
 
+Additional tests to add:
+- **Self-referential repr still works**: `x = []; x.append(x); repr(x)` should return `[[...]]` (cycle detection, not recursion error)
+- **Self-referential equality**: `x = []; x.append(x); x == x` should return `True` (identity short-circuit)
+- **Deep tuple hash**: Nested tuples beyond limit should raise RecursionError when used as dict key
+- **Deep frozenset hash**: Same for frozensets
+
 ## Files to Modify
 
 1. `crates/monty/src/heap.rs` - **Convert `dec_ref` to iterative**, add recursion tracking field, guard, and methods
@@ -319,7 +327,7 @@ RecursionError: maximum recursion depth exceeded
 4. `crates/monty/src/types/list.rs` - Update py_eq, py_repr_fmt
 5. `crates/monty/src/types/tuple.rs` - Update py_eq, py_repr_fmt
 6. `crates/monty/src/types/dict.rs` - Update py_eq, py_repr_fmt
-7. `crates/monty/src/types/set.rs` - Update py_eq for set/frozenset
+7. `crates/monty/src/types/set.rs` - Update py_eq for set/frozenset, add depth guard to frozenset hash
 8. `crates/monty/src/types/dataclass.rs` - Update py_eq
 9. `crates/monty/src/types/namedtuple.rs` - Update py_eq
 10. `crates/monty/src/bytecode/vm/*.rs` - Update call sites for py_repr, py_str, py_eq that now return Result
@@ -330,7 +338,7 @@ RecursionError: maximum recursion depth exceeded
 
 **Thread Safety:** The use of `Cell<u16>` for recursion depth implies `Heap` is single-threaded. This is correct - Monty VMs are not shared across threads. If threaded parallelism is ever added, this would need to change to `AtomicU16`.
 
-**Future Configuration:** The hardcoded limits (200/35) could eventually be exposed via a `sys.setrecursionlimit` equivalent, but this is out of scope for this fix.
+**Future Configuration:** The hardcoded limits (1000/35) could eventually be exposed via a `sys.setrecursionlimit` equivalent, but this is out of scope for this fix.
 
 ## Verification
 
