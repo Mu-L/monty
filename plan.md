@@ -22,9 +22,15 @@ All recursive container traversal operations are vulnerable:
 |-----------|------------------|-------|
 | `py_repr_fmt` | `(..., heap_ids: &mut AHashSet<HeapId>)` | Has cycle detection, no depth limit |
 | `py_str` | `(&Heap, &Interns) -> Cow<str>` | Calls py_repr, same issue |
+| `py_repr` | `(&Heap, &Interns) -> Cow<str>` | Wrapper around py_repr_fmt, needs Result |
 | `py_eq` | `(&mut Heap, &Interns) -> bool` | No depth limit |
 | `py_cmp` | `(&mut Heap, &Interns) -> Option<Ordering>` | No depth limit |
 | `compute_hash_if_immutable` | `(&mut Heap, &Interns) -> Option<u64>` | Recurses for tuples |
+| **`dec_ref`** | `(&mut self, id: HeapId)` | **CRITICAL: Recursive deallocation overflows on drop** |
+
+### Critical: `dec_ref` Recursion
+
+Even if `repr(deep_obj)` raises `RecursionError` and the script continues, when `deep_obj` goes out of scope, `dec_ref` will recursively free all nested objects, causing a **crash** (stack overflow). This must be fixed with an iterative algorithm.
 
 ## Solution Design
 
@@ -48,6 +54,50 @@ Store a recursion counter in `Heap` using `Cell<u16>` to allow incrementing with
 5. **Check location**: At container entry points before recursing into children
 
 ## Implementation Plan
+
+### Step 0: Convert `dec_ref` to Iterative (CRITICAL)
+
+**File: `crates/monty/src/heap.rs`**
+
+**Problem:** Current `dec_ref` recursively calls itself for each child:
+```rust
+for child_id in child_ids {
+    self.dec_ref(child_id);  // RECURSIVE - will overflow!
+}
+```
+
+**Solution:** Convert to iterative using a work list (similar to `collect_garbage`):
+```rust
+pub fn dec_ref(&mut self, id: HeapId) {
+    let mut work_list = vec![id];
+
+    while let Some(current_id) = work_list.pop() {
+        let slot = self.entries.get_mut(current_id.index()).expect("Heap::dec_ref: slot missing");
+        let entry = slot.as_mut().expect("Heap::dec_ref: object already freed");
+
+        if entry.refcount > 1 {
+            entry.refcount -= 1;
+            continue;
+        }
+
+        // refcount == 1, free the value
+        if let Some(value) = slot.take() {
+            self.free_list.push(current_id);
+
+            if let Some(ref data) = value.data {
+                self.tracker.on_free(|| data.py_estimate_size());
+            }
+
+            if let Some(mut data) = value.data {
+                // Push children to work_list instead of recursing
+                data.py_dec_ref_ids(&mut work_list);
+            }
+        }
+    }
+}
+```
+
+**Note:** This reuses the existing `py_dec_ref_ids` method which pushes HeapIds to a Vec. The change is purely in how we process them (iteratively vs recursively).
 
 ### Step 1: Add Recursion Tracking to Heap
 
@@ -170,7 +220,28 @@ Self::Ref(id) => {
 }
 ```
 
-Update `py_repr` to convert `ReprError::Recursion` to appropriate Python exception.
+**Update `py_repr` and `py_str` signatures** (major change):
+
+Current signatures return `Cow<'static, str>` which cannot propagate errors:
+```rust
+fn py_repr(&self, heap: &Heap<...>, interns: &Interns) -> Cow<'static, str>;
+fn py_str(&self, heap: &Heap<...>, interns: &Interns) -> Cow<'static, str>;
+```
+
+Change to return `Result` to propagate `RecursionError`:
+```rust
+fn py_repr(&self, heap: &Heap<...>, interns: &Interns) -> Result<Cow<'static, str>, ResourceError>;
+fn py_str(&self, heap: &Heap<...>, interns: &Interns) -> Result<Cow<'static, str>, ResourceError>;
+```
+
+**Scope of changes:** This affects all call sites of `repr()` and `str()`:
+- Exception formatting
+- Print statements
+- String formatting (f-strings, % formatting)
+- Logging/debugging
+- Error messages
+
+All these call sites must be updated to handle the `Result`.
 
 ### Step 3: Update py_eq and py_cmp
 
@@ -242,24 +313,33 @@ RecursionError: maximum recursion depth exceeded
 
 ## Files to Modify
 
-1. `crates/monty/src/heap.rs` - Add recursion tracking field, guard, and methods
-2. `crates/monty/src/value.rs` - Update py_repr_fmt, py_eq, py_cmp implementations
-3. `crates/monty/src/types/py_trait.rs` - Update trait signatures if needed
+1. `crates/monty/src/heap.rs` - **Convert `dec_ref` to iterative**, add recursion tracking field, guard, and methods
+2. `crates/monty/src/value.rs` - Update py_repr, py_repr_fmt, py_str, py_eq, py_cmp implementations
+3. `crates/monty/src/types/py_trait.rs` - Update trait signatures (py_repr, py_str, py_eq, py_cmp, py_repr_fmt)
 4. `crates/monty/src/types/list.rs` - Update py_eq, py_repr_fmt
 5. `crates/monty/src/types/tuple.rs` - Update py_eq, py_repr_fmt
 6. `crates/monty/src/types/dict.rs` - Update py_eq, py_repr_fmt
 7. `crates/monty/src/types/set.rs` - Update py_eq for set/frozenset
 8. `crates/monty/src/types/dataclass.rs` - Update py_eq
 9. `crates/monty/src/types/namedtuple.rs` - Update py_eq
-10. `crates/monty/test_cases/` - Add test for deep nesting RecursionError
+10. `crates/monty/src/bytecode/vm/*.rs` - Update call sites for py_repr, py_str, py_eq that now return Result
+11. `crates/monty/src/builtins/*.rs` - Update repr(), str() builtins and error formatting
+12. `crates/monty/test_cases/` - Add test for deep nesting RecursionError
+
+## Design Notes
+
+**Thread Safety:** The use of `Cell<u16>` for recursion depth implies `Heap` is single-threaded. This is correct - Monty VMs are not shared across threads. If threaded parallelism is ever added, this would need to change to `AtomicU16`.
+
+**Future Configuration:** The hardcoded limits (200/35) could eventually be exposed via a `sys.setrecursionlimit` equivalent, but this is out of scope for this fix.
 
 ## Verification
 
 1. Run `make test-ref-count-panic` to ensure all existing tests pass
 2. Run deep.py and verify it raises RecursionError instead of crashing
-3. Test self-referential structures still work (cycle detection preserved)
-4. Test normal nested structures within limits work correctly
-5. Run `make format-rs && make lint-rs` to ensure code quality
+3. **Test that deep structures don't crash on drop** - create deep structure, let it go out of scope
+4. Test self-referential structures still work (cycle detection preserved)
+5. Test normal nested structures within limits work correctly
+6. Run `make format-rs && make lint-rs` to ensure code quality
 
 ## Alternative Considered: Iterative Algorithms
 
