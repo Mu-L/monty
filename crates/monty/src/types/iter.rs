@@ -363,12 +363,27 @@ impl MontyIter {
     /// and similar constructors that need to materialize all items.
     ///
     /// Pre-allocates capacity based on `size_hint()` for better performance.
-    pub fn collect(&mut self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Vec<Value>> {
-        let mut items = Vec::with_capacity(self.size_hint(heap));
-        while let Some(item) = self.for_next(heap, interns)? {
-            items.push(item);
-        }
-        Ok(items)
+    pub fn collect<T: FromIterator<Value>>(
+        &mut self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> RunResult<T> {
+        HeapedMontyIter(self, heap, interns).collect()
+    }
+}
+
+struct HeapedMontyIter<'a, T: ResourceTracker>(&'a mut MontyIter, &'a mut Heap<T>, &'a Interns);
+
+impl<T: ResourceTracker> Iterator for HeapedMontyIter<'_, T> {
+    type Item = RunResult<Value>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.for_next(self.1, self.2).transpose()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.0.size_hint(self.1);
+        (remaining, Some(remaining))
     }
 }
 

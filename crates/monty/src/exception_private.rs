@@ -4,6 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use smallvec::smallvec;
 use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::{
@@ -16,7 +17,7 @@ use crate::{
     parse::CodeRange,
     resource::ResourceTracker,
     types::{
-        AttrCallResult, PyTrait, Str, Tuple, Type,
+        AttrCallResult, PyTrait, Str, Type, allocate_tuple,
         str::{StringRepr, string_repr_fmt},
     },
     value::Value,
@@ -855,6 +856,14 @@ impl ExcType {
         SimpleException::new_msg(Self::OverflowError, "cannot fit 'int' into an index-sized integer")
     }
 
+    /// Creates an IndexError for when an integer index is too large to fit in i64.
+    ///
+    /// Matches CPython's format: `IndexError: cannot fit 'int' into an index-sized integer`
+    #[must_use]
+    pub(crate) fn index_error_int_too_large() -> RunError {
+        SimpleException::new_msg(Self::IndexError, "cannot fit 'int' into an index-sized integer").into()
+    }
+
     /// Creates an ImportError for when a name cannot be imported from a module.
     ///
     /// Matches CPython's format for built-in modules:
@@ -1208,12 +1217,11 @@ impl SimpleException {
             // Construct tuple with 0 or 1 elements based on whether arg exists
             let elements = if let Some(arg_str) = &self.arg {
                 let str_id = heap.allocate(HeapData::Str(Str::from(arg_str.clone())))?;
-                vec![Value::Ref(str_id)]
+                smallvec![Value::Ref(str_id)]
             } else {
-                vec![]
+                smallvec![]
             };
-            let tuple_id = heap.allocate(HeapData::Tuple(Tuple::new(elements)))?;
-            Ok(Some(AttrCallResult::Value(Value::Ref(tuple_id))))
+            Ok(Some(AttrCallResult::Value(allocate_tuple(elements, heap)?)))
         } else {
             Ok(None)
         }

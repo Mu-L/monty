@@ -1,5 +1,7 @@
 //! Implementation of the enumerate() builtin function.
 
+use smallvec::smallvec;
+
 use crate::{
     args::ArgValues,
     defer_drop, defer_drop_mut,
@@ -7,7 +9,7 @@ use crate::{
     heap::{Heap, HeapData},
     intern::Interns,
     resource::ResourceTracker,
-    types::{List, MontyIter, PyTrait, Tuple},
+    types::{List, MontyIter, PyTrait, allocate_tuple},
     value::Value,
 };
 
@@ -44,8 +46,8 @@ pub fn builtin_enumerate(
 
     while let Some(item) = iter.for_next(heap, interns)? {
         // Create tuple (index, item)
-        let tuple_id = heap.allocate(HeapData::Tuple(Tuple::new(vec![Value::Int(index), item])))?;
-        result.push(Value::Ref(tuple_id));
+        let tuple_val = allocate_tuple(smallvec![Value::Int(index), item], heap)?;
+        result.push(tuple_val);
         index += 1;
     }
 

@@ -2,6 +2,7 @@
 
 use num_bigint::BigInt;
 use num_integer::Integer;
+use smallvec::smallvec;
 
 use crate::{
     args::ArgValues,
@@ -9,7 +10,7 @@ use crate::{
     exception_private::{ExcType, RunResult, SimpleException},
     heap::{Heap, HeapData},
     resource::ResourceTracker,
-    types::{LongInt, PyTrait, Tuple},
+    types::{LongInt, PyTrait, allocate_tuple},
     value::Value,
 };
 
@@ -31,8 +32,7 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
             } else {
                 // Python uses floor division (toward negative infinity), not Euclidean
                 let (quot, rem) = floor_divmod(*x, *y);
-                let tuple_id = heap.allocate(HeapData::Tuple(Tuple::new(vec![Value::Int(quot), Value::Int(rem)])))?;
-                Ok(Value::Ref(tuple_id))
+                Ok(allocate_tuple(smallvec![Value::Int(quot), Value::Int(rem)], heap)?)
             }
         }
         (Value::Int(x), Value::Ref(id)) => {
@@ -44,8 +44,7 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                     let (quot, rem) = bigint_floor_divmod(&x_bi, li.inner());
                     let quot_val = LongInt::new(quot).into_value(heap)?;
                     let rem_val = LongInt::new(rem).into_value(heap)?;
-                    let tuple_id = heap.allocate(HeapData::Tuple(Tuple::new(vec![quot_val, rem_val])))?;
-                    Ok(Value::Ref(tuple_id))
+                    Ok(allocate_tuple(smallvec![quot_val, rem_val], heap)?)
                 }
             } else {
                 let a_type = a.py_type(heap);
@@ -66,8 +65,7 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                     let (quot, rem) = bigint_floor_divmod(li.inner(), &y_bi);
                     let quot_val = LongInt::new(quot).into_value(heap)?;
                     let rem_val = LongInt::new(rem).into_value(heap)?;
-                    let tuple_id = heap.allocate(HeapData::Tuple(Tuple::new(vec![quot_val, rem_val])))?;
-                    Ok(Value::Ref(tuple_id))
+                    Ok(allocate_tuple(smallvec![quot_val, rem_val], heap)?)
                 }
             } else {
                 let a_type = a.py_type(heap);
@@ -98,8 +96,7 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                     let (quot, rem) = bigint_floor_divmod(&x_bi, li.inner());
                     let quot_val = LongInt::new(quot).into_value(heap)?;
                     let rem_val = LongInt::new(rem).into_value(heap)?;
-                    let tuple_id = heap.allocate(HeapData::Tuple(Tuple::new(vec![quot_val, rem_val])))?;
-                    Ok(Value::Ref(tuple_id))
+                    Ok(allocate_tuple(smallvec![quot_val, rem_val], heap)?)
                 }
             } else {
                 let a_type = a.py_type(heap);
@@ -117,9 +114,7 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
             } else {
                 let quot = (x / y).floor();
                 let rem = x - quot * y;
-                let tuple_id =
-                    heap.allocate(HeapData::Tuple(Tuple::new(vec![Value::Float(quot), Value::Float(rem)])))?;
-                Ok(Value::Ref(tuple_id))
+                Ok(allocate_tuple(smallvec![Value::Float(quot), Value::Float(rem)], heap)?)
             }
         }
         (Value::Int(x), Value::Float(y)) => {
@@ -129,9 +124,7 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                 let xf = *x as f64;
                 let quot = (xf / y).floor();
                 let rem = xf - quot * y;
-                let tuple_id =
-                    heap.allocate(HeapData::Tuple(Tuple::new(vec![Value::Float(quot), Value::Float(rem)])))?;
-                Ok(Value::Ref(tuple_id))
+                Ok(allocate_tuple(smallvec![Value::Float(quot), Value::Float(rem)], heap)?)
             }
         }
         (Value::Float(x), Value::Int(y)) => {
@@ -141,9 +134,7 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                 let yf = *y as f64;
                 let quot = (x / yf).floor();
                 let rem = x - quot * yf;
-                let tuple_id =
-                    heap.allocate(HeapData::Tuple(Tuple::new(vec![Value::Float(quot), Value::Float(rem)])))?;
-                Ok(Value::Ref(tuple_id))
+                Ok(allocate_tuple(smallvec![Value::Float(quot), Value::Float(rem)], heap)?)
             }
         }
         _ => {

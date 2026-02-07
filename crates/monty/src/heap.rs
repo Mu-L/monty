@@ -11,6 +11,7 @@ use std::{
 
 use ahash::AHashSet;
 use num_integer::Integer;
+use smallvec::SmallVec;
 
 use crate::{
     args::ArgValues,
@@ -20,7 +21,7 @@ use crate::{
     resource::{ResourceError, ResourceTracker},
     types::{
         AttrCallResult, Bytes, Dataclass, Dict, FrozenSet, List, LongInt, Module, MontyIter, NamedTuple, Path, PyTrait,
-        Range, ReprError, Set, Slice, Str, Tuple, Type,
+        Range, ReprError, Set, Slice, Str, Tuple, Type, allocate_tuple,
     },
     value::{EitherStr, Value},
 };
@@ -913,6 +914,12 @@ pub(crate) struct Heap<T: ResourceTracker> {
     /// Uses AtomicU16 for thread safety with Python bindings.
     /// Prevents stack overflow from deeply nested (but not cyclic) structures.
     data_recursion_depth: AtomicU16,
+    /// Cached HeapId for the empty tuple singleton `()`.
+    ///
+    /// Lazily allocated on first use via `get_or_create_empty_tuple()`.
+    /// In Python, `() is ()` is always `True` because empty tuples are interned.
+    /// This field enables the same optimization.
+    empty_tuple_id: Option<HeapId>,
 }
 
 impl<T: ResourceTracker + serde::Serialize> serde::Serialize for Heap<T> {
@@ -928,6 +935,7 @@ impl<T: ResourceTracker + serde::Serialize> serde::Serialize for Heap<T> {
             "data_recursion_depth",
             &self.data_recursion_depth.load(Ordering::Relaxed),
         )?;
+        state.serialize_field("empty_tuple_id", &self.empty_tuple_id)?;
         state.end()
     }
 }
@@ -943,6 +951,7 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
             allocations_since_gc: u32,
             #[serde(default)]
             data_recursion_depth: u16,
+            empty_tuple_id: Option<HeapId>,
         }
         let fields = HeapFields::<T>::deserialize(deserializer)?;
         Ok(Self {
@@ -952,6 +961,7 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
             may_have_cycles: fields.may_have_cycles,
             allocations_since_gc: fields.allocations_since_gc,
             data_recursion_depth: AtomicU16::new(fields.data_recursion_depth),
+            empty_tuple_id: fields.empty_tuple_id,
         })
     }
 }
@@ -1028,6 +1038,7 @@ impl<T: ResourceTracker> Heap<T> {
             may_have_cycles: false,
             allocations_since_gc: 0,
             data_recursion_depth: AtomicU16::new(0),
+            empty_tuple_id: None,
         }
     }
 
@@ -1163,6 +1174,33 @@ impl<T: ResourceTracker> Heap<T> {
         };
 
         Ok(id)
+    }
+
+    /// Returns the singleton empty tuple, creating it on first use.
+    ///
+    /// In Python, `() is ()` is always `True` because empty tuples are interned.
+    /// This method provides the same optimization by returning the same `HeapId`
+    /// for all empty tuple allocations.
+    ///
+    /// The returned `HeapId` has its reference count incremented, so the caller
+    /// owns a reference and must call `dec_ref` when done.
+    ///
+    /// # Errors
+    /// Returns `ResourceError` if allocating the empty tuple fails (only possible
+    /// on first call when resource limits are exhausted).
+    pub fn get_or_create_empty_tuple(&mut self) -> Result<HeapId, ResourceError> {
+        if let Some(id) = self.empty_tuple_id {
+            // Return existing singleton with incremented refcount
+            self.inc_ref(id);
+            Ok(id)
+        } else {
+            // First use - allocate the empty tuple singleton
+            let id = self.allocate(HeapData::Tuple(Tuple::default()))?;
+            self.empty_tuple_id = Some(id);
+            // Keep an extra reference so the singleton is never freed
+            self.inc_ref(id);
+            Ok(id)
+        }
     }
 
     /// Increments the reference count for an existing heap entry.
@@ -1434,10 +1472,19 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// This is primarily used for testing to verify that all heap entries
     /// are accounted for in reference count tests.
+    ///
+    /// Excludes the empty tuple singleton since it's an internal optimization
+    /// detail that persists even when not explicitly used by user code.
     #[must_use]
     #[cfg(feature = "ref-count-return")]
     pub fn entry_count(&self) -> usize {
-        self.entries.iter().filter(|o| o.is_some()).count()
+        let count = self.entries.iter().filter(|o| o.is_some()).count();
+        // Subtract 1 for the empty tuple singleton if it exists
+        if self.empty_tuple_id.is_some() {
+            count.saturating_sub(1)
+        } else {
+            count
+        }
     }
 
     /// Gets the value inside a cell, cloning it with proper refcount handling.
@@ -1588,9 +1635,8 @@ impl<T: ResourceTracker> Heap<T> {
             HeapData::Tuple(tuple) => {
                 if count == 0 {
                     restore_data!(self, id, data, "mult_sequence");
-                    Ok(Some(Value::Ref(
-                        self.allocate(HeapData::Tuple(Tuple::new(Vec::new())))?,
-                    )))
+                    // Use empty tuple singleton
+                    Ok(Some(Value::Ref(self.get_or_create_empty_tuple()?)))
                 } else {
                     // Copy items and track which refs need incrementing
                     let items: Vec<Value> = tuple.as_vec().iter().map(Value::copy_for_extend).collect();
@@ -1612,7 +1658,7 @@ impl<T: ResourceTracker> Heap<T> {
                     let capacity = original_len
                         .checked_mul(count)
                         .ok_or_else(ExcType::overflow_repeat_count)?;
-                    let mut result = Vec::with_capacity(capacity);
+                    let mut result = SmallVec::with_capacity(capacity);
                     for _ in 0..count {
                         for item in &items {
                             result.push(item.copy_for_extend());
@@ -1622,7 +1668,7 @@ impl<T: ResourceTracker> Heap<T> {
                     // Manually forget the items vec to avoid Drop panic
                     std::mem::forget(items);
 
-                    Ok(Some(Value::Ref(self.allocate(HeapData::Tuple(Tuple::new(result)))?)))
+                    Ok(Some(allocate_tuple(result, self)?))
                 }
             }
             _ => {
