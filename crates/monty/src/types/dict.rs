@@ -8,8 +8,7 @@ use ahash::AHashSet;
 use hashbrown::{HashTable, hash_table::Entry};
 use smallvec::smallvec;
 
-use super::allocate_tuple;
-use super::{List, MontyIter, PyTrait, ReprError};
+use super::{List, MontyIter, PyTrait, ReprError, allocate_tuple};
 use crate::{
     args::{ArgValues, KwargsValues},
     exception_private::{ExcType, RunResult},

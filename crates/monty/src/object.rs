@@ -337,6 +337,13 @@ impl MontyObject {
                 // Mark this id as being visited
                 visited.insert(*id);
 
+                // Guard against deep nesting (non-cyclic structures that would overflow stack).
+                // If we can't get a guard, the structure is too deep - return a truncated repr.
+                let Ok(_guard) = heap.enter_data_recursion() else {
+                    visited.remove(id);
+                    return Self::Repr("<deeply nested>".to_owned());
+                };
+
                 let result = match heap.get(*id) {
                     HeapData::Str(s) => Self::String(s.as_str().to_owned()),
                     HeapData::Bytes(b) => Self::Bytes(b.as_slice().to_owned()),

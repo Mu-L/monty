@@ -16,8 +16,7 @@ use crate::{
     intern::{Interns, StaticStrings, StringId},
     os::OsFunction,
     resource::ResourceTracker,
-    types::allocate_tuple,
-    types::{AttrCallResult, PyTrait, ReprError, Str, Type},
+    types::{AttrCallResult, PyTrait, ReprError, Str, Type, allocate_tuple},
     value::{EitherStr, Value},
 };
 
