@@ -1008,21 +1008,6 @@ pub const MAX_DATA_RECURSION_DEPTH: u16 = 1000;
 #[cfg(debug_assertions)]
 pub const MAX_DATA_RECURSION_DEPTH: u16 = 35;
 
-/// RAII guard that decrements data recursion depth on drop.
-///
-/// Created by `Heap::enter_data_recursion()` when entering recursive
-/// container operations. Automatically decrements depth when dropped,
-/// ensuring correct cleanup even on early returns or errors.
-pub struct DataRecursionGuard<'a>(&'a AtomicU16);
-
-impl Drop for DataRecursionGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v + 1));
-    }
-}
-
 impl<T: ResourceTracker> Heap<T> {
     /// Creates a new heap with the given resource tracker.
     ///
@@ -1064,41 +1049,11 @@ impl<T: ResourceTracker> Heap<T> {
         self.may_have_cycles = true;
     }
 
-    /// Enters a recursive data structure operation (repr, eq, hash, etc).
+    /// Incrase data recursion depth, returning error if limit exceeded.
     ///
-    /// Returns a guard that decrements the depth on drop. Returns
-    /// `Err(ResourceError::Recursion)` if depth limit exceeded.
-    ///
-    /// This is used to prevent stack overflow from deeply nested (but not cyclic)
-    /// structures. For example, 10,000 nested lists `[[[...]]]` would overflow
-    /// the Rust stack without this protection.
-    ///
-    /// Use this for operations that take `&Heap` (like `py_repr_fmt`). For operations
-    /// that take `&mut Heap` (like `py_eq`), use `try_inc_data_recursion` and
-    /// `dec_data_recursion` manually to avoid borrow conflicts.
+    /// You MUST call `reduce_data_recursion` on every return path after calling this.
     #[inline]
-    pub fn enter_data_recursion(&self) -> Result<DataRecursionGuard<'_>, ResourceError> {
-        let current = self.data_recursion_depth_remaining.load(Ordering::Relaxed);
-        if let Some(incr) = current.checked_sub(1) {
-            self.data_recursion_depth_remaining.store(incr, Ordering::Relaxed);
-            Ok(DataRecursionGuard(&self.data_recursion_depth_remaining))
-        } else {
-            Err(ResourceError::Recursion {
-                limit: MAX_DATA_RECURSION_DEPTH as usize,
-                depth: MAX_DATA_RECURSION_DEPTH as usize,
-            })
-        }
-    }
-
-    /// Increments data recursion depth, returning error if limit exceeded.
-    ///
-    /// This is the non-RAII version for use in methods that take `&mut Heap`.
-    /// You MUST call `dec_data_recursion` on every return path after calling this.
-    ///
-    /// For methods that take `&Heap`, prefer `enter_data_recursion` which returns
-    /// an RAII guard for automatic cleanup.
-    #[inline]
-    pub fn increase_data_recursion(&mut self) -> Result<(), ResourceError> {
+    pub fn increase_data_recursion(&self) -> Result<(), ResourceError> {
         let current = self.data_recursion_depth_remaining.load(Ordering::Relaxed);
         if let Some(incr) = current.checked_sub(1) {
             self.data_recursion_depth_remaining.store(incr, Ordering::Relaxed);
@@ -1111,11 +1066,11 @@ impl<T: ResourceTracker> Heap<T> {
         }
     }
 
-    /// Decrements data recursion depth.
+    /// Decrease data recursion depth.
     ///
-    /// Must be called after `try_inc_data_recursion` on every return path.
+    /// Must be called after `increase_data_recursion` on every return path.
     #[inline]
-    pub fn reduce_data_recursion(&mut self) {
+    pub fn reduce_data_recursion(&self) {
         let _ = self
             .data_recursion_depth_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v + 1));

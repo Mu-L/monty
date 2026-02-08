@@ -445,6 +445,33 @@ impl Dict {
             .copied();
         Ok((opt_index, hash))
     }
+
+    fn py_repr_fmt_inner(
+        &self,
+        f: &mut impl Write,
+        heap: &Heap<impl ResourceTracker>,
+        heap_ids: &mut AHashSet<HeapId>,
+        interns: &Interns,
+    ) -> Result<(), ReprError> {
+        if self.is_empty() {
+            f.write_str("{}")?;
+            return Ok(());
+        }
+
+        f.write_char('{')?;
+        let mut first = true;
+        for entry in &self.entries {
+            if !first {
+                f.write_str(", ")?;
+            }
+            first = false;
+            entry.key.py_repr_fmt(f, heap, heap_ids, interns)?;
+            f.write_str(": ")?;
+            entry.value.py_repr_fmt(f, heap, heap_ids, interns)?;
+        }
+        f.write_char('}')?;
+        Ok(())
+    }
 }
 
 /// Iterator over borrowed (key, value) pairs in a dict.
@@ -564,27 +591,10 @@ impl PyTrait for Dict {
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
-        if self.is_empty() {
-            f.write_str("{}")?;
-            return Ok(());
-        }
-
-        // Guard against deep nesting (non-cyclic structures that would overflow stack)
-        let _guard = heap.enter_data_recursion()?;
-
-        f.write_char('{')?;
-        let mut first = true;
-        for entry in &self.entries {
-            if !first {
-                f.write_str(", ")?;
-            }
-            first = false;
-            entry.key.py_repr_fmt(f, heap, heap_ids, interns)?;
-            f.write_str(": ")?;
-            entry.value.py_repr_fmt(f, heap, heap_ids, interns)?;
-        }
-        f.write_char('}')?;
-        Ok(())
+        heap.increase_data_recursion()?;
+        let result = self.py_repr_fmt_inner(f, heap, heap_ids, interns);
+        heap.reduce_data_recursion();
+        result
     }
 
     fn py_getitem(&self, key: &Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Value> {

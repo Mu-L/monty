@@ -420,9 +420,6 @@ impl SetStorage {
             return Ok(());
         }
 
-        // Guard against deep nesting (non-cyclic structures that would overflow stack)
-        let _guard = heap.enter_data_recursion()?;
-
         // frozenset needs type prefix: frozenset({...}), but set doesn't: {...}
         let needs_prefix = type_name != "set";
         if needs_prefix {
@@ -632,7 +629,10 @@ impl PyTrait for Set {
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
-        self.0.repr_fmt(f, heap, heap_ids, interns, "set")
+        heap.increase_data_recursion()?;
+        let result = self.0.repr_fmt(f, heap, heap_ids, interns, "set");
+        heap.reduce_data_recursion();
+        result
     }
 
     fn py_call_attr(
@@ -1140,7 +1140,10 @@ impl PyTrait for FrozenSet {
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
-        self.0.repr_fmt(f, heap, heap_ids, interns, "frozenset")
+        heap.increase_data_recursion()?;
+        let result = self.0.repr_fmt(f, heap, heap_ids, interns, "frozenset");
+        heap.reduce_data_recursion();
+        result
     }
 
     fn py_call_attr(

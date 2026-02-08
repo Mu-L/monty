@@ -283,7 +283,10 @@ impl PyTrait for Tuple {
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
-        repr_sequence_fmt('(', ')', &self.items, f, heap, heap_ids, interns)
+        heap.increase_data_recursion()?;
+        let result = repr_sequence_fmt('(', ')', &self.items, f, heap, heap_ids, interns);
+        heap.reduce_data_recursion();
+        result
     }
 }
 

@@ -354,7 +354,10 @@ impl PyTrait for List {
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
-        repr_sequence_fmt('[', ']', &self.items, f, heap, heap_ids, interns)
+        heap.increase_data_recursion()?;
+        let result = repr_sequence_fmt('[', ']', &self.items, f, heap, heap_ids, interns);
+        heap.reduce_data_recursion();
+        result
     }
 
     fn py_add(
@@ -1021,9 +1024,6 @@ pub(crate) fn repr_sequence_fmt(
     heap_ids: &mut AHashSet<HeapId>,
     interns: &Interns,
 ) -> Result<(), ReprError> {
-    // Guard against deep nesting (non-cyclic structures that would overflow stack)
-    let _guard = heap.enter_data_recursion()?;
-
     f.write_char(start)?;
     let mut iter = items.iter();
     if let Some(first) = iter.next() {

@@ -187,6 +187,42 @@ impl Dataclass {
         }
         Some(hasher.finish())
     }
+
+    fn py_repr_fmt_inner(
+        &self,
+        f: &mut impl Write,
+        heap: &Heap<impl ResourceTracker>,
+        heap_ids: &mut AHashSet<HeapId>,
+        interns: &Interns,
+    ) -> Result<(), ReprError> {
+        // Format: ClassName(field1=value1, field2=value2, ...)
+        // Only declared fields are shown, not dynamically added attributes
+        f.write_str(self.name(interns))?;
+        f.write_char('(')?;
+
+        let mut first = true;
+        for field_name in &self.field_names {
+            if !first {
+                f.write_str(", ")?;
+            }
+            first = false;
+
+            // Write field name
+            f.write_str(field_name)?;
+            f.write_char('=')?;
+
+            // Look up value in attrs
+            if let Some(value) = self.attrs.get_by_str(field_name, heap, interns) {
+                value.py_repr_fmt(f, heap, heap_ids, interns)?;
+            } else {
+                // Field not found - shouldn't happen for well-formed dataclasses
+                f.write_str("<?>")?;
+            }
+        }
+
+        f.write_char(')')?;
+        Ok(())
+    }
 }
 
 impl PyTrait for Dataclass {
@@ -234,36 +270,10 @@ impl PyTrait for Dataclass {
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
-        // Guard against deep nesting (non-cyclic structures that would overflow stack)
-        let _guard = heap.enter_data_recursion()?;
-
-        // Format: ClassName(field1=value1, field2=value2, ...)
-        // Only declared fields are shown, not dynamically added attributes
-        f.write_str(self.name(interns))?;
-        f.write_char('(')?;
-
-        let mut first = true;
-        for field_name in &self.field_names {
-            if !first {
-                f.write_str(", ")?;
-            }
-            first = false;
-
-            // Write field name
-            f.write_str(field_name)?;
-            f.write_char('=')?;
-
-            // Look up value in attrs
-            if let Some(value) = self.attrs.get_by_str(field_name, heap, interns) {
-                value.py_repr_fmt(f, heap, heap_ids, interns)?;
-            } else {
-                // Field not found - shouldn't happen for well-formed dataclasses
-                f.write_str("<?>")?;
-            }
-        }
-
-        f.write_char(')')?;
-        Ok(())
+        heap.increase_data_recursion()?;
+        let result = self.py_repr_fmt_inner(f, heap, heap_ids, interns);
+        heap.reduce_data_recursion();
+        result
     }
 
     fn py_call_attr(
