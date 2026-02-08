@@ -278,7 +278,7 @@ impl SetStorage {
         }
 
         // Guard against deep nesting (non-cyclic structures that would overflow stack)
-        heap.try_inc_data_recursion()?;
+        heap.increase_data_recursion()?;
         let result = (|| {
             // Check that every element in self is in other
             for entry in &self.entries {
@@ -289,7 +289,7 @@ impl SetStorage {
             }
             Ok(true)
         })();
-        heap.dec_data_recursion();
+        heap.reduce_data_recursion();
         result
     }
 

@@ -244,7 +244,7 @@ impl HeapData {
             }
             Self::Tuple(t) => {
                 // Guard against deep nesting - if limit exceeded, treat as unhashable
-                if heap.try_inc_data_recursion().is_err() {
+                if heap.increase_data_recursion().is_err() {
                     return None;
                 }
                 let mut hasher = DefaultHasher::new();
@@ -253,17 +253,17 @@ impl HeapData {
                 for obj in t.as_vec() {
                     let h = obj.py_hash(heap, interns);
                     if h.is_none() {
-                        heap.dec_data_recursion();
+                        heap.reduce_data_recursion();
                         return None;
                     }
                     h.unwrap().hash(&mut hasher);
                 }
-                heap.dec_data_recursion();
+                heap.reduce_data_recursion();
                 Some(hasher.finish())
             }
             Self::NamedTuple(nt) => {
                 // Guard against deep nesting - if limit exceeded, treat as unhashable
-                if heap.try_inc_data_recursion().is_err() {
+                if heap.increase_data_recursion().is_err() {
                     return None;
                 }
                 let mut hasher = DefaultHasher::new();
@@ -272,12 +272,12 @@ impl HeapData {
                 for obj in nt.as_vec() {
                     let h = obj.py_hash(heap, interns);
                     if h.is_none() {
-                        heap.dec_data_recursion();
+                        heap.reduce_data_recursion();
                         return None;
                     }
                     h.unwrap().hash(&mut hasher);
                 }
-                heap.dec_data_recursion();
+                heap.reduce_data_recursion();
                 Some(hasher.finish())
             }
             Self::Closure(f, _, _) | Self::FunctionDefaults(f, _) => {
@@ -442,7 +442,7 @@ impl PyTrait for HeapData {
                     return Ok(false);
                 }
                 // Guard against deep nesting
-                heap.try_inc_data_recursion()?;
+                heap.increase_data_recursion()?;
                 let result = (|| {
                     for (a, b) in nt_items.iter().zip(t_items.iter()) {
                         if !a.py_eq(b, heap, interns)? {
@@ -451,7 +451,7 @@ impl PyTrait for HeapData {
                     }
                     Ok(true)
                 })();
-                heap.dec_data_recursion();
+                heap.reduce_data_recursion();
                 result
             }
             (Self::Dict(a), Self::Dict(b)) => a.py_eq(b, heap, interns),
@@ -911,9 +911,9 @@ pub(crate) struct Heap<T: ResourceTracker> {
     /// Number of GC applicable allocations since the last GC.
     allocations_since_gc: u32,
     /// Tracks recursion depth for container operations (repr, eq, cmp, hash).
-    /// Uses AtomicU16 for thread safety with Python bindings.
+    /// Uses AtomicU16 so multiple guards can hold a reference to the value
     /// Prevents stack overflow from deeply nested (but not cyclic) structures.
-    data_recursion_depth: AtomicU16,
+    data_recursion_depth_remaining: AtomicU16,
     /// Cached HeapId for the empty tuple singleton `()`.
     ///
     /// Lazily allocated on first use via `get_or_create_empty_tuple()`.
@@ -932,8 +932,8 @@ impl<T: ResourceTracker + serde::Serialize> serde::Serialize for Heap<T> {
         state.serialize_field("may_have_cycles", &self.may_have_cycles)?;
         state.serialize_field("allocations_since_gc", &self.allocations_since_gc)?;
         state.serialize_field(
-            "data_recursion_depth",
-            &self.data_recursion_depth.load(Ordering::Relaxed),
+            "data_recursion_depth_remaining",
+            &self.data_recursion_depth_remaining.load(Ordering::Relaxed),
         )?;
         state.serialize_field("empty_tuple_id", &self.empty_tuple_id)?;
         state.end()
@@ -950,7 +950,7 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
             may_have_cycles: bool,
             allocations_since_gc: u32,
             #[serde(default)]
-            data_recursion_depth: u16,
+            data_recursion_depth_remaining: u16,
             empty_tuple_id: Option<HeapId>,
         }
         let fields = HeapFields::<T>::deserialize(deserializer)?;
@@ -960,7 +960,7 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
             tracker: fields.tracker,
             may_have_cycles: fields.may_have_cycles,
             allocations_since_gc: fields.allocations_since_gc,
-            data_recursion_depth: AtomicU16::new(fields.data_recursion_depth),
+            data_recursion_depth_remaining: AtomicU16::new(fields.data_recursion_depth_remaining),
             empty_tuple_id: fields.empty_tuple_id,
         })
     }
@@ -1013,16 +1013,13 @@ pub const MAX_DATA_RECURSION_DEPTH: u16 = 35;
 /// Created by `Heap::enter_data_recursion()` when entering recursive
 /// container operations. Automatically decrements depth when dropped,
 /// ensuring correct cleanup even on early returns or errors.
-pub struct DataRecursionGuard<'a> {
-    depth: &'a AtomicU16,
-}
+pub struct DataRecursionGuard<'a>(&'a AtomicU16);
 
 impl Drop for DataRecursionGuard<'_> {
     fn drop(&mut self) {
-        // Saturating sub in case of underflow (shouldn't happen with correct usage)
         let _ = self
-            .depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v + 1));
     }
 }
 
@@ -1037,7 +1034,7 @@ impl<T: ResourceTracker> Heap<T> {
             tracker,
             may_have_cycles: false,
             allocations_since_gc: 0,
-            data_recursion_depth: AtomicU16::new(0),
+            data_recursion_depth_remaining: AtomicU16::new(MAX_DATA_RECURSION_DEPTH),
             empty_tuple_id: None,
         }
     }
@@ -1081,17 +1078,16 @@ impl<T: ResourceTracker> Heap<T> {
     /// `dec_data_recursion` manually to avoid borrow conflicts.
     #[inline]
     pub fn enter_data_recursion(&self) -> Result<DataRecursionGuard<'_>, ResourceError> {
-        let current = self.data_recursion_depth.load(Ordering::Relaxed);
-        if current >= MAX_DATA_RECURSION_DEPTH {
-            return Err(ResourceError::Recursion {
+        let current = self.data_recursion_depth_remaining.load(Ordering::Relaxed);
+        if let Some(incr) = current.checked_sub(1) {
+            self.data_recursion_depth_remaining.store(incr, Ordering::Relaxed);
+            Ok(DataRecursionGuard(&self.data_recursion_depth_remaining))
+        } else {
+            Err(ResourceError::Recursion {
                 limit: MAX_DATA_RECURSION_DEPTH as usize,
-                depth: current as usize,
-            });
+                depth: MAX_DATA_RECURSION_DEPTH as usize,
+            })
         }
-        self.data_recursion_depth.store(current + 1, Ordering::Relaxed);
-        Ok(DataRecursionGuard {
-            depth: &self.data_recursion_depth,
-        })
     }
 
     /// Increments data recursion depth, returning error if limit exceeded.
@@ -1102,26 +1098,27 @@ impl<T: ResourceTracker> Heap<T> {
     /// For methods that take `&Heap`, prefer `enter_data_recursion` which returns
     /// an RAII guard for automatic cleanup.
     #[inline]
-    pub fn try_inc_data_recursion(&mut self) -> Result<(), ResourceError> {
-        let current = self.data_recursion_depth.load(Ordering::Relaxed);
-        if current >= MAX_DATA_RECURSION_DEPTH {
-            return Err(ResourceError::Recursion {
+    pub fn increase_data_recursion(&mut self) -> Result<(), ResourceError> {
+        let current = self.data_recursion_depth_remaining.load(Ordering::Relaxed);
+        if let Some(incr) = current.checked_sub(1) {
+            self.data_recursion_depth_remaining.store(incr, Ordering::Relaxed);
+            Ok(())
+        } else {
+            Err(ResourceError::Recursion {
                 limit: MAX_DATA_RECURSION_DEPTH as usize,
-                depth: current as usize,
-            });
+                depth: MAX_DATA_RECURSION_DEPTH as usize,
+            })
         }
-        self.data_recursion_depth.store(current + 1, Ordering::Relaxed);
-        Ok(())
     }
 
     /// Decrements data recursion depth.
     ///
     /// Must be called after `try_inc_data_recursion` on every return path.
     #[inline]
-    pub fn dec_data_recursion(&mut self) {
+    pub fn reduce_data_recursion(&mut self) {
         let _ = self
-            .data_recursion_depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+            .data_recursion_depth_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v + 1));
     }
 
     /// Returns the number of GC-tracked allocations since the last garbage collection.

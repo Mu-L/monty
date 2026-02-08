@@ -515,7 +515,7 @@ impl PyTrait for Dict {
         }
 
         // Guard against deep nesting (non-cyclic structures that would overflow stack)
-        heap.try_inc_data_recursion()?;
+        heap.increase_data_recursion()?;
         let result = (|| {
             // Check that all keys in self exist in other with equal values
             for entry in &self.entries {
@@ -530,7 +530,7 @@ impl PyTrait for Dict {
             }
             Ok(true)
         })();
-        heap.dec_data_recursion();
+        heap.reduce_data_recursion();
         result
     }
 

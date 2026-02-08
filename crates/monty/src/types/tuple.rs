@@ -211,7 +211,7 @@ impl PyTrait for Tuple {
             return Ok(false);
         }
         // Guard against deep nesting (non-cyclic structures that would overflow stack)
-        heap.try_inc_data_recursion()?;
+        heap.increase_data_recursion()?;
         let result = (|| {
             for (i1, i2) in self.items.iter().zip(&other.items) {
                 if !i1.py_eq(i2, heap, interns)? {
@@ -220,7 +220,7 @@ impl PyTrait for Tuple {
             }
             Ok(true)
         })();
-        heap.dec_data_recursion();
+        heap.reduce_data_recursion();
         result
     }
 

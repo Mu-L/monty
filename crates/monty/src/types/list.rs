@@ -316,7 +316,7 @@ impl PyTrait for List {
             return Ok(false);
         }
         // Guard against deep nesting - use manual inc/dec due to borrow conflicts with guard
-        heap.try_inc_data_recursion()?;
+        heap.increase_data_recursion()?;
         let result = (|| {
             for (i1, i2) in self.items.iter().zip(&other.items) {
                 if !i1.py_eq(i2, heap, interns)? {
@@ -325,7 +325,7 @@ impl PyTrait for List {
             }
             Ok(true)
         })();
-        heap.dec_data_recursion();
+        heap.reduce_data_recursion();
         result
     }
 
