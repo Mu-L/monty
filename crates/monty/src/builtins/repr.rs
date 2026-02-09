@@ -2,7 +2,7 @@
 
 use crate::{
     args::ArgValues,
-    defer_drop,
+    defer_drop_mut,
     exception_private::RunResult,
     heap::{Heap, HeapData},
     intern::Interns,
@@ -16,7 +16,8 @@ use crate::{
 /// Returns a string containing a printable representation of an object.
 pub fn builtin_repr(heap: &mut Heap<impl ResourceTracker>, args: ArgValues, interns: &Interns) -> RunResult<Value> {
     let value = args.get_one_arg("repr", heap)?;
-    defer_drop!(value, heap);
-    let heap_id = heap.allocate(HeapData::Str(value.py_repr(heap, interns)?.into_owned().into()))?;
+    defer_drop_mut!(value, heap);
+    let s = value.py_repr(heap, interns)?.into_owned();
+    let heap_id = heap.allocate(HeapData::Str(s.into()))?;
     Ok(Value::Ref(heap_id))
 }

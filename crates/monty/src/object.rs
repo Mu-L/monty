@@ -297,7 +297,7 @@ impl MontyObject {
         }
     }
 
-    fn from_value(object: &Value, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Self {
+    fn from_value(object: &Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Self {
         let mut visited = AHashSet::new();
         Self::from_value_inner(object, heap, &mut visited, interns)
     }
@@ -309,7 +309,7 @@ impl MontyObject {
     /// with an appropriate placeholder string.
     fn from_value_inner(
         object: &Value,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         visited: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Self {
@@ -366,88 +366,42 @@ impl MontyObject {
     fn from_heap_value(
         object: &Value,
         heap_id: HeapId,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         visited: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Self {
-        match heap.get(heap_id) {
-            HeapData::Str(s) => Self::String(s.as_str().to_owned()),
-            HeapData::Bytes(b) => Self::Bytes(b.as_slice().to_owned()),
-            HeapData::List(list) => Self::List(
-                list.as_vec()
-                    .iter()
-                    .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
-                    .collect(),
-            ),
-            HeapData::Tuple(tuple) => Self::Tuple(
-                tuple
-                    .as_vec()
-                    .iter()
-                    .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
-                    .collect(),
-            ),
-            HeapData::NamedTuple(nt) => Self::NamedTuple {
-                type_name: nt.name(interns).to_owned(),
-                field_names: nt
-                    .field_names()
-                    .iter()
-                    .map(|field_name| field_name.as_str(interns).to_owned())
-                    .collect(),
-                values: nt
-                    .as_vec()
-                    .iter()
-                    .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
-                    .collect(),
-            },
-            HeapData::Dict(dict) => Self::Dict(DictPairs(
-                dict.into_iter()
-                    .map(|(k, v)| {
-                        (
-                            Self::from_value_inner(k, heap, visited, interns),
-                            Self::from_value_inner(v, heap, visited, interns),
-                        )
-                    })
-                    .collect(),
-            )),
-            HeapData::Set(set) => Self::Set(
-                set.storage()
-                    .iter()
-                    .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
-                    .collect(),
-            ),
-            HeapData::FrozenSet(frozenset) => Self::FrozenSet(
-                frozenset
-                    .storage()
-                    .iter()
-                    .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
-                    .collect(),
-            ),
-            // Cells are internal closure implementation details
-            HeapData::Cell(inner) => {
-                // Show the cell's contents
-                Self::from_value_inner(inner, heap, visited, interns)
-            }
-            HeapData::Closure(..) | HeapData::FunctionDefaults(..) => {
-                let repr = object
-                    .py_repr(heap, interns)
-                    .map_or_else(|_| "<...>".to_owned(), Cow::into_owned);
-                Self::Repr(repr)
-            }
-            HeapData::Range(range) => {
-                // Represent Range as a repr string since MontyObject doesn't have a Range variant
-                let mut s = String::new();
-                let _ = range.py_repr_fmt(&mut s, heap, visited, interns);
-                Self::Repr(s)
-            }
-            HeapData::Exception(exc) => Self::Exception {
-                exc_type: exc.exc_type(),
-                arg: exc.arg().map(ToString::to_string),
-            },
-            HeapData::Dataclass(dc) => {
-                // Convert attrs to DictPairs
-                let attrs = DictPairs(
-                    dc.attrs()
-                        .into_iter()
+        heap.with_entry_mut(heap_id, |heap, data| {
+            match data {
+                HeapData::Str(s) => Self::String(s.as_str().to_owned()),
+                HeapData::Bytes(b) => Self::Bytes(b.as_slice().to_owned()),
+                HeapData::List(list) => Self::List(
+                    list.as_vec()
+                        .iter()
+                        .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
+                        .collect(),
+                ),
+                HeapData::Tuple(tuple) => Self::Tuple(
+                    tuple
+                        .as_vec()
+                        .iter()
+                        .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
+                        .collect(),
+                ),
+                HeapData::NamedTuple(nt) => Self::NamedTuple {
+                    type_name: nt.name(interns).to_owned(),
+                    field_names: nt
+                        .field_names()
+                        .iter()
+                        .map(|field_name| field_name.as_str(interns).to_owned())
+                        .collect(),
+                    values: nt
+                        .as_vec()
+                        .iter()
+                        .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
+                        .collect(),
+                },
+                HeapData::Dict(dict) => Self::Dict(DictPairs(
+                    dict.iter()
                         .map(|(k, v)| {
                             (
                                 Self::from_value_inner(k, heap, visited, interns),
@@ -455,46 +409,94 @@ impl MontyObject {
                             )
                         })
                         .collect(),
-                );
-                // Convert methods set to sorted Vec for determinism
-                let mut methods: Vec<String> = dc.methods().iter().cloned().collect();
-                methods.sort();
-                Self::Dataclass {
-                    name: dc.name(interns).to_owned(),
-                    type_id: dc.type_id(),
-                    field_names: dc.field_names().to_vec(),
-                    attrs,
-                    methods,
-                    frozen: dc.is_frozen(),
+                )),
+                HeapData::Set(set) => Self::Set(
+                    set.storage()
+                        .iter()
+                        .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
+                        .collect(),
+                ),
+                HeapData::FrozenSet(frozenset) => Self::FrozenSet(
+                    frozenset
+                        .storage()
+                        .iter()
+                        .map(|obj| Self::from_value_inner(obj, heap, visited, interns))
+                        .collect(),
+                ),
+                // Cells are internal closure implementation details
+                HeapData::Cell(inner) => {
+                    // Show the cell's contents
+                    Self::from_value_inner(inner, heap, visited, interns)
                 }
+                HeapData::Closure(..) | HeapData::FunctionDefaults(..) => {
+                    let repr = object
+                        .py_repr(heap, interns)
+                        .map_or_else(|_| "<...>".to_owned(), Cow::into_owned);
+                    Self::Repr(repr)
+                }
+                HeapData::Range(range) => {
+                    // Represent Range as a repr string since MontyObject doesn't have a Range variant
+                    let mut s = String::new();
+                    let _ = range.py_repr_fmt(&mut s, heap, visited, interns);
+                    Self::Repr(s)
+                }
+                HeapData::Exception(exc) => Self::Exception {
+                    exc_type: exc.exc_type(),
+                    arg: exc.arg().map(ToString::to_string),
+                },
+                HeapData::Dataclass(dc) => {
+                    // Convert attrs to DictPairs
+                    let attrs = DictPairs(
+                        dc.attrs()
+                            .into_iter()
+                            .map(|(k, v)| {
+                                (
+                                    Self::from_value_inner(k, heap, visited, interns),
+                                    Self::from_value_inner(v, heap, visited, interns),
+                                )
+                            })
+                            .collect(),
+                    );
+                    // Convert methods set to sorted Vec for determinism
+                    let mut methods: Vec<String> = dc.methods().iter().cloned().collect();
+                    methods.sort();
+                    Self::Dataclass {
+                        name: dc.name(interns).to_owned(),
+                        type_id: dc.type_id(),
+                        field_names: dc.field_names().to_vec(),
+                        attrs,
+                        methods,
+                        frozen: dc.is_frozen(),
+                    }
+                }
+                HeapData::Iter(_) => {
+                    // Iterators are internal objects - represent as a type string
+                    Self::Repr("<iterator>".to_owned())
+                }
+                HeapData::LongInt(li) => Self::BigInt(li.inner().clone()),
+                HeapData::Module(m) => {
+                    // Modules are represented as a repr string
+                    Self::Repr(format!("<module '{}'>", interns.get_str(m.name())))
+                }
+                HeapData::Slice(slice) => {
+                    // Represent Slice as a repr string since MontyObject doesn't have a Slice variant
+                    let mut s = String::new();
+                    let _ = slice.py_repr_fmt(&mut s, heap, visited, interns);
+                    Self::Repr(s)
+                }
+                HeapData::Coroutine(coro) => {
+                    // Coroutines are represented as a repr string
+                    let func = interns.get_function(coro.func_id);
+                    let name = interns.get_str(func.name.name_id);
+                    Self::Repr(format!("<coroutine object {name}>"))
+                }
+                HeapData::GatherFuture(gather) => {
+                    // GatherFutures are represented as a repr string
+                    Self::Repr(format!("<gather({})>", gather.item_count()))
+                }
+                HeapData::Path(path) => Self::Path(path.as_str().to_owned()),
             }
-            HeapData::Iter(_) => {
-                // Iterators are internal objects - represent as a type string
-                Self::Repr("<iterator>".to_owned())
-            }
-            HeapData::LongInt(li) => Self::BigInt(li.inner().clone()),
-            HeapData::Module(m) => {
-                // Modules are represented as a repr string
-                Self::Repr(format!("<module '{}'>", interns.get_str(m.name())))
-            }
-            HeapData::Slice(slice) => {
-                // Represent Slice as a repr string since MontyObject doesn't have a Slice variant
-                let mut s = String::new();
-                let _ = slice.py_repr_fmt(&mut s, heap, visited, interns);
-                Self::Repr(s)
-            }
-            HeapData::Coroutine(coro) => {
-                // Coroutines are represented as a repr string
-                let func = interns.get_function(coro.func_id);
-                let name = interns.get_str(func.name.name_id);
-                Self::Repr(format!("<coroutine object {name}>"))
-            }
-            HeapData::GatherFuture(gather) => {
-                // GatherFutures are represented as a repr string
-                Self::Repr(format!("<gather({})>", gather.item_count()))
-            }
-            HeapData::Path(path) => Self::Path(path.as_str().to_owned()),
-        }
+        })
     }
 
     /// Returns the Python `repr()` string for this value.

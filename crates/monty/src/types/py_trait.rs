@@ -184,7 +184,7 @@ pub trait PyTrait {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError>;
@@ -197,7 +197,7 @@ pub trait PyTrait {
     /// Returns `ResourceError` if maximum recursion depth is exceeded.
     fn py_repr(
         &self,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
     ) -> Result<Cow<'static, str>, ResourceError> {
         let mut s = String::new();
@@ -216,7 +216,11 @@ pub trait PyTrait {
     ///
     /// # Errors
     /// Returns `ResourceError` if maximum recursion depth is exceeded.
-    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Result<Cow<'static, str>, ResourceError> {
+    fn py_str(
+        &self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<Cow<'static, str>, ResourceError> {
         self.py_repr(heap, interns)
     }
 

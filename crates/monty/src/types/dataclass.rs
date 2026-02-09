@@ -191,7 +191,7 @@ impl Dataclass {
     fn py_repr_fmt_inner(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
@@ -266,7 +266,7 @@ impl PyTrait for Dataclass {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {

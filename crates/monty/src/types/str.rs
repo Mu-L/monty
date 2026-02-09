@@ -258,7 +258,7 @@ impl PyTrait for Str {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        _heap: &Heap<impl ResourceTracker>,
+        _heap: &mut Heap<impl ResourceTracker>,
         _heap_ids: &mut AHashSet<HeapId>,
         _interns: &Interns,
     ) -> Result<(), ReprError> {
@@ -268,7 +268,7 @@ impl PyTrait for Str {
 
     fn py_str(
         &self,
-        _heap: &Heap<impl ResourceTracker>,
+        _heap: &mut Heap<impl ResourceTracker>,
         _interns: &Interns,
     ) -> Result<Cow<'static, str>, crate::resource::ResourceError> {
         Ok(self.0.clone().into())

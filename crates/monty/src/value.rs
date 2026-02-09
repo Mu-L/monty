@@ -343,7 +343,7 @@ impl PyTrait for Value {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
@@ -386,7 +386,7 @@ impl PyTrait for Value {
                     }
                 } else {
                     heap_ids.insert(*id);
-                    let result = heap.get(*id).py_repr_fmt(f, heap, heap_ids, interns);
+                    let result = heap.with_entry_mut(*id, |heap, data| data.py_repr_fmt(f, heap, heap_ids, interns));
                     heap_ids.remove(id);
                     return result;
                 }
@@ -397,10 +397,14 @@ impl PyTrait for Value {
         Ok(())
     }
 
-    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Result<Cow<'static, str>, ResourceError> {
+    fn py_str(
+        &self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<Cow<'static, str>, ResourceError> {
         match self {
             Self::InternString(string_id) => Ok(interns.get_str(*string_id).to_owned().into()),
-            Self::Ref(id) => heap.get(*id).py_str(heap, interns),
+            Self::Ref(id) => heap.with_entry_mut(*id, |heap, data| data.py_str(heap, interns)),
             _ => self.py_repr(heap, interns),
         }
     }

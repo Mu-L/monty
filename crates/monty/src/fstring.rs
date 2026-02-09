@@ -260,7 +260,7 @@ impl std::fmt::Display for FormatError {
 pub fn format_with_spec(
     value: &Value,
     spec: &ParsedFormatSpec,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &mut Heap<impl ResourceTracker>,
     interns: &Interns,
 ) -> Result<String, RunError> {
     let value_type = value.py_type(heap);

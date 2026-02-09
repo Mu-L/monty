@@ -5,7 +5,6 @@ use std::{
     hash::{Hash, Hasher},
     mem::{ManuallyDrop, discriminant},
     ptr::addr_of,
-    sync::atomic::{AtomicU16, Ordering},
     vec,
 };
 
@@ -561,7 +560,7 @@ impl PyTrait for HeapData {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
@@ -616,7 +615,11 @@ impl PyTrait for HeapData {
         }
     }
 
-    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Result<Cow<'static, str>, ResourceError> {
+    fn py_str(
+        &self,
+        heap: &mut Heap<impl ResourceTracker>,
+        interns: &Interns,
+    ) -> Result<Cow<'static, str>, ResourceError> {
         match self {
             // Strings return their value directly without quotes
             Self::Str(s) => s.py_str(heap, interns),
@@ -913,7 +916,7 @@ pub(crate) struct Heap<T: ResourceTracker> {
     /// Tracks recursion depth for container operations (repr, eq, cmp, hash).
     /// Uses AtomicU16 so multiple guards can hold a reference to the value
     /// Prevents stack overflow from deeply nested (but not cyclic) structures.
-    data_recursion_depth_remaining: AtomicU16,
+    data_recursion_depth_remaining: u16,
     /// Cached HeapId for the empty tuple singleton `()`.
     ///
     /// Lazily allocated on first use via `get_or_create_empty_tuple()`.
@@ -931,10 +934,7 @@ impl<T: ResourceTracker + serde::Serialize> serde::Serialize for Heap<T> {
         state.serialize_field("tracker", &self.tracker)?;
         state.serialize_field("may_have_cycles", &self.may_have_cycles)?;
         state.serialize_field("allocations_since_gc", &self.allocations_since_gc)?;
-        state.serialize_field(
-            "data_recursion_depth_remaining",
-            &self.data_recursion_depth_remaining.load(Ordering::Relaxed),
-        )?;
+        state.serialize_field("data_recursion_depth_remaining", &self.data_recursion_depth_remaining)?;
         state.serialize_field("empty_tuple_id", &self.empty_tuple_id)?;
         state.end()
     }
@@ -960,7 +960,7 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
             tracker: fields.tracker,
             may_have_cycles: fields.may_have_cycles,
             allocations_since_gc: fields.allocations_since_gc,
-            data_recursion_depth_remaining: AtomicU16::new(fields.data_recursion_depth_remaining),
+            data_recursion_depth_remaining: fields.data_recursion_depth_remaining,
             empty_tuple_id: fields.empty_tuple_id,
         })
     }
@@ -1019,7 +1019,7 @@ impl<T: ResourceTracker> Heap<T> {
             tracker,
             may_have_cycles: false,
             allocations_since_gc: 0,
-            data_recursion_depth_remaining: AtomicU16::new(MAX_DATA_RECURSION_DEPTH),
+            data_recursion_depth_remaining: MAX_DATA_RECURSION_DEPTH,
             empty_tuple_id: None,
         }
     }
@@ -1049,14 +1049,13 @@ impl<T: ResourceTracker> Heap<T> {
         self.may_have_cycles = true;
     }
 
-    /// Incrase data recursion depth, returning error if limit exceeded.
+    /// Increase data recursion depth, returning error if limit exceeded.
     ///
     /// You MUST call `reduce_data_recursion` on every return path after calling this.
     #[inline]
-    pub fn increase_data_recursion(&self) -> Result<(), ResourceError> {
-        let current = self.data_recursion_depth_remaining.load(Ordering::Relaxed);
-        if let Some(incr) = current.checked_sub(1) {
-            self.data_recursion_depth_remaining.store(incr, Ordering::Relaxed);
+    pub fn increase_data_recursion(&mut self) -> Result<(), ResourceError> {
+        if let Some(incr) = self.data_recursion_depth_remaining.checked_sub(1) {
+            self.data_recursion_depth_remaining = incr;
             Ok(())
         } else {
             Err(ResourceError::Recursion {
@@ -1070,10 +1069,8 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// Must be called after `increase_data_recursion` on every return path.
     #[inline]
-    pub fn reduce_data_recursion(&self) {
-        let _ = self
-            .data_recursion_depth_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v + 1));
+    pub fn reduce_data_recursion(&mut self) {
+        self.data_recursion_depth_remaining += 1;
     }
 
     /// Returns the number of GC-tracked allocations since the last garbage collection.

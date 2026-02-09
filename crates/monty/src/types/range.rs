@@ -292,7 +292,7 @@ impl PyTrait for Range {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        _heap: &Heap<impl ResourceTracker>,
+        _heap: &mut Heap<impl ResourceTracker>,
         _heap_ids: &mut AHashSet<HeapId>,
         _interns: &Interns,
     ) -> Result<(), ReprError> {

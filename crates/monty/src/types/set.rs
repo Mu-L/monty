@@ -410,7 +410,7 @@ impl SetStorage {
     fn repr_fmt(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
         type_name: &str,
@@ -625,7 +625,7 @@ impl PyTrait for Set {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
@@ -1136,7 +1136,7 @@ impl PyTrait for FrozenSet {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {

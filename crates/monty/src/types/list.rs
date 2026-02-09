@@ -350,7 +350,7 @@ impl PyTrait for List {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        heap: &Heap<impl ResourceTracker>,
+        heap: &mut Heap<impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
         interns: &Interns,
     ) -> Result<(), ReprError> {
@@ -1020,7 +1020,7 @@ pub(crate) fn repr_sequence_fmt(
     end: char,
     items: &[Value],
     f: &mut impl Write,
-    heap: &Heap<impl ResourceTracker>,
+    heap: &mut Heap<impl ResourceTracker>,
     heap_ids: &mut AHashSet<HeapId>,
     interns: &Interns,
 ) -> Result<(), ReprError> {
