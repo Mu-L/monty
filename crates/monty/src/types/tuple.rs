@@ -34,7 +34,7 @@ use crate::{
     args::ArgValues,
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapGuard, HeapId},
     intern::{Interns, StaticStrings},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::Type,
@@ -107,9 +107,7 @@ impl Tuple {
                 Ok(heap.get_empty_tuple())
             }
             Some(v) => {
-                let mut iter = MontyIter::new(v, heap, interns)?;
-                let items = iter.collect(heap, interns)?;
-                iter.drop_with_heap(heap);
+                let items = MontyIter::new(v, heap, interns)?.collect(heap, interns)?;
                 Ok(allocate_tuple(items, heap)?)
             }
         }
@@ -259,13 +257,17 @@ impl PyTrait for Tuple {
         args: ArgValues,
         interns: &Interns,
     ) -> RunResult<Value> {
+        let args_guard = HeapGuard::new(args, heap);
         match attr.static_string() {
-            Some(StaticStrings::Index) => tuple_index(self, args, heap, interns),
-            Some(StaticStrings::Count) => tuple_count(self, args, heap, interns),
-            _ => {
-                args.drop_with_heap(heap);
-                Err(ExcType::attribute_error(Type::Tuple, attr.as_str(interns)))
+            Some(StaticStrings::Index) => {
+                let (args, heap) = args_guard.into_parts();
+                tuple_index(self, args, heap, interns)
             }
+            Some(StaticStrings::Count) => {
+                let (args, heap) = args_guard.into_parts();
+                tuple_count(self, args, heap, interns)
+            }
+            _ => Err(ExcType::attribute_error(Type::Tuple, attr.as_str(interns))),
         }
     }
 
@@ -295,19 +297,34 @@ fn tuple_index(
     heap: &mut Heap<impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<Value> {
-    let (value, start, end) = parse_tuple_index_args("tuple.index", tuple.as_slice().len(), args, heap)?;
+    let pos_args = args.into_pos_only("tuple.index", heap)?;
+    defer_drop!(pos_args, heap);
+
+    let len = tuple.as_slice().len();
+    let (value, start, end) = match pos_args.as_slice() {
+        [] => return Err(ExcType::type_error_at_least("tuple.index", 1, 0)),
+        [value] => (value, 0, len),
+        [value, start_arg] => {
+            let start = normalize_tuple_index(start_arg.as_int(heap)?, len);
+            (value, start, len)
+        }
+        [value, start_arg, end_arg] => {
+            let start = normalize_tuple_index(start_arg.as_int(heap)?, len);
+            let end = normalize_tuple_index(end_arg.as_int(heap)?, len).max(start);
+            (value, start, end)
+        }
+        other => return Err(ExcType::type_error_at_most("tuple.index", 3, other.len())),
+    };
 
     let mut guard = DepthGuard::default();
     // Search for the value in the specified range
     for (i, item) in tuple.as_slice()[start..end].iter().enumerate() {
         if value.py_eq(item, heap, &mut guard, interns)? {
-            value.drop_with_heap(heap);
             let idx = i64::try_from(start + i).expect("index exceeds i64::MAX");
             return Ok(Value::Int(idx));
         }
     }
 
-    value.drop_with_heap(heap);
     Err(ExcType::value_error_not_in_tuple())
 }
 
@@ -333,84 +350,6 @@ fn tuple_count(
 
     let count_i64 = i64::try_from(count).expect("count exceeds i64::MAX");
     Ok(Value::Int(count_i64))
-}
-
-/// Parses arguments for tuple.index() method.
-///
-/// Returns (value, start, end) where start and end are normalized indices.
-/// Guarantees `start <= end` to prevent slice panics.
-fn parse_tuple_index_args(
-    method: &str,
-    len: usize,
-    args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
-) -> RunResult<(Value, usize, usize)> {
-    let (pos, kwargs) = args.into_parts();
-    if !kwargs.is_empty() {
-        kwargs.drop_with_heap(heap);
-        return Err(ExcType::type_error_no_kwargs(method));
-    }
-
-    let mut pos_iter = pos;
-    let value = pos_iter
-        .next()
-        .ok_or_else(|| ExcType::type_error_at_least(method, 1, 0))?;
-    let start_value = pos_iter.next();
-    let end_value = pos_iter.next();
-
-    // Check no extra arguments - must drop the 4th arg consumed by .next()
-    if let Some(fourth) = pos_iter.next() {
-        fourth.drop_with_heap(heap);
-        for v in pos_iter {
-            v.drop_with_heap(heap);
-        }
-        value.drop_with_heap(heap);
-        if let Some(v) = start_value {
-            v.drop_with_heap(heap);
-        }
-        if let Some(v) = end_value {
-            v.drop_with_heap(heap);
-        }
-        return Err(ExcType::type_error_at_most(method, 3, 4));
-    }
-
-    // Extract start (default 0)
-    let start = if let Some(v) = start_value {
-        let result = v.as_int(heap);
-        v.drop_with_heap(heap);
-        match result {
-            Ok(i) => normalize_tuple_index(i, len),
-            Err(e) => {
-                value.drop_with_heap(heap);
-                if let Some(ev) = end_value {
-                    ev.drop_with_heap(heap);
-                }
-                return Err(e);
-            }
-        }
-    } else {
-        0
-    };
-
-    // Extract end (default len)
-    let end = if let Some(v) = end_value {
-        let result = v.as_int(heap);
-        v.drop_with_heap(heap);
-        match result {
-            Ok(i) => normalize_tuple_index(i, len),
-            Err(e) => {
-                value.drop_with_heap(heap);
-                return Err(e);
-            }
-        }
-    } else {
-        len
-    };
-
-    // Ensure start <= end to prevent slice panics (Python treats start > end as empty slice)
-    let end = end.max(start);
-
-    Ok((value, start, end))
 }
 
 /// Normalizes a Python-style tuple index to a valid index in range [0, len].

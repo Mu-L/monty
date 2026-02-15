@@ -9,6 +9,7 @@ use ahash::AHashSet;
 
 use crate::{
     args::ArgValues,
+    defer_drop,
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapData, HeapId},
     intern::Interns,
@@ -116,54 +117,30 @@ impl Range {
     /// - `range(start, stop)` - range from start to stop
     /// - `range(start, stop, step)` - range with custom step
     pub fn init(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-        let range = match args {
-            ArgValues::Empty => return Err(ExcType::type_error_at_least("range", 1, 0)),
-            ArgValues::One(stop_val) => {
-                let result = stop_val.as_int(heap);
-                stop_val.drop_with_heap(heap);
-                Self::from_stop(result?)
-            }
-            ArgValues::Two(start_val, stop_val) => {
-                let start = start_val.as_int(heap);
-                let stop = stop_val.as_int(heap);
-                start_val.drop_with_heap(heap);
-                stop_val.drop_with_heap(heap);
-                Self::from_start_stop(start?, stop?)
-            }
-            ArgValues::ArgsKargs { args, kwargs } if kwargs.is_empty() && args.len() == 3 => {
-                let mut iter = args.into_iter();
-                let start_val = iter.next().unwrap();
-                let stop_val = iter.next().unwrap();
-                let step_val = iter.next().unwrap();
+        let pos_args = args.into_pos_only("range", heap)?;
+        defer_drop!(pos_args, heap);
 
-                let start = start_val.as_int(heap);
-                let stop = stop_val.as_int(heap);
-                let step = step_val.as_int(heap);
-                start_val.drop_with_heap(heap);
-                stop_val.drop_with_heap(heap);
-                step_val.drop_with_heap(heap);
-
-                let step = step?;
+        let range = match pos_args.as_slice() {
+            [] => return Err(ExcType::type_error_at_least("range", 1, 0)),
+            [first_arg] => {
+                let stop = first_arg.as_int(heap)?;
+                Self::from_stop(stop)
+            }
+            [first_arg, second_arg] => {
+                let start = first_arg.as_int(heap)?;
+                let stop = second_arg.as_int(heap)?;
+                Self::from_start_stop(start, stop)
+            }
+            [first_arg, second_arg, third_arg] => {
+                let start = first_arg.as_int(heap)?;
+                let stop = second_arg.as_int(heap)?;
+                let step = third_arg.as_int(heap)?;
                 if step == 0 {
                     return Err(ExcType::value_error_range_step_zero());
                 }
-                Self::new(start?, stop?, step)
+                Self::new(start, stop, step)
             }
-            ArgValues::Kwargs(kwargs) => {
-                kwargs.drop_with_heap(heap);
-                return Err(ExcType::type_error_no_kwargs("range"));
-            }
-            ArgValues::ArgsKargs { args, kwargs } => {
-                let arg_count = args.len();
-                for v in args {
-                    v.drop_with_heap(heap);
-                }
-                if !kwargs.is_empty() {
-                    kwargs.drop_with_heap(heap);
-                    return Err(ExcType::type_error_no_kwargs("range"));
-                }
-                return Err(ExcType::type_error_at_most("range", 3, arg_count));
-            }
+            _ => return Err(ExcType::type_error_at_most("range", 3, pos_args.len())),
         };
 
         Ok(Value::Ref(heap.allocate(HeapData::Range(range))?))

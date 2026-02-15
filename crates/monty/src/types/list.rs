@@ -7,8 +7,9 @@ use super::{MontyIter, PyTrait};
 use crate::{
     args::ArgValues,
     builtins::Builtins,
+    defer_drop,
     exception_private::{ExcType, RunError, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
     intern::{Interns, StaticStrings},
     io::PrintWriter,
     resource::{DepthGuard, ResourceError, ResourceTracker},
@@ -171,9 +172,7 @@ impl List {
                 Ok(Value::Ref(heap_id))
             }
             Some(v) => {
-                let mut iter = MontyIter::new(v, heap, interns)?;
-                let items = iter.collect(heap, interns)?;
-                iter.drop_with_heap(heap);
+                let items = MontyIter::new(v, heap, interns)?.collect(heap, interns)?;
                 let heap_id = heap.allocate(HeapData::List(Self::new(items)))?;
                 Ok(Value::Ref(heap_id))
             }
@@ -427,11 +426,12 @@ impl PyTrait for List {
         args: ArgValues,
         interns: &Interns,
     ) -> RunResult<Value> {
+        let args_guard = HeapGuard::new(args, heap);
         let Some(method) = attr.static_string() else {
-            args.drop_with_heap(heap);
             return Err(ExcType::attribute_error(Type::List, attr.as_str(interns)));
         };
 
+        let (args, heap) = args_guard.into_parts();
         call_list_method(self, method, args, heap, interns)
     }
 }
@@ -490,19 +490,13 @@ fn call_list_method(
 /// Implements Python's `list.insert(index, item)` method.
 fn list_insert(list: &mut List, args: ArgValues, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Value> {
     let (index_obj, item) = args.get_two_args("insert", heap)?;
+    defer_drop!(index_obj, heap);
+    let mut item_guard = HeapGuard::new(item, heap);
+    let heap = item_guard.heap();
     // Python's insert() handles negative indices by adding len
     // If still negative after adding len, clamps to 0
     // If >= len, appends to end
-    let index_result = index_obj.as_int(heap);
-    // Drop index_obj before propagating error - it could be a Ref (e.g., dict)
-    index_obj.drop_with_heap(heap);
-    let index_i64 = match index_result {
-        Ok(i) => i,
-        Err(e) => {
-            item.drop_with_heap(heap);
-            return Err(e);
-        }
-    };
+    let index_i64 = index_obj.as_int(heap)?;
     let len = list.items.len();
     let len_i64 = i64::try_from(len).expect("list length exceeds i64::MAX");
     let index = if index_i64 < 0 {
@@ -513,6 +507,7 @@ fn list_insert(list: &mut List, args: ArgValues, heap: &mut Heap<impl ResourceTr
         // Positive index: clamp to len if too large
         usize::try_from(index_i64).unwrap_or(len)
     };
+    let (item, heap) = item_guard.into_parts();
     list.insert(heap, index, item);
     Ok(Value::None)
 }
@@ -564,6 +559,7 @@ fn list_remove(
     interns: &Interns,
 ) -> RunResult<Value> {
     let value = args.get_one_arg("list.remove", heap)?;
+    defer_drop!(value, heap);
 
     // Find the first matching element
     let mut found_idx = None;
@@ -574,8 +570,6 @@ fn list_remove(
             break;
         }
     }
-
-    value.drop_with_heap(heap);
 
     match found_idx {
         Some(idx) => {
@@ -617,13 +611,7 @@ fn list_extend(
     interns: &Interns,
 ) -> RunResult<Value> {
     let iterable = args.get_one_arg("list.extend", heap)?;
-
-    // Create iterator for the iterable
-    let mut iter = MontyIter::new(iterable, heap, interns)?;
-
-    // Collect all items from the iterator
-    let items: SmallVec<[_; 2]> = iter.collect(heap, interns)?;
-    iter.drop_with_heap(heap);
+    let items: SmallVec<[_; 2]> = MontyIter::new(iterable, heap, interns)?.collect(heap, interns)?;
 
     // Add each item to the list
     for item in items {
@@ -643,19 +631,34 @@ fn list_index(
     heap: &mut Heap<impl ResourceTracker>,
     interns: &Interns,
 ) -> RunResult<Value> {
-    let (value, start, end) = parse_index_count_args("list.index", list.items.len(), args, heap)?;
+    let pos_args = args.into_pos_only("list.index", heap)?;
+    defer_drop!(pos_args, heap);
+
+    let len = list.items.len();
+    let (value, start, end) = match pos_args.as_slice() {
+        [] => return Err(ExcType::type_error_at_least("list.index", 1, 0)),
+        [value] => (value, 0, len),
+        [value, start_arg] => {
+            let start = normalize_list_index(start_arg.as_int(heap)?, len);
+            (value, start, len)
+        }
+        [value, start_arg, end_arg] => {
+            let start = normalize_list_index(start_arg.as_int(heap)?, len);
+            let end = normalize_list_index(end_arg.as_int(heap)?, len).max(start);
+            (value, start, end)
+        }
+        other => return Err(ExcType::type_error_at_most("list.index", 3, other.len())),
+    };
 
     // Search for the value in the specified range
     let mut guard = DepthGuard::default();
     for (i, item) in list.items[start..end].iter().enumerate() {
         if value.py_eq(item, heap, &mut guard, interns)? {
-            value.drop_with_heap(heap);
             let idx = i64::try_from(start + i).expect("index exceeds i64::MAX");
             return Ok(Value::Int(idx));
         }
     }
 
-    value.drop_with_heap(heap);
     Err(ExcType::value_error_not_in_list())
 }
 
@@ -669,6 +672,7 @@ fn list_count(
     interns: &Interns,
 ) -> RunResult<Value> {
     let value = args.get_one_arg("list.count", heap)?;
+    defer_drop!(value, heap);
 
     // Use a local DepthGuard for py_eq calls.
     // We use unwrap_or(false) for recursion errors since filter() can't propagate Results.
@@ -679,87 +683,8 @@ fn list_count(
         .filter(|item| value.py_eq(item, heap, &mut guard, interns).unwrap_or(false))
         .count();
 
-    value.drop_with_heap(heap);
     let count_i64 = i64::try_from(count).expect("count exceeds i64::MAX");
     Ok(Value::Int(count_i64))
-}
-
-/// Parses arguments for list.index() and similar methods.
-///
-/// Returns (value, start, end) where start and end are normalized indices.
-/// Guarantees `start <= end` to prevent slice panics.
-fn parse_index_count_args(
-    method: &str,
-    len: usize,
-    args: ArgValues,
-    heap: &mut Heap<impl ResourceTracker>,
-) -> RunResult<(Value, usize, usize)> {
-    let (pos, kwargs) = args.into_parts();
-    if !kwargs.is_empty() {
-        kwargs.drop_with_heap(heap);
-        return Err(ExcType::type_error_no_kwargs(method));
-    }
-
-    let mut pos_iter = pos;
-    let value = pos_iter
-        .next()
-        .ok_or_else(|| ExcType::type_error_at_least(method, 1, 0))?;
-    let start_value = pos_iter.next();
-    let end_value = pos_iter.next();
-
-    // Check no extra arguments - must drop the 4th arg consumed by .next()
-    if let Some(fourth) = pos_iter.next() {
-        fourth.drop_with_heap(heap);
-        for v in pos_iter {
-            v.drop_with_heap(heap);
-        }
-        value.drop_with_heap(heap);
-        if let Some(v) = start_value {
-            v.drop_with_heap(heap);
-        }
-        if let Some(v) = end_value {
-            v.drop_with_heap(heap);
-        }
-        return Err(ExcType::type_error_at_most(method, 3, 4));
-    }
-
-    // Extract start (default 0)
-    let start = if let Some(v) = start_value {
-        let result = v.as_int(heap);
-        v.drop_with_heap(heap);
-        match result {
-            Ok(i) => normalize_list_index(i, len),
-            Err(e) => {
-                value.drop_with_heap(heap);
-                if let Some(ev) = end_value {
-                    ev.drop_with_heap(heap);
-                }
-                return Err(e);
-            }
-        }
-    } else {
-        0
-    };
-
-    // Extract end (default len)
-    let end = if let Some(v) = end_value {
-        let result = v.as_int(heap);
-        v.drop_with_heap(heap);
-        match result {
-            Ok(i) => normalize_list_index(i, len),
-            Err(e) => {
-                value.drop_with_heap(heap);
-                return Err(e);
-            }
-        }
-    } else {
-        len
-    };
-
-    // Ensure start <= end to prevent slice panics (Python treats start > end as empty slice)
-    let end = end.max(start);
-
-    Ok((value, start, end))
 }
 
 /// Normalizes a Python-style list index to a valid index in range [0, len].
