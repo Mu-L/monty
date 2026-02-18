@@ -16,7 +16,7 @@ use crate::{
     os::OsFunction,
     resource::ResourceTracker,
     types::{
-        AttrCallResult, Dict, PyTrait, Type,
+        CallOutcome, Dict, PyTrait, Type,
         bytes::{bytes_fromhex, call_bytes_method},
         dict::dict_fromkeys,
         str::call_str_method,
@@ -49,13 +49,13 @@ pub(super) enum CallResult {
     MethodCall(EitherStr, ArgValues),
 }
 
-impl From<AttrCallResult> for CallResult {
-    fn from(result: AttrCallResult) -> Self {
+impl From<CallOutcome> for CallResult {
+    fn from(result: CallOutcome) -> Self {
         match result {
-            AttrCallResult::Value(v) => Self::Push(v),
-            AttrCallResult::OsCall(func, args) => Self::OsCall(func, args),
-            AttrCallResult::ExternalCall(ext_id, args) => Self::External(ext_id, args),
-            AttrCallResult::MethodCall(name, args) => Self::MethodCall(name, args),
+            CallOutcome::Value(v) => Self::Push(v),
+            CallOutcome::OsCall(func, args) => Self::OsCall(func, args),
+            CallOutcome::ExternalCall(ext_id, args) => Self::External(ext_id, args),
+            CallOutcome::MethodCall(name, args) => Self::MethodCall(name, args),
         }
     }
 }
@@ -82,11 +82,19 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     ///
     /// Calls a builtin function directly without stack manipulation for the callable.
     /// This is an optimization that avoids constant pool lookup and stack manipulation.
-    pub(super) fn exec_call_builtin_function(&mut self, builtin_id: u8, arg_count: usize) -> Result<Value, RunError> {
+    ///
+    /// Returns `CallResult` because some builtins (e.g., `sorted()` with key functions)
+    /// may push frames via `call_sync`, requiring `handle_call_result!` in the dispatch loop.
+    pub(super) fn exec_call_builtin_function(
+        &mut self,
+        builtin_id: u8,
+        arg_count: usize,
+    ) -> Result<CallResult, RunError> {
         // Convert u8 to BuiltinsFunctions via FromRepr
         if let Some(builtin) = BuiltinsFunctions::from_repr(builtin_id) {
             let args = self.pop_n_args(arg_count);
-            builtin.call(self.heap, args, self.interns, self.print_writer)
+            let outcome = builtin.call(self, args)?;
+            Ok(outcome.into())
         } else {
             Err(RunError::internal("CallBuiltinFunction: invalid builtin_id"))
         }
@@ -257,8 +265,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     ///
     /// For heap-allocated objects (`Value::Ref`), dispatches to the type's
     /// attribute call implementation via `heap.call_attr_raw()`, which may return
-    /// `AttrCallResult::OsCall`, `AttrCallResult::ExternalCall`, or
-    /// `AttrCallResult::MethodCall` for operations that require host involvement.
+    /// `CallOutcome::OsCall`, `CallOutcome::ExternalCall`, or
+    /// `CallOutcome::MethodCall` for operations that require host involvement.
     ///
     /// For interned strings (`Value::InternString`), uses the unified `call_str_method`.
     /// For interned bytes (`Value::InternBytes`), uses the unified `call_bytes_method`.
@@ -305,11 +313,11 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// - `Value::ExtFunction`: returns `External` for caller to execute
     /// - `Value::DefFunction`: pushes a new frame, returns `FramePushed`
     /// - `Value::Ref`: checks for closure/function on heap
-    fn call_function(&mut self, callable: Value, args: ArgValues) -> Result<CallResult, RunError> {
+    pub(super) fn call_function(&mut self, callable: Value, args: ArgValues) -> Result<CallResult, RunError> {
         match callable {
             Value::Builtin(builtin) => {
-                let result = builtin.call(self.heap, args, self.interns, self.print_writer)?;
-                Ok(CallResult::Push(result))
+                let result = builtin.call(self, args)?;
+                Ok(result.into())
             }
             Value::ModuleFunction(mf) => {
                 let result = mf.call(self.heap, args)?;

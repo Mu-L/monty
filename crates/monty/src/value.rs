@@ -25,7 +25,7 @@ use crate::{
         check_repeat_size,
     },
     types::{
-        AttrCallResult, LongInt, Property, PyTrait, Str, Type,
+        CallOutcome, LongInt, Property, PyTrait, Str, Type,
         bytes::{bytes_repr_fmt, get_byte_at_index, get_bytes_slice},
         path,
         str::{allocate_char, get_char_at_index, get_str_slice, string_repr_fmt},
@@ -1724,7 +1724,7 @@ impl Value {
         name_id: StringId,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> RunResult<AttrCallResult> {
+    ) -> RunResult<CallOutcome> {
         match self {
             Self::Ref(heap_id) => {
                 // Use with_entry_mut to get access to both data and heap without borrow conflicts.
@@ -1739,7 +1739,7 @@ impl Value {
                 if name_id == StaticStrings::DunderName {
                     let name_str = t.to_string();
                     let str_id = heap.allocate(HeapData::Str(Str::from(name_str)))?;
-                    return Ok(AttrCallResult::Value(Self::Ref(str_id)));
+                    return Ok(CallOutcome::Value(Self::Ref(str_id)));
                 }
             }
             _ => {}

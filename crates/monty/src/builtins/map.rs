@@ -76,7 +76,7 @@ pub fn builtin_map(
         [] => {
             while let Some(item) = first_iter.for_next(heap, interns)? {
                 let args = ArgValues::One(item);
-                out.push(builtin.call(heap, args, interns, print_writer)?);
+                out.push(builtin.call_basic(heap, args, interns, print_writer)?);
             }
         }
         // map(f, iter1, iter2)
@@ -87,7 +87,7 @@ pub fn builtin_map(
                     break;
                 };
                 let args = ArgValues::Two(arg1, arg2);
-                out.push(builtin.call(heap, args, interns, print_writer)?);
+                out.push(builtin.call_basic(heap, args, interns, print_writer)?);
             }
         }
         // map(f, iter1, iter2, *iterables)
@@ -108,7 +108,7 @@ pub fn builtin_map(
                 kwargs: KwargsValues::Empty,
             };
 
-            out.push(builtin.call(heap, args, interns, print_writer)?);
+            out.push(builtin.call_basic(heap, args, interns, print_writer)?);
         },
     }
 

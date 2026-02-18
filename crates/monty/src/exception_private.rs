@@ -17,7 +17,7 @@ use crate::{
     parse::CodeRange,
     resource::{DepthGuard, ResourceTracker},
     types::{
-        AttrCallResult, PyTrait, Str, Type, allocate_tuple,
+        CallOutcome, PyTrait, Str, Type, allocate_tuple,
         str::{StringRepr, string_repr_fmt},
     },
     value::Value,
@@ -1205,7 +1205,7 @@ impl SimpleException {
         attr_id: StringId,
         heap: &mut Heap<impl ResourceTracker>,
         _interns: &Interns,
-    ) -> RunResult<Option<AttrCallResult>> {
+    ) -> RunResult<Option<CallOutcome>> {
         if attr_id == StaticStrings::Args {
             // Construct tuple with 0 or 1 elements based on whether arg exists
             let elements = if let Some(arg_str) = &self.arg {
@@ -1214,7 +1214,7 @@ impl SimpleException {
             } else {
                 smallvec![]
             };
-            Ok(Some(AttrCallResult::Value(allocate_tuple(elements, heap)?)))
+            Ok(Some(CallOutcome::Value(allocate_tuple(elements, heap)?)))
         } else {
             Ok(None)
         }

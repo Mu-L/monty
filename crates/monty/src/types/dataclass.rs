@@ -11,7 +11,7 @@ use crate::{
     intern::{Interns, StringId},
     io::PrintWriter,
     resource::{DepthGuard, ResourceError, ResourceTracker},
-    types::{AttrCallResult, Type},
+    types::{CallOutcome, Type},
     value::{EitherStr, Value},
 };
 
@@ -293,7 +293,7 @@ impl PyTrait for Dataclass {
         args: ArgValues,
         interns: &Interns,
         _print_writer: &mut PrintWriter<'_>,
-    ) -> RunResult<AttrCallResult> {
+    ) -> RunResult<CallOutcome> {
         let attr_str = attr.as_str(interns);
         // Only public methods (no underscore prefix = no dunders, no private)
         if !attr_str.starts_with('_') && self.attrs.get_by_str(attr_str, heap, interns).is_none() {
@@ -302,10 +302,10 @@ impl PyTrait for Dataclass {
             heap.inc_ref(self_id);
             let self_arg = Value::Ref(self_id);
             let args_with_self = args.prepend(self_arg);
-            Ok(AttrCallResult::MethodCall(attr.clone(), args_with_self))
+            Ok(CallOutcome::MethodCall(attr.clone(), args_with_self))
         } else {
             // Not a method call — delegate to standard attr dispatch
-            self.py_call_attr(heap, attr, args, interns).map(AttrCallResult::Value)
+            self.py_call_attr(heap, attr, args, interns).map(CallOutcome::Value)
         }
     }
 
@@ -314,10 +314,10 @@ impl PyTrait for Dataclass {
         attr_id: StringId,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> RunResult<Option<AttrCallResult>> {
+    ) -> RunResult<Option<CallOutcome>> {
         let attr_name = interns.get_str(attr_id);
         match self.attrs.get_by_str(attr_name, heap, interns) {
-            Some(value) => Ok(Some(AttrCallResult::Value(value.clone_with_heap(heap)))),
+            Some(value) => Ok(Some(CallOutcome::Value(value.clone_with_heap(heap)))),
             // we use name here, not `self.py_type(heap)` hence returning a Ok(None)
             None => Err(ExcType::attribute_error(self.name(interns), attr_name)),
         }

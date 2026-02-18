@@ -24,25 +24,20 @@ use crate::{
     value::{EitherStr, Value},
 };
 
-/// Result of calling an attribute method via `py_call_attr_raw`.
+/// Result of a call that may require host involvement beyond a simple return value.
 ///
-/// This enum enables attribute methods to signal different outcomes to the VM:
+/// Used by attribute methods (`py_call_attr_raw`), builtin functions, and module
+/// functions to signal different outcomes to the VM:
 /// - `Value`: The call completed synchronously with a return value
 /// - `OsCall`: The method needs an OS operation; VM should yield to host
 /// - `ExternalCall`: The method needs to call an external function
+/// - `MethodCall`: A dataclass method call; VM should yield to host
 ///
-/// This unifies the pattern where `call_function` returns `CallResult` to indicate
-/// different outcomes. Types that only support synchronous attribute calls can
+/// The VM converts these into the appropriate `FrameExit` variant or pushes the
+/// value onto the stack. Types that only support synchronous attribute calls can
 /// use the default `py_call_attr_raw` implementation which wraps `py_call_attr`.
-///
-/// # Future Extensibility
-///
-/// When needed for features like `list.sort(key=func)`, we can add:
-/// ```ignore
-/// CallFunction(Value, ArgValues)  // Call a callable, result becomes attr result
-/// ```
 #[derive(Debug)]
-pub enum AttrCallResult {
+pub enum CallOutcome {
     /// Call completed synchronously with a value to return.
     Value(Value),
 
@@ -321,14 +316,14 @@ pub trait PyTrait {
         Err(ExcType::attribute_error(self.py_type(heap), attr.as_str(interns)))
     }
 
-    /// Calls an attribute method, returning an `AttrCallResult` that may signal OS, external,
+    /// Calls an attribute method, returning an `CallOutcome` that may signal OS, external,
     /// or method calls.
     ///
     /// This method enables types to signal that they need operations the VM cannot perform
     /// directly (OS operations, external function calls, dataclass method calls). The VM
     /// converts the result to the appropriate `FrameExit` variant.
     ///
-    /// The default implementation wraps `py_call_attr` in `AttrCallResult::Value`. Types that
+    /// The default implementation wraps `py_call_attr` in `CallOutcome::Value`. Types that
     /// need to perform OS/external operations, intercept specific methods (e.g. `list.sort`),
     /// or detect method calls (e.g. dataclass methods) should override this method.
     ///
@@ -340,10 +335,10 @@ pub trait PyTrait {
     ///
     /// # Returns
     ///
-    /// - `Ok(AttrCallResult::Value(v))` - Method completed synchronously with value `v`
-    /// - `Ok(AttrCallResult::OsCall(func, args))` - Method needs OS operation; VM yields to host
-    /// - `Ok(AttrCallResult::ExternalCall(id, args))` - Method needs external function call
-    /// - `Ok(AttrCallResult::MethodCall(attr, args))` - Dataclass method call; VM yields to host
+    /// - `Ok(CallOutcome::Value(v))` - Method completed synchronously with value `v`
+    /// - `Ok(CallOutcome::OsCall(func, args))` - Method needs OS operation; VM yields to host
+    /// - `Ok(CallOutcome::ExternalCall(id, args))` - Method needs external function call
+    /// - `Ok(CallOutcome::MethodCall(attr, args))` - Dataclass method call; VM yields to host
     /// - `Err(e)` - Method call failed with error
     fn py_call_attr_raw(
         &mut self,
@@ -353,9 +348,9 @@ pub trait PyTrait {
         args: ArgValues,
         interns: &Interns,
         _print_writer: &mut PrintWriter<'_>,
-    ) -> RunResult<AttrCallResult> {
+    ) -> RunResult<CallOutcome> {
         let value = self.py_call_attr(heap, attr, args, interns)?;
-        Ok(AttrCallResult::Value(value))
+        Ok(CallOutcome::Value(value))
     }
 
     /// Estimates the memory size in bytes of this value.
@@ -425,7 +420,7 @@ pub trait PyTrait {
         _attr_id: StringId,
         _heap: &mut Heap<impl ResourceTracker>,
         _interns: &Interns,
-    ) -> RunResult<Option<AttrCallResult>> {
+    ) -> RunResult<Option<CallOutcome>> {
         Ok(None)
     }
 }

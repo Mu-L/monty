@@ -18,7 +18,7 @@ use crate::{
     io::PrintWriter,
     os::OsFunction,
     resource::{DepthGuard, ResourceError, ResourceTracker},
-    types::{AttrCallResult, PyTrait, Str, Type, allocate_tuple},
+    types::{CallOutcome, PyTrait, Str, Type, allocate_tuple},
     value::{EitherStr, Value},
 };
 
@@ -509,9 +509,9 @@ impl PyTrait for Path {
         args: ArgValues,
         interns: &Interns,
         _print_writer: &mut PrintWriter<'_>,
-    ) -> RunResult<AttrCallResult> {
+    ) -> RunResult<CallOutcome> {
         let Some(method) = attr.static_string() else {
-            return self.py_call_attr(heap, attr, args, interns).map(AttrCallResult::Value);
+            return self.py_call_attr(heap, attr, args, interns).map(CallOutcome::Value);
         };
 
         // Check if this is an OS method that requires host system access
@@ -519,11 +519,11 @@ impl PyTrait for Path {
             // Package path as first argument for OS call (as Path, not string)
             let path_arg = Value::Ref(heap.allocate(HeapData::Path(self.clone()))?);
             let os_args = prepend_path_arg(path_arg, args);
-            return Ok(AttrCallResult::OsCall(os_fn, os_args));
+            return Ok(CallOutcome::OsCall(os_fn, os_args));
         }
 
         // Fall back to py_call_attr for pure methods
-        self.py_call_attr(heap, attr, args, interns).map(AttrCallResult::Value)
+        self.py_call_attr(heap, attr, args, interns).map(CallOutcome::Value)
     }
 
     fn py_getattr(
@@ -531,7 +531,7 @@ impl PyTrait for Path {
         attr_id: StringId,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> RunResult<Option<AttrCallResult>> {
+    ) -> RunResult<Option<CallOutcome>> {
         let v = match StaticStrings::from_string_id(attr_id) {
             // Properties returning strings
             Some(StaticStrings::Name) => {
@@ -580,6 +580,6 @@ impl PyTrait for Path {
             // NOTE: For method calls, we'd need to return a bound method. For now, properties only.
             _ => return Err(ExcType::attribute_error(Type::Path, interns.get_str(attr_id))),
         };
-        Ok(Some(AttrCallResult::Value(v)))
+        Ok(Some(CallOutcome::Value(v)))
     }
 }

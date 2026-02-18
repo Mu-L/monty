@@ -14,7 +14,7 @@ use crate::{
     heap::{Heap, HeapData, HeapId},
     intern::{Interns, StaticStrings, StringId},
     resource::{DepthGuard, ResourceError, ResourceTracker},
-    types::{AttrCallResult, PyTrait, Type},
+    types::{CallOutcome, PyTrait, Type},
     value::Value,
 };
 
@@ -231,12 +231,12 @@ impl PyTrait for Slice {
         attr_id: StringId,
         _heap: &mut Heap<impl ResourceTracker>,
         _interns: &Interns,
-    ) -> RunResult<Option<AttrCallResult>> {
+    ) -> RunResult<Option<CallOutcome>> {
         // Slice attributes are computed values (Int or None), return Cow::Owned
         match StaticStrings::from_string_id(attr_id) {
-            Some(StaticStrings::Start) => Ok(Some(AttrCallResult::Value(option_i64_to_value(self.start)))),
-            Some(StaticStrings::Stop) => Ok(Some(AttrCallResult::Value(option_i64_to_value(self.stop)))),
-            Some(StaticStrings::Step) => Ok(Some(AttrCallResult::Value(option_i64_to_value(self.step)))),
+            Some(StaticStrings::Start) => Ok(Some(CallOutcome::Value(option_i64_to_value(self.start)))),
+            Some(StaticStrings::Stop) => Ok(Some(CallOutcome::Value(option_i64_to_value(self.stop)))),
+            Some(StaticStrings::Step) => Ok(Some(CallOutcome::Value(option_i64_to_value(self.step)))),
             _ => Ok(None),
         }
     }

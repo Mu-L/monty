@@ -25,7 +25,7 @@ use crate::{
     heap::{Heap, HeapId},
     intern::{Interns, StringId},
     resource::{DepthGuard, ResourceError, ResourceTracker},
-    types::{AttrCallResult, Type},
+    types::{CallOutcome, Type},
     value::{EitherStr, Value},
 };
 
@@ -261,9 +261,9 @@ impl PyTrait for NamedTuple {
         attr_id: StringId,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> RunResult<Option<AttrCallResult>> {
+    ) -> RunResult<Option<CallOutcome>> {
         if let Some(value) = self.get_by_name(attr_id, interns) {
-            Ok(Some(AttrCallResult::Value(value.clone_with_heap(heap))))
+            Ok(Some(CallOutcome::Value(value.clone_with_heap(heap))))
         } else {
             // we use name here, not `self.py_type(heap)` hence returning a Ok(None)
             Err(ExcType::attribute_error(self.name(interns), interns.get_str(attr_id)))

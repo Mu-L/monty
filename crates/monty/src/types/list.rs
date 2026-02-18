@@ -3,7 +3,7 @@ use std::{cmp::Ordering, fmt::Write};
 use ahash::AHashSet;
 use smallvec::SmallVec;
 
-use super::{AttrCallResult, MontyIter, PyTrait};
+use super::{CallOutcome, MontyIter, PyTrait};
 use crate::{
     args::ArgValues,
     builtins::Builtins,
@@ -441,12 +441,12 @@ impl PyTrait for List {
         args: ArgValues,
         interns: &Interns,
         print_writer: &mut PrintWriter<'_>,
-    ) -> RunResult<AttrCallResult> {
+    ) -> RunResult<CallOutcome> {
         if attr.static_string() == Some(StaticStrings::Sort) {
             do_list_sort(self, args, heap, interns, print_writer)?;
-            return Ok(AttrCallResult::Value(Value::None));
+            return Ok(CallOutcome::Value(Value::None));
         }
-        self.py_call_attr(heap, attr, args, interns).map(AttrCallResult::Value)
+        self.py_call_attr(heap, attr, args, interns).map(CallOutcome::Value)
     }
 }
 
@@ -913,7 +913,7 @@ fn call_key_function(
     match key_fn {
         Value::Builtin(Builtins::Function(builtin)) => {
             let args = ArgValues::One(elem);
-            builtin.call(heap, args, interns, print_writer)
+            builtin.call_basic(heap, args, interns, print_writer)
         }
         Value::Builtin(Builtins::Type(t)) => {
             // Type constructors (int, str, float, etc.) are callable key functions

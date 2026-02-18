@@ -176,7 +176,18 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 return None; // Continue execution at handler
             }
 
-            // No handler in this frame - pop frame and try outer
+            // No handler in this frame - check subcall boundary before unwinding further.
+            // If we're inside a call_sync() and about to unwind past the subcall boundary,
+            // stop here and propagate the error back to call_sync().
+            if let Some(depth) = this.subcall_depth
+                && this.frames.len() <= depth + 1
+            {
+                // Drop exc_value before returning
+                drop(exc_guard);
+                self.pop_frame();
+                return Some(error);
+            }
+
             if this.frames.len() <= 1 {
                 // No more frames - exception is unhandled
                 let is_spawned = this.is_spawned_task();

@@ -20,7 +20,7 @@ use crate::{
     io::PrintWriter,
     resource::{DepthGuard, ResourceError, ResourceTracker, check_mult_size, check_repeat_size},
     types::{
-        AttrCallResult, Bytes, Dataclass, Dict, FrozenSet, List, LongInt, Module, MontyIter, NamedTuple, Path, PyTrait,
+        Bytes, CallOutcome, Dataclass, Dict, FrozenSet, List, LongInt, Module, MontyIter, NamedTuple, Path, PyTrait,
         Range, Set, Slice, Str, Tuple, Type, allocate_tuple,
     },
     value::{EitherStr, Value},
@@ -721,7 +721,7 @@ impl PyTrait for HeapData {
         args: ArgValues,
         interns: &Interns,
         print_writer: &mut PrintWriter<'_>,
-    ) -> RunResult<AttrCallResult> {
+    ) -> RunResult<CallOutcome> {
         match self {
             // List intercepts sort for key function support via PrintWriter
             Self::List(l) => l.py_call_attr_raw(self_id, heap, attr, args, interns, print_writer),
@@ -732,7 +732,7 @@ impl PyTrait for HeapData {
             // Module has special handling for OS calls (os.getenv, etc.)
             Self::Module(m) => m.py_call_attr_raw(self_id, heap, attr, args, interns, print_writer),
             // All other types use the default implementation (wrap py_call_attr)
-            _ => self.py_call_attr(heap, attr, args, interns).map(AttrCallResult::Value),
+            _ => self.py_call_attr(heap, attr, args, interns).map(CallOutcome::Value),
         }
     }
 
@@ -771,7 +771,7 @@ impl PyTrait for HeapData {
         attr_id: StringId,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> RunResult<Option<AttrCallResult>> {
+    ) -> RunResult<Option<CallOutcome>> {
         match self {
             Self::Dataclass(dc) => dc.py_getattr(attr_id, heap, interns),
             Self::Module(m) => Ok(m.py_getattr(attr_id, heap, interns)),
@@ -1209,7 +1209,7 @@ impl<T: ResourceTracker> Heap<T> {
         hash
     }
 
-    /// Calls an attribute on the heap entry, returning an `AttrCallResult` that may signal
+    /// Calls an attribute on the heap entry, returning an `CallOutcome` that may signal
     /// OS, external, or method calls.
     ///
     /// Temporarily takes ownership of the payload to avoid borrow conflicts when attribute
@@ -1218,7 +1218,7 @@ impl<T: ResourceTracker> Heap<T> {
     /// The `print_writer` parameter is threaded through for `list.sort(key=...)` which
     /// needs it to call builtin key functions.
     ///
-    /// Returns `AttrCallResult` which may be:
+    /// Returns `CallOutcome` which may be:
     /// - `Value(v)` - Method completed synchronously with value `v`
     /// - `OsCall(func, args)` - Method needs OS operation; VM should yield to host
     /// - `ExternalCall(id, args)` - Method needs external function call
@@ -1230,7 +1230,7 @@ impl<T: ResourceTracker> Heap<T> {
         args: ArgValues,
         interns: &Interns,
         print_writer: &mut PrintWriter<'_>,
-    ) -> RunResult<AttrCallResult> {
+    ) -> RunResult<CallOutcome> {
         // Take data out so the borrow of self.entries ends
         let mut data = take_data!(self, id, "call_attr");
 

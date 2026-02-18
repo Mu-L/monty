@@ -7,7 +7,7 @@ use crate::{
     intern::{Interns, StringId},
     io::PrintWriter,
     resource::ResourceTracker,
-    types::{AttrCallResult, Dict, PyTrait},
+    types::{CallOutcome, Dict, PyTrait},
     value::{EitherStr, Value},
 };
 
@@ -108,14 +108,14 @@ impl Module {
         attr_id: StringId,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> Option<AttrCallResult> {
+    ) -> Option<CallOutcome> {
         let value = self.attrs.get_by_str(interns.get_str(attr_id), heap, interns)?;
 
         // If the value is a Property, invoke its getter to compute the actual value
         if let Value::Property(prop) = *value {
             Some(prop.get())
         } else {
-            Some(AttrCallResult::Value(value.clone_with_heap(heap)))
+            Some(CallOutcome::Value(value.clone_with_heap(heap)))
         }
     }
 
@@ -124,7 +124,7 @@ impl Module {
     /// Modules don't have methods - they have callable attributes. This looks up
     /// the attribute and calls it if it's a `ModuleFunction`.
     ///
-    /// Returns `AttrCallResult` because module functions may need OS operations
+    /// Returns `CallOutcome` because module functions may need OS operations
     /// (e.g., `os.getenv()`) that require host involvement.
     pub fn py_call_attr_raw(
         &self,
@@ -134,7 +134,7 @@ impl Module {
         args: ArgValues,
         interns: &Interns,
         _print_writer: &mut PrintWriter<'_>,
-    ) -> RunResult<AttrCallResult> {
+    ) -> RunResult<CallOutcome> {
         let mut args_guard = HeapGuard::new(args, heap);
 
         let attr_key = match attr {

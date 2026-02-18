@@ -24,7 +24,7 @@ use crate::{
     asyncio::{CallId, TaskId},
     bytecode::{code::Code, op::Opcode},
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{ContainsHeap, Heap, HeapData, HeapId},
+    heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapId},
     intern::{ExtFunctionId, FunctionId, Interns, StringId},
     io::PrintWriter,
     modules::BuiltinModule,
@@ -447,16 +447,23 @@ pub struct VM<'a, 'p, T: ResourceTracker> {
     frames: Vec<CallFrame<'a>>,
 
     /// Heap for reference-counted objects.
-    heap: &'a mut Heap<T>,
+    ///
+    /// `pub(crate)` so builtins receiving `&mut VM` can access the heap directly,
+    /// enabling split borrows that avoid conflicts with `call_sync`.
+    pub(crate) heap: &'a mut Heap<T>,
 
     /// Namespace stack for variable storage.
     namespaces: &'a mut Namespaces,
 
     /// Interned strings/bytes.
-    interns: &'a Interns,
+    ///
+    /// `pub(crate)` so builtins receiving `&mut VM` can read interned strings.
+    pub(crate) interns: &'a Interns,
 
     /// Print output writer, borrowed so callers retain access to collected output.
-    print_writer: &'a mut PrintWriter<'p>,
+    ///
+    /// `pub(crate)` so builtins receiving `&mut VM` can write output.
+    pub(crate) print_writer: &'a mut PrintWriter<'p>,
 
     /// Stack of exceptions being handled for nested except blocks.
     ///
@@ -489,6 +496,16 @@ pub struct VM<'a, 'p, T: ResourceTracker> {
     /// Stored here because the main task's frames have `function_id: None` and
     /// need a reference to the module code when being restored after task switching.
     module_code: Option<&'a Code>,
+
+    /// Frame depth at which a `call_sync` subcall should return.
+    ///
+    /// When set, `ReturnValue` checks if we've returned to this depth and stops
+    /// the run loop instead of continuing. This allows builtins like `sorted()`
+    /// to call user-defined functions (lambdas) synchronously within the VM.
+    ///
+    /// Uses a stack of depths to support nested `call_sync` calls (e.g., a key
+    /// function that itself calls `sorted()`).
+    subcall_depth: Option<usize>,
 }
 
 impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
@@ -511,6 +528,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             next_call_id: 0,
             scheduler: None, // Lazy - no allocation for sync code
             module_code: None,
+            subcall_depth: None,
         }
     }
 
@@ -568,6 +586,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             next_call_id: snapshot.next_call_id,
             scheduler: snapshot.scheduler,
             module_code: Some(module_code),
+            subcall_depth: None,
         }
     }
     /// Consumes the VM and creates a snapshot for pause/resume if needed.
@@ -1160,11 +1179,15 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     let builtin_id = fetch_u8!(cached_frame);
                     let arg_count = fetch_u8!(cached_frame) as usize;
 
-                    match self.exec_call_builtin_function(builtin_id, arg_count) {
-                        Ok(result) => self.push(result),
-                        // IP sync deferred to error path (no frame push possible)
-                        Err(err) => catch_sync!(self, cached_frame, err),
-                    }
+                    // Sync IP before call (some builtins like sorted() may call user
+                    // functions via call_sync, which pushes frames)
+                    self.current_frame_mut().ip = cached_frame.ip;
+
+                    handle_call_result!(
+                        self,
+                        cached_frame,
+                        self.exec_call_builtin_function(builtin_id, arg_count)
+                    );
                 }
                 Opcode::CallBuiltinType => {
                     // Fetch operands: type_id (u8) + arg_count (u8)
@@ -1372,6 +1395,13 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     }
                     // Pop current frame and push return value
                     self.pop_frame();
+
+                    // Check if we've returned to the subcall boundary — if so,
+                    // stop the run loop and return the value to call_sync().
+                    if self.subcall_depth == Some(self.frames.len()) {
+                        return Ok(FrameExit::Return(value));
+                    }
+
                     self.push(value);
                     // Reload cache from parent frame
                     reload_cache!(self, cached_frame);
@@ -1466,6 +1496,52 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         }
         // Exception was caught, continue execution
         self.run()
+    }
+
+    /// Calls a callable synchronously within the VM run loop.
+    ///
+    /// This is used by builtins like `sorted()` that need to invoke user-defined
+    /// functions (e.g., lambda key functions) during their execution. The callable
+    /// is called as if it were a normal function call, but the run loop returns
+    /// control to the caller when the subcall completes.
+    ///
+    /// Supports builtins, defined functions (including closures/lambdas), and type
+    /// constructors. External functions are rejected since they would require
+    /// yielding to the host, which is not possible during a synchronous subcall.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The callable is an external function (cannot be called synchronously)
+    /// - The callable raises an exception
+    /// - The callable is not callable
+    pub(crate) fn call_sync(&mut self, callable: &Value, args: ArgValues) -> RunResult<Value> {
+        let callable_clone = callable.clone_with_heap(self.heap);
+        let result = self.call_function(callable_clone, args)?;
+        match result {
+            CallResult::Push(value) => Ok(value),
+            CallResult::FramePushed => {
+                // A new frame was pushed — run the VM until it returns from that frame.
+                // Save and set subcall_depth so ReturnValue knows when to stop.
+                let prev = self.subcall_depth;
+                self.subcall_depth = Some(self.frames.len() - 1);
+                let result = self.run();
+                self.subcall_depth = prev;
+                match result {
+                    Ok(FrameExit::Return(value)) => Ok(value),
+                    Err(e) => Err(e),
+                    _ => Err(RunError::internal("unexpected exit in call_sync")),
+                }
+            }
+            CallResult::External(_, args) | CallResult::OsCall(_, args) => {
+                args.drop_with_heap(self.heap);
+                Err(ExcType::type_error("key function cannot be an external function"))
+            }
+            CallResult::MethodCall(_, args) => {
+                args.drop_with_heap(self.heap);
+                Err(ExcType::type_error("key function cannot be an external function"))
+            }
+        }
     }
 
     // ========================================================================

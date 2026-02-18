@@ -13,7 +13,7 @@ use crate::{
     heap::{Heap, HeapId},
     intern::{Interns, StaticStrings, StringId},
     resource::{ResourceError, ResourceTracker},
-    types::AttrCallResult,
+    types::CallOutcome,
 };
 
 pub(crate) mod asyncio;
@@ -88,9 +88,9 @@ impl fmt::Display for ModuleFunctions {
 impl ModuleFunctions {
     /// Calls the module function with the given arguments.
     ///
-    /// Returns `AttrCallResult` to support both immediate values and OS calls that
+    /// Returns `CallOutcome` to support both immediate values and OS calls that
     /// require host involvement (e.g., `os.getenv()` needs the host to provide environment variables).
-    pub fn call(self, heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<AttrCallResult> {
+    pub fn call(self, heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<CallOutcome> {
         match self {
             Self::Asyncio(functions) => asyncio::call(heap, functions, args),
             Self::Os(functions) => os::call(heap, functions, args),
