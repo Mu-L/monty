@@ -33,7 +33,7 @@
 use crate::{
     args::ArgValues,
     exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, MutableHeapData},
     intern::{BytesId, Interns, StringId},
     resource::ResourceTracker,
     types::{PyTrait, Range, str::allocate_char},
@@ -417,7 +417,7 @@ pub(crate) fn advance_on_heap(
     // Fast path: Range and InternBytes don't need additional heap access,
     // so we can handle them with a single mutable borrow.
     {
-        let HeapData::Iter(iter) = heap.get_mut(iter_id) else {
+        let MutableHeapData::Iter(iter) = heap.get_mut(iter_id) else {
             panic!("advance_on_heap: expected Iterator on heap");
         };
         if let Some(result) = iter.try_advance_simple(interns) {
@@ -460,7 +460,7 @@ pub(crate) fn advance_on_heap(
     };
 
     // Phase 3: Advance the iterator
-    let HeapData::Iter(iter) = heap.get_mut(iter_id) else {
+    let MutableHeapData::Iter(iter) = heap.get_mut(iter_id) else {
         panic!("advance_on_heap: expected Iterator on heap");
     };
     iter.advance(string_char_len);

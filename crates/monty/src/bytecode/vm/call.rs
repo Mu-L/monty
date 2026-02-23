@@ -11,7 +11,7 @@ use crate::{
     builtins::{Builtins, BuiltinsFunctions},
     defer_drop,
     exception_private::{ExcType, RunError},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapPtrOwned},
     intern::{ExtFunctionId, FunctionId, Interns, StaticStrings, StringId},
     os::OsFunction,
     resource::ResourceTracker,
@@ -744,8 +744,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             default.drop_with_heap(self.heap);
         }
 
-        // Track created cell HeapIds for the frame
-        let mut frame_cells: Vec<HeapId> = Vec::with_capacity(func.cell_var_count + cells.len());
+        // Track created cell HeapPtrOwneds for the frame
+        let mut frame_cells: Vec<HeapPtrOwned<Value>> = Vec::with_capacity(func.cell_var_count + cells.len());
 
         // 3. Create cells for variables captured by nested functions
         {
@@ -758,7 +758,10 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                     Value::Undefined
                 };
                 let cell_id = self.heap.allocate(HeapData::Cell(cell_value))?;
-                frame_cells.push(cell_id);
+                // Frame owns one ref (via HeapPtrOwned), namespace gets another
+                let cell_ptr = self.heap.make_cell_ptr(cell_id);
+                self.heap.inc_ref(cell_id);
+                frame_cells.push(cell_ptr);
                 namespace.resize_with(cell_slot, || Value::Undefined);
                 namespace.push(Value::Ref(cell_id));
             }
@@ -766,8 +769,11 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             // 4. Copy captured cells (free vars) into namespace
             let free_var_start = param_count + func.cell_var_count;
             for (i, &cell_id) in cells.iter().enumerate() {
-                self.heap.inc_ref(cell_id);
-                frame_cells.push(cell_id);
+                // Frame gets an owned ref, namespace gets another
+                self.heap.inc_ref(cell_id); // for the HeapPtrOwned
+                let cell_ptr = self.heap.make_cell_ptr(cell_id);
+                self.heap.inc_ref(cell_id); // for the namespace Value::Ref
+                frame_cells.push(cell_ptr);
                 let slot = free_var_start + i;
                 namespace.resize_with(slot, || Value::Undefined);
                 namespace.push(Value::Ref(cell_id));

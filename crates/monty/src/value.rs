@@ -17,7 +17,7 @@ use crate::{
     asyncio::CallId,
     builtins::Builtins,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapId, MutableHeapData},
     intern::{BytesId, ExtFunctionId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
     modules::ModuleFunctions,
     resource::{
@@ -746,7 +746,7 @@ impl PyTrait for Value {
                 Ok(result)
             }
             (Self::Ref(id1), Self::InternString(string_id)) => {
-                if let HeapData::Str(s1) = heap.get_mut(*id1) {
+                if let MutableHeapData::Str(s1) = heap.get_mut(*id1) {
                     s1.as_string_mut().push_str(interns.get_str(*string_id));
                     Ok(true)
                 } else {
@@ -779,7 +779,7 @@ impl PyTrait for Value {
                 Ok(result)
             }
             (Self::Ref(id1), Self::InternBytes(bytes_id)) => {
-                if let HeapData::Bytes(b1) = heap.get_mut(*id1) {
+                if let MutableHeapData::Bytes(b1) = heap.get_mut(*id1) {
                     b1.as_vec_mut().extend_from_slice(interns.get_bytes(*bytes_id));
                     Ok(true)
                 } else {

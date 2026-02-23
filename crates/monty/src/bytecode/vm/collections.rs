@@ -6,7 +6,7 @@ use super::VM;
 use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunError, SimpleException},
-    heap::{HeapData, HeapGuard},
+    heap::{HeapData, HeapGuard, MutableHeapData},
     intern::StringId,
     resource::ResourceTracker,
     types::{Dict, List, PyTrait, Set, Slice, Type, allocate_tuple, slice::value_to_option_i64, str::allocate_char},
@@ -149,7 +149,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         // Extend the list
         if let Value::Ref(id) = list_ref
-            && let HeapData::List(list) = this.heap.get_mut(*id)
+            && let MutableHeapData::List(list) = this.heap.get_mut(*id)
         {
             // Update contains_refs before extending
             if has_refs {

@@ -24,7 +24,7 @@ use crate::{
     asyncio::{CallId, TaskId},
     bytecode::{code::Code, op::Opcode},
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{ContainsHeap, Heap, HeapData, HeapId},
+    heap::{ContainsHeap, DropWithHeap, Heap, HeapData, HeapId, HeapPtrOwned},
     intern::{ExtFunctionId, FunctionId, Interns, StringId},
     io::PrintWriter,
     modules::BuiltinModule,
@@ -302,8 +302,11 @@ pub struct CallFrame<'code> {
     /// Function ID (for tracebacks). None for module-level code.
     function_id: Option<FunctionId>,
 
-    /// Captured cells for closures.
-    cells: Vec<HeapId>,
+    /// Owned references to captured cells for closures.
+    ///
+    /// Each `HeapPtrOwned<Value>` holds a strong reference (refcount) to a
+    /// `HeapData::Cell` entry. The inner `Value` is the cell's mutable payload.
+    cells: Vec<HeapPtrOwned<Value>>,
 
     /// Call site position (for tracebacks).
     call_position: Option<CodeRange>,
@@ -329,7 +332,7 @@ impl<'code> CallFrame<'code> {
         stack_base: usize,
         namespace_idx: NamespaceId,
         function_id: FunctionId,
-        cells: Vec<HeapId>,
+        cells: Vec<HeapPtrOwned<Value>>,
         call_position: Option<CodeRange>,
     ) -> Self {
         Self {
@@ -393,14 +396,17 @@ pub struct SerializedFrame {
 }
 
 impl CallFrame<'_> {
-    /// Converts this frame to a serializable representation.
-    fn serialize(&self) -> SerializedFrame {
+    /// Converts this frame to a serializable representation, consuming the cells.
+    ///
+    /// Uses `into_heap_id()` to transfer ownership of the cell references from
+    /// `HeapPtrOwned<Value>` to bare `HeapId` in the serialized frame.
+    fn serialize(self) -> SerializedFrame {
         SerializedFrame {
             function_id: self.function_id,
             ip: self.ip,
             stack_base: self.stack_base,
             namespace_idx: self.namespace_idx,
-            cells: self.cells.clone(),
+            cells: self.cells.into_iter().map(HeapPtrOwned::into_heap_id).collect(),
             call_position: self.call_position,
         }
     }
@@ -564,13 +570,14 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     Some(func_id) => &interns.get_function(func_id).code,
                     None => module_code,
                 };
+                let cells = sf.cells.into_iter().map(|id| heap.make_cell_ptr(id)).collect();
                 CallFrame {
                     code,
                     ip: sf.ip,
                     stack_base: sf.stack_base,
                     namespace_idx: sf.namespace_idx,
                     function_id: sf.function_id,
-                    cells: sf.cells,
+                    cells,
                     call_position: sf.call_position,
                 }
             })
@@ -619,7 +626,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             // Move values directly - no clone, no refcount increment needed
             // (the VM owned them, now the snapshot owns them)
             stack: self.stack,
-            frames: self.frames.into_iter().map(|f| f.serialize()).collect(),
+            frames: self.frames.into_iter().map(CallFrame::serialize).collect(),
             exception_stack: self.exception_stack,
             instruction_ip: self.instruction_ip,
             next_call_id: self.next_call_id,
@@ -1548,6 +1555,10 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             let value = self.stack.pop().unwrap();
             value.drop_with_heap(self.heap);
         }
+        // Clean up owned cell references
+        for cell in frame.cells {
+            cell.drop_with_heap(self.heap);
+        }
         // Clean up the namespace (but not the global namespace)
         if frame.namespace_idx != GLOBAL_NS_IDX {
             self.namespaces.drop_with_heap(frame.namespace_idx, self.heap);
@@ -1560,9 +1571,9 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// Properly cleans up each frame's namespace and cell references.
     pub(super) fn cleanup_current_frames(&mut self) {
         for frame in self.frames.drain(..) {
-            // Clean up cell references
-            for cell_id in frame.cells {
-                self.heap.dec_ref(cell_id);
+            // Clean up owned cell references
+            for cell in frame.cells {
+                cell.drop_with_heap(self.heap);
             }
             // Clean up the namespace (but not the global namespace)
             if frame.namespace_idx != GLOBAL_NS_IDX {
@@ -1714,7 +1725,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     ///
     /// Returns a NameError if the cell value is undefined (free variable not bound).
     fn load_cell(&mut self, slot: u16) -> RunResult<()> {
-        let cell_id = self.current_frame().cells[slot as usize];
+        let cell_id = self.current_frame().cells[slot as usize].id();
         // get_cell_value already clones with proper refcount via clone_with_heap
         let value = self.heap.get_cell_value(cell_id);
 
@@ -1740,7 +1751,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// Pops the top of stack and stores it in a closure cell.
     fn store_cell(&mut self, slot: u16) {
         let value = self.pop();
-        let cell_id = self.current_frame().cells[slot as usize];
+        let cell_id = self.current_frame().cells[slot as usize].id();
         self.heap.set_cell_value(cell_id, value);
     }
 }

@@ -510,11 +510,12 @@ impl Scheduler {
             }
 
             // Cleanup the inner GatherFuture - extract data first to avoid borrow conflict
-            let (items, results) = if let crate::heap::HeapData::GatherFuture(gather) = heap.get_mut(inner_gather_id) {
-                (std::mem::take(&mut gather.items), std::mem::take(&mut gather.results))
-            } else {
-                (vec![], vec![])
-            };
+            let (items, results) =
+                if let crate::heap::MutableHeapData::GatherFuture(gather) = heap.get_mut(inner_gather_id) {
+                    (std::mem::take(&mut gather.items), std::mem::take(&mut gather.results))
+                } else {
+                    (vec![], vec![])
+                };
 
             // Now cleanup the extracted data with mutable heap access
             for item in items {

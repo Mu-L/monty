@@ -4,7 +4,8 @@ use std::{
     fmt::Write,
     hash::{Hash, Hasher},
     mem::{ManuallyDrop, discriminant, size_of},
-    ptr::addr_of,
+    ops::{Index, IndexMut},
+    ptr::{NonNull, addr_of},
     vec,
 };
 
@@ -131,6 +132,67 @@ pub(crate) enum HeapData {
     /// Pure methods (name, parent, etc.) are handled directly by the VM.
     /// I/O methods (exists, read_text, etc.) yield external function calls.
     Path(Path),
+}
+
+/// Mutable reference to a heap entry's inner data that prevents discriminant changes.
+///
+/// When `Heap::get_mut` returned `&mut HeapData`, callers could theoretically replace
+/// a `Cell(value)` with a `List(...)`, invalidating any `HeapPtrOwned<Value>` that
+/// points to the Cell's payload. `MutableHeapData` exposes only mutable references to
+/// the *inner* data of each variant, making discriminant changes impossible.
+#[expect(dead_code)]
+pub(crate) enum MutableHeapData<'a> {
+    Str(&'a mut Str),
+    Bytes(&'a mut Bytes),
+    List(&'a mut List),
+    Tuple(&'a mut Tuple),
+    NamedTuple(&'a mut NamedTuple),
+    Dict(&'a mut Dict),
+    Set(&'a mut Set),
+    FrozenSet(&'a mut FrozenSet),
+    Closure(&'a mut FunctionId, &'a mut Vec<HeapId>, &'a mut Vec<Value>),
+    FunctionDefaults(&'a mut FunctionId, &'a mut Vec<Value>),
+    Cell(&'a mut Value),
+    Range(&'a mut Range),
+    Slice(&'a mut Slice),
+    Exception(&'a mut SimpleException),
+    Dataclass(&'a mut Dataclass),
+    Iter(&'a mut MontyIter),
+    LongInt(&'a mut LongInt),
+    Module(&'a mut Module),
+    Coroutine(&'a mut Coroutine),
+    GatherFuture(&'a mut GatherFuture),
+    Path(&'a mut Path),
+}
+
+impl HeapData {
+    /// Returns a [`MutableHeapData`] that borrows the inner data mutably while
+    /// preventing the caller from changing the enum discriminant.
+    fn as_mutable(&mut self) -> MutableHeapData<'_> {
+        match self {
+            Self::Str(v) => MutableHeapData::Str(v),
+            Self::Bytes(v) => MutableHeapData::Bytes(v),
+            Self::List(v) => MutableHeapData::List(v),
+            Self::Tuple(v) => MutableHeapData::Tuple(v),
+            Self::NamedTuple(v) => MutableHeapData::NamedTuple(v),
+            Self::Dict(v) => MutableHeapData::Dict(v),
+            Self::Set(v) => MutableHeapData::Set(v),
+            Self::FrozenSet(v) => MutableHeapData::FrozenSet(v),
+            Self::Closure(fid, cells, defaults) => MutableHeapData::Closure(fid, cells, defaults),
+            Self::FunctionDefaults(fid, defaults) => MutableHeapData::FunctionDefaults(fid, defaults),
+            Self::Cell(v) => MutableHeapData::Cell(v),
+            Self::Range(v) => MutableHeapData::Range(v),
+            Self::Slice(v) => MutableHeapData::Slice(v),
+            Self::Exception(v) => MutableHeapData::Exception(v),
+            Self::Dataclass(v) => MutableHeapData::Dataclass(v),
+            Self::Iter(v) => MutableHeapData::Iter(v),
+            Self::LongInt(v) => MutableHeapData::LongInt(v),
+            Self::Module(v) => MutableHeapData::Module(v),
+            Self::Coroutine(v) => MutableHeapData::Coroutine(v),
+            Self::GatherFuture(v) => MutableHeapData::GatherFuture(v),
+            Self::Path(v) => MutableHeapData::Path(v),
+        }
+    }
 }
 
 impl HeapData {
@@ -859,6 +921,211 @@ pub struct HeapValue {
     hash_state: HashState,
 }
 
+/// Number of entries per page in the paged heap arena.
+///
+/// 256 keeps pages small enough to avoid wasting much memory on the last
+/// partially-filled page, while large enough to amortize the cost of page
+/// allocation.
+const PAGE_SIZE: usize = 256;
+
+/// Paged arena storage providing stable memory addresses for heap entries.
+///
+/// Unlike a flat `Vec<Option<HeapValue>>` which invalidates all pointers on
+/// reallocation, `PagedVec` stores entries in fixed-size `Box`-allocated pages.
+/// Once an entry is placed in a page, its memory address never changes — even
+/// when new pages are added. This enables safe `NonNull<T>` pointers into the
+/// arena for [`HeapPtrOwned`].
+///
+/// Internally, the layout is `Vec<Box<Page>>` where each `Page` is
+/// `[Option<HeapValue>; PAGE_SIZE]`. Appending a new page only pushes a
+/// pointer onto the outer `Vec`; existing pages remain at their original
+/// heap addresses.
+#[derive(Debug)]
+struct PagedVec {
+    pages: Vec<Box<[Option<HeapValue>; PAGE_SIZE]>>,
+    /// Total number of entries (including freed slots). This is the logical
+    /// length — slots beyond this have never been used.
+    len: usize,
+}
+
+impl PagedVec {
+    /// Creates a new `PagedVec`, pre-allocating enough pages for `capacity` entries.
+    fn new(capacity: usize) -> Self {
+        let page_count = capacity.div_ceil(PAGE_SIZE);
+        let mut pages = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            pages.push(Self::new_page());
+        }
+        Self { pages, len: 0 }
+    }
+
+    /// Returns the logical length — the number of slots that have been pushed.
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Appends a new entry, allocating a fresh page if the current one is full.
+    fn push(&mut self, value: Option<HeapValue>) {
+        let page_idx = self.len / PAGE_SIZE;
+        let slot_idx = self.len % PAGE_SIZE;
+        if page_idx >= self.pages.len() {
+            self.pages.push(Self::new_page());
+        }
+        self.pages[page_idx][slot_idx] = value;
+        self.len += 1;
+    }
+
+    /// Returns an immutable reference to the slot at `index`, or `None` if out of bounds.
+    #[inline]
+    fn get(&self, index: usize) -> Option<&Option<HeapValue>> {
+        if index >= self.len {
+            return None;
+        }
+        let page_idx = index / PAGE_SIZE;
+        let slot_idx = index % PAGE_SIZE;
+        Some(&self.pages[page_idx][slot_idx])
+    }
+
+    /// Returns a mutable reference to the slot at `index`, or `None` if out of bounds.
+    #[inline]
+    fn get_mut(&mut self, index: usize) -> Option<&mut Option<HeapValue>> {
+        if index >= self.len {
+            return None;
+        }
+        let page_idx = index / PAGE_SIZE;
+        let slot_idx = index % PAGE_SIZE;
+        Some(&mut self.pages[page_idx][slot_idx])
+    }
+
+    /// Iterates mutably over all live slots (0..len), yielding `&mut Option<HeapValue>`.
+    ///
+    /// Only used in the `Heap::Drop` impl (behind `cfg(feature = "ref-count-panic")`).
+    #[cfg(feature = "ref-count-panic")]
+    fn iter_mut(&mut self) -> PagedVecIterMut<'_> {
+        PagedVecIterMut {
+            pages: &mut self.pages,
+            index: 0,
+            len: self.len,
+        }
+    }
+
+    /// Returns the number of occupied (non-`None`) slots after index 0.
+    ///
+    /// Used by `entry_count()` to exclude the empty-tuple singleton at index 0.
+    #[cfg(feature = "ref-count-return")]
+    fn count_occupied_after_first(&self) -> usize {
+        let mut count = 0;
+        for i in 1..self.len {
+            let page_idx = i / PAGE_SIZE;
+            let slot_idx = i % PAGE_SIZE;
+            if self.pages[page_idx][slot_idx].is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Allocates a new page initialized with `None` in every slot.
+    fn new_page() -> Box<[Option<HeapValue>; PAGE_SIZE]> {
+        // Safety: `Option<HeapValue>` has no invalid bit patterns for `None`,
+        // and `Box::new` would require the array on the stack first. Instead,
+        // allocate zeroed memory (all `None` discriminants) directly on the heap.
+        //
+        // Actually, we cannot assume `None` is zeroed for `Option<HeapValue>`.
+        // Use the safe approach of boxing a default-initialized array.
+        Box::new(std::array::from_fn(|_| None))
+    }
+}
+
+impl Index<usize> for PagedVec {
+    type Output = Option<HeapValue>;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("PagedVec index out of bounds")
+    }
+}
+
+impl IndexMut<usize> for PagedVec {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.get_mut(index).expect("PagedVec index out of bounds")
+    }
+}
+
+/// Mutable iterator over all slots in a [`PagedVec`].
+///
+/// Only used in the `Heap::Drop` impl (behind `cfg(feature = "ref-count-panic")`).
+#[cfg(feature = "ref-count-panic")]
+struct PagedVecIterMut<'a> {
+    pages: &'a mut Vec<Box<[Option<HeapValue>; PAGE_SIZE]>>,
+    index: usize,
+    len: usize,
+}
+
+#[cfg(feature = "ref-count-panic")]
+impl<'a> Iterator for PagedVecIterMut<'a> {
+    type Item = &'a mut Option<HeapValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.len {
+            return None;
+        }
+        let page_idx = self.index / PAGE_SIZE;
+        let slot_idx = self.index % PAGE_SIZE;
+        self.index += 1;
+        let page = &raw mut self.pages[page_idx];
+        // SAFETY: Each index is visited exactly once, and the pages pointer
+        // remains valid for the lifetime of the iterator. We reborrow the
+        // page via a raw pointer to avoid the borrow checker rejecting
+        // multiple mutable borrows from the same `&mut Vec`.
+        let slot = unsafe { &mut (*page)[slot_idx] };
+        Some(slot)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+#[cfg(feature = "ref-count-panic")]
+impl ExactSizeIterator for PagedVecIterMut<'_> {}
+
+impl serde::Serialize for PagedVec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len))?;
+        for i in 0..self.len {
+            let page_idx = i / PAGE_SIZE;
+            let slot_idx = i % PAGE_SIZE;
+            seq.serialize_element(&self.pages[page_idx][slot_idx])?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PagedVec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let flat: Vec<Option<HeapValue>> = Vec::deserialize(deserializer)?;
+        let len = flat.len();
+        let page_count = len.div_ceil(PAGE_SIZE);
+        let mut pages = Vec::with_capacity(page_count);
+        let mut iter = flat.into_iter();
+        for _ in 0..page_count {
+            let mut page = Self::new_page();
+            for slot in page.iter_mut() {
+                if let Some(value) = iter.next() {
+                    *slot = value;
+                }
+            }
+            pages.push(page);
+        }
+        Ok(Self { pages, len })
+    }
+}
+
 /// Reference-counted arena that backs all heap-only runtime values.
 ///
 /// Uses a free list to reuse slots from freed values, keeping memory usage
@@ -873,7 +1140,7 @@ pub struct HeapValue {
 /// handles the Drop constraint by using `std::mem::take` during serialization.
 #[derive(Debug)]
 pub(crate) struct Heap<T: ResourceTracker> {
-    entries: Vec<Option<HeapValue>>,
+    entries: PagedVec,
     /// IDs of freed slots available for reuse. Populated by `dec_ref`, consumed by `allocate`.
     free_list: Vec<HeapId>,
     /// Resource tracker for enforcing limits and scheduling GC.
@@ -902,7 +1169,7 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(serde::Deserialize)]
         struct HeapFields<T> {
-            entries: Vec<Option<HeapValue>>,
+            entries: PagedVec,
             free_list: Vec<HeapId>,
             tracker: T,
             may_have_cycles: bool,
@@ -957,7 +1224,7 @@ impl<T: ResourceTracker> Heap<T> {
     /// Use this to create heaps with custom resource limits or GC scheduling.
     pub fn new(capacity: usize, tracker: T) -> Self {
         let mut this = Self {
-            entries: Vec::with_capacity(capacity),
+            entries: PagedVec::new(capacity),
             free_list: Vec::new(),
             tracker,
             may_have_cycles: false,
@@ -1143,12 +1410,27 @@ impl<T: ResourceTracker> Heap<T> {
             .expect("Heap::get: data currently borrowed")
     }
 
-    /// Returns a mutable reference to the heap data stored at the given ID.
+    /// Returns a [`MutableHeapData`] reference to the heap data at the given ID.
+    ///
+    /// Unlike `get_mut_raw`, this prevents callers from changing the enum discriminant,
+    /// which is essential for the soundness of [`HeapPtrOwned`] pointers that point into
+    /// the variant's payload.
     ///
     /// # Panics
     /// Panics if the value ID is invalid, the value has already been freed,
     /// or the data is currently borrowed via `with_entry_mut`/`call_attr`.
-    pub fn get_mut(&mut self, id: HeapId) -> &mut HeapData {
+    pub fn get_mut(&mut self, id: HeapId) -> MutableHeapData<'_> {
+        self.get_mut_raw(id).as_mutable()
+    }
+
+    /// Returns a raw `&mut HeapData` reference.
+    ///
+    /// This is an internal method — external callers should use [`get_mut`] which
+    /// returns [`MutableHeapData`] to prevent discriminant changes. This raw version
+    /// is needed by `HeapPtrOwned` construction (to extract `NonNull<T>` pointers to
+    /// inner variant data) and by `take_data!`/`restore_data!` patterns that will
+    /// eventually be removed.
+    fn get_mut_raw(&mut self, id: HeapId) -> &mut HeapData {
         self.entries
             .get_mut(id.index())
             .expect("Heap::get_mut: slot missing")
@@ -1318,8 +1600,8 @@ impl<T: ResourceTracker> Heap<T> {
     #[must_use]
     #[cfg(feature = "ref-count-return")]
     pub fn entry_count(&self) -> usize {
-        // 1.. to skip index 0 which is the empty tuple singleton
-        self.entries[1..].iter().filter(|o| o.is_some()).count()
+        // Skip index 0 which is the empty tuple singleton
+        self.entries.count_occupied_after_first()
     }
 
     /// Gets the value inside a cell, cloning it with proper refcount handling.
@@ -1642,13 +1924,13 @@ impl<T: ResourceTracker> Heap<T> {
         }
 
         // Sweep phase: free unreachable values
-        for (id, value) in self.entries.iter_mut().enumerate() {
-            if reachable[id] {
+        for (id, is_reachable) in reachable.iter().enumerate().take(self.entries.len()) {
+            if *is_reachable {
                 continue;
             }
 
             // This entry is unreachable - free it
-            if let Some(value) = value.take() {
+            if let Some(value) = self.entries[id].take() {
                 // Notify tracker of freed memory
                 if let Some(ref data) = value.data {
                     self.tracker.on_free(|| data.py_estimate_size());
@@ -1962,6 +2244,317 @@ impl<U: DropWithHeap, V: DropWithHeap> DropWithHeap for (U, V) {
         let (left, right) = self;
         left.drop_with_heap(heap);
         right.drop_with_heap(heap);
+    }
+}
+
+/// Strong-reference smart pointer to a typed value inside the heap arena.
+///
+/// Holds both a `HeapId` (for heap operations like inc_ref/dec_ref) and a `NonNull<T>`
+/// pointing to the inner payload of a specific `HeapData` variant. Currently, all
+/// access goes through `Heap::get`/`Heap::get_mut_raw` with an address validation
+/// check — the `NonNull<T>` is never raw-dereferenced. This ensures soundness even
+/// while `take_data!` exists.
+///
+/// Once `take_data!` is removed and `HeapValue.data` becomes non-optional, the
+/// `NonNull<T>` can be dereferenced directly, skipping the index lookup entirely.
+///
+/// Implements [`DropWithHeap`] — must be cleaned up with heap access on every code path.
+/// Use [`defer_drop!`] or [`HeapGuard`] to ensure cleanup.
+///
+/// `HeapPtrOwned` does **not** implement `Deref` or `DerefMut`. Instead, call
+/// [`get`](Self::get) or [`get_mut`](Self::get_mut) which require a borrow of the
+/// `Heap`, making the heap reference act as the aliasing guard.
+pub(crate) struct HeapPtrOwned<T> {
+    id: HeapId,
+    /// Pointer into the heap page, pointing at the inner `T` of the `HeapData` variant.
+    /// Used for address validation (and future direct-dereference optimisation).
+    ptr: NonNull<T>,
+}
+
+impl<T> std::fmt::Debug for HeapPtrOwned<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeapPtrOwned")
+            .field("id", &self.id)
+            .field("ptr", &self.ptr)
+            .finish()
+    }
+}
+
+/// Trait for types that can be the target of a [`HeapPtrOwned`].
+///
+/// Each implementer knows which `HeapData` variant it lives inside and can
+/// extract a reference to itself from a `&HeapData` or `&mut HeapData`.
+/// This keeps the variant-dispatch logic out of generic `HeapPtrOwned` code.
+///
+/// Currently only used by `HeapPtrOwned::get` and `get_mut`, which are not yet
+/// called. The impls exist for all `HeapData` variants to support future typed
+/// heap pointers beyond `HeapPtrOwned<Value>`.
+pub(crate) trait HeapPtrTarget: Sized {
+    /// Extracts an immutable reference from the `HeapData` variant.
+    fn extract_ref(data: &HeapData) -> &Self;
+    /// Extracts a mutable reference from the `HeapData` variant.
+    fn extract_mut(data: &mut HeapData) -> &mut Self;
+}
+
+/// Generates a [`HeapPtrTarget`] implementation that maps a concrete inner type to
+/// its `HeapData` variant.
+macro_rules! impl_heap_ptr_target {
+    ($ty:ty, $variant:ident, $label:literal) => {
+        impl HeapPtrTarget for $ty {
+            fn extract_ref(data: &HeapData) -> &Self {
+                match data {
+                    HeapData::$variant(v) => v,
+                    _ => panic!(
+                        concat!(
+                            "HeapPtrOwned<",
+                            $label,
+                            ">: expected ",
+                            stringify!($variant),
+                            ", got {:?}"
+                        ),
+                        discriminant(data)
+                    ),
+                }
+            }
+
+            fn extract_mut(data: &mut HeapData) -> &mut Self {
+                match data {
+                    HeapData::$variant(v) => v,
+                    _ => panic!(concat!(
+                        "HeapPtrOwned<",
+                        $label,
+                        ">: expected ",
+                        stringify!($variant)
+                    )),
+                }
+            }
+        }
+    };
+}
+
+// `HeapPtrOwned<Value>` targets the inner `Value` of a `HeapData::Cell` variant.
+impl_heap_ptr_target!(Value, Cell, "Value");
+impl_heap_ptr_target!(Str, Str, "Str");
+impl_heap_ptr_target!(Bytes, Bytes, "Bytes");
+impl_heap_ptr_target!(List, List, "List");
+impl_heap_ptr_target!(Tuple, Tuple, "Tuple");
+impl_heap_ptr_target!(NamedTuple, NamedTuple, "NamedTuple");
+impl_heap_ptr_target!(Dict, Dict, "Dict");
+impl_heap_ptr_target!(Set, Set, "Set");
+impl_heap_ptr_target!(FrozenSet, FrozenSet, "FrozenSet");
+impl_heap_ptr_target!(Range, Range, "Range");
+impl_heap_ptr_target!(Slice, Slice, "Slice");
+impl_heap_ptr_target!(SimpleException, Exception, "SimpleException");
+impl_heap_ptr_target!(Dataclass, Dataclass, "Dataclass");
+impl_heap_ptr_target!(MontyIter, Iter, "MontyIter");
+impl_heap_ptr_target!(LongInt, LongInt, "LongInt");
+impl_heap_ptr_target!(Module, Module, "Module");
+impl_heap_ptr_target!(Coroutine, Coroutine, "Coroutine");
+impl_heap_ptr_target!(GatherFuture, GatherFuture, "GatherFuture");
+impl_heap_ptr_target!(Path, Path, "Path");
+
+/// Owned typed reference to a heap entry, dispatched by variant.
+///
+/// Returned by [`Heap::get_entry_owned`] to provide typed access without
+/// the caller needing to know the variant in advance. Each variant holds
+/// a [`HeapPtrOwned`] that owns a strong reference (refcount) to the entry.
+pub(crate) enum HeapEntryOwned {
+    Str(HeapPtrOwned<Str>),
+    Bytes(HeapPtrOwned<Bytes>),
+    List(HeapPtrOwned<List>),
+    Tuple(HeapPtrOwned<Tuple>),
+    NamedTuple(HeapPtrOwned<NamedTuple>),
+    Dict(HeapPtrOwned<Dict>),
+    Set(HeapPtrOwned<Set>),
+    FrozenSet(HeapPtrOwned<FrozenSet>),
+    Closure(HeapId),
+    FunctionDefaults(HeapId),
+    Cell(HeapPtrOwned<Value>),
+    Range(HeapPtrOwned<Range>),
+    Slice(HeapPtrOwned<Slice>),
+    Exception(HeapPtrOwned<SimpleException>),
+    Dataclass(HeapPtrOwned<Dataclass>),
+    Iter(HeapPtrOwned<MontyIter>),
+    LongInt(HeapPtrOwned<LongInt>),
+    Module(HeapPtrOwned<Module>),
+    Coroutine(HeapPtrOwned<Coroutine>),
+    GatherFuture(HeapPtrOwned<GatherFuture>),
+    Path(HeapPtrOwned<Path>),
+}
+
+impl<T: HeapPtrTarget> HeapPtrOwned<T> {
+    /// Returns the `HeapId` associated with this pointer.
+    #[inline]
+    pub fn id(&self) -> HeapId {
+        self.id
+    }
+
+    /// Returns an immutable reference to the inner `T`, validated against the stored pointer.
+    ///
+    /// Looks up the entry via `heap.get(id)`, extracts `&T` from the correct variant,
+    /// and asserts that the address matches the stored `NonNull<T>`. The returned
+    /// reference borrows from `heap`, preventing concurrent mutation.
+    ///
+    /// # Panics
+    /// Panics if the address doesn't match (indicating the entry was freed and reallocated
+    /// as a different type) or if the variant is wrong.
+    #[expect(dead_code)]
+    pub fn get<'a, R: ResourceTracker>(&self, heap: &'a Heap<R>) -> &'a T {
+        let data = heap.get(self.id);
+        let inner = T::extract_ref(data);
+        debug_assert_eq!(
+            std::ptr::from_ref(inner),
+            self.ptr.as_ptr(),
+            "HeapPtrOwned: address mismatch — entry was likely freed and reallocated"
+        );
+        inner
+    }
+
+    /// Returns a mutable reference to the inner `T`, validated against the stored pointer.
+    ///
+    /// Uses `heap.get_mut_raw(id)` internally (not the public `get_mut` that returns
+    /// `MutableHeapData`) so that the variant can be matched and the address checked.
+    ///
+    /// # Panics
+    /// Panics if the address doesn't match or the variant is wrong.
+    #[expect(dead_code)]
+    pub fn get_mut<'a, R: ResourceTracker>(&self, heap: &'a mut Heap<R>) -> &'a mut T {
+        let data = heap.get_mut_raw(self.id);
+        let inner = T::extract_mut(data);
+        debug_assert_eq!(
+            std::ptr::from_mut(inner).cast_const(),
+            self.ptr.as_ptr(),
+            "HeapPtrOwned: address mismatch — entry was likely freed and reallocated"
+        );
+        inner
+    }
+
+    /// Consumes the pointer, returning the `HeapId` without decrementing the reference count.
+    ///
+    /// Use this when transferring ownership to another structure (e.g., moving a cell
+    /// reference from a frame into a `Closure` or `Coroutine`).
+    pub fn into_heap_id(self) -> HeapId {
+        let id = self.id;
+        std::mem::forget(self);
+        id
+    }
+}
+
+impl<T: HeapPtrTarget> DropWithHeap for HeapPtrOwned<T> {
+    fn drop_with_heap<R: ResourceTracker>(self, heap: &mut Heap<R>) {
+        heap.dec_ref(self.id);
+        std::mem::forget(self);
+    }
+}
+
+impl<T> Drop for HeapPtrOwned<T> {
+    fn drop(&mut self) {
+        // If a HeapPtrOwned is dropped without calling drop_with_heap or into_heap_id,
+        // that's a refcount leak. In debug builds, panic to catch this early.
+        assert!(
+            !cfg!(debug_assertions) || std::thread::panicking(),
+            "HeapPtrOwned<{}> dropped without drop_with_heap — refcount leak for {:?}",
+            std::any::type_name::<T>(),
+            self.id
+        );
+    }
+}
+
+impl<T: ResourceTracker> Heap<T> {
+    /// Creates a `HeapPtrOwned<Value>` pointing to the inner value of a `Cell` entry.
+    ///
+    /// This does **not** increment the reference count — the caller must already own
+    /// a reference (e.g., from `allocate` which starts at refcount 1, or from a prior
+    /// `inc_ref` call).
+    ///
+    /// # Panics
+    /// Panics if the entry is not a `Cell`.
+    pub fn make_cell_ptr(&mut self, id: HeapId) -> HeapPtrOwned<Value> {
+        let data = self.get_mut_raw(id);
+        let inner = match data {
+            HeapData::Cell(v) => v as *mut Value,
+            _ => panic!("Heap::make_cell_ptr: expected Cell, got {:?}", discriminant(data)),
+        };
+        HeapPtrOwned {
+            id,
+            // Safety: `inner` points into a `Box`-allocated page that won't move.
+            ptr: NonNull::new(inner).expect("Cell value pointer is null"),
+        }
+    }
+
+    /// Creates an owned typed reference to a heap entry, incrementing its refcount.
+    ///
+    /// The returned [`HeapEntryOwned`] holds a strong reference and must be cleaned up
+    /// via [`DropWithHeap`] on all code paths.
+    #[expect(dead_code)]
+    pub fn get_entry_owned(&mut self, id: HeapId) -> HeapEntryOwned {
+        self.inc_ref(id);
+        self.make_entry_owned(id)
+    }
+
+    /// Creates a [`HeapEntryOwned`] without incrementing the refcount.
+    ///
+    /// The caller must already own a reference (e.g., from `allocate` or `inc_ref`).
+    fn make_entry_owned(&mut self, id: HeapId) -> HeapEntryOwned {
+        macro_rules! owned {
+            ($variant:ident, $inner:expr) => {
+                HeapEntryOwned::$variant(HeapPtrOwned {
+                    id,
+                    ptr: NonNull::from($inner),
+                })
+            };
+        }
+        let data = self.get_mut_raw(id);
+        match data {
+            HeapData::Str(v) => owned!(Str, v),
+            HeapData::Bytes(v) => owned!(Bytes, v),
+            HeapData::List(v) => owned!(List, v),
+            HeapData::Tuple(v) => owned!(Tuple, v),
+            HeapData::NamedTuple(v) => owned!(NamedTuple, v),
+            HeapData::Dict(v) => owned!(Dict, v),
+            HeapData::Set(v) => owned!(Set, v),
+            HeapData::FrozenSet(v) => owned!(FrozenSet, v),
+            HeapData::Closure(..) => HeapEntryOwned::Closure(id),
+            HeapData::FunctionDefaults(..) => HeapEntryOwned::FunctionDefaults(id),
+            HeapData::Cell(v) => owned!(Cell, v),
+            HeapData::Range(v) => owned!(Range, v),
+            HeapData::Slice(v) => owned!(Slice, v),
+            HeapData::Exception(v) => owned!(Exception, v),
+            HeapData::Dataclass(v) => owned!(Dataclass, v),
+            HeapData::Iter(v) => owned!(Iter, v),
+            HeapData::LongInt(v) => owned!(LongInt, v),
+            HeapData::Module(v) => owned!(Module, v),
+            HeapData::Coroutine(v) => owned!(Coroutine, v),
+            HeapData::GatherFuture(v) => owned!(GatherFuture, v),
+            HeapData::Path(v) => owned!(Path, v),
+        }
+    }
+}
+
+impl DropWithHeap for HeapEntryOwned {
+    fn drop_with_heap<R: ResourceTracker>(self, heap: &mut Heap<R>) {
+        match self {
+            Self::Str(p) => p.drop_with_heap(heap),
+            Self::Bytes(p) => p.drop_with_heap(heap),
+            Self::List(p) => p.drop_with_heap(heap),
+            Self::Tuple(p) => p.drop_with_heap(heap),
+            Self::NamedTuple(p) => p.drop_with_heap(heap),
+            Self::Dict(p) => p.drop_with_heap(heap),
+            Self::Set(p) => p.drop_with_heap(heap),
+            Self::FrozenSet(p) => p.drop_with_heap(heap),
+            Self::Closure(id) | Self::FunctionDefaults(id) => heap.dec_ref(id),
+            Self::Cell(p) => p.drop_with_heap(heap),
+            Self::Range(p) => p.drop_with_heap(heap),
+            Self::Slice(p) => p.drop_with_heap(heap),
+            Self::Exception(p) => p.drop_with_heap(heap),
+            Self::Dataclass(p) => p.drop_with_heap(heap),
+            Self::Iter(p) => p.drop_with_heap(heap),
+            Self::LongInt(p) => p.drop_with_heap(heap),
+            Self::Module(p) => p.drop_with_heap(heap),
+            Self::Coroutine(p) => p.drop_with_heap(heap),
+            Self::GatherFuture(p) => p.drop_with_heap(heap),
+            Self::Path(p) => p.drop_with_heap(heap),
+        }
     }
 }
 

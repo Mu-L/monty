@@ -14,7 +14,7 @@ use crate::{
     bytecode::vm::scheduler::{PendingCallData, Scheduler, SerializedTaskFrame, TaskState},
     defer_drop,
     exception_private::{ExcType, RunError, SimpleException},
-    heap::{HeapData, HeapGuard, HeapId},
+    heap::{HeapData, HeapGuard, HeapId, HeapPtrOwned, MutableHeapData},
     intern::FunctionId,
     resource::ResourceTracker,
     types::{List, PyTrait},
@@ -135,7 +135,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         }
 
         // Mark coroutine as Running
-        if let HeapData::Coroutine(coro_mut) = this.heap.get_mut(heap_id) {
+        if let MutableHeapData::Coroutine(coro_mut) = this.heap.get_mut(heap_id) {
             coro_mut.state = CoroutineState::Running;
         }
 
@@ -177,7 +177,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         // Note: We clone instead of mem::take because GatherItem::Coroutine holds HeapIds
         // that need to stay in gather.items for proper ref counting when the gather is dropped.
         let current_task = this.get_or_create_scheduler().current_task_id();
-        let items: Vec<GatherItem> = if let HeapData::GatherFuture(gather_mut) = this.heap.get_mut(heap_id) {
+        let items: Vec<GatherItem> = if let MutableHeapData::GatherFuture(gather_mut) = this.heap.get_mut(heap_id) {
             gather_mut.waiter = current_task;
             gather_mut.items.clone()
         } else {
@@ -202,7 +202,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
                     if let Some(value) = this.scheduler_mut().take_resolved(*call_id) {
                         // Already resolved - store result immediately
-                        if let HeapData::GatherFuture(gather_mut) = this.heap.get_mut(heap_id) {
+                        if let MutableHeapData::GatherFuture(gather_mut) = this.heap.get_mut(heap_id) {
                             gather_mut.results[idx] = Some(value);
                         }
                     } else {
@@ -216,7 +216,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         }
 
         // Store task IDs and pending calls in the gather
-        if let HeapData::GatherFuture(gather_mut) = this.heap.get_mut(heap_id) {
+        if let MutableHeapData::GatherFuture(gather_mut) = this.heap.get_mut(heap_id) {
             gather_mut.task_ids = task_ids;
             gather_mut.pending_calls.clone_from(&pending_calls);
         }
@@ -234,7 +234,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             // All external futures were already resolved - return results immediately
             // Steal results using mem::take - avoids refcount dance since we're dropping
             // the GatherFuture anyway via awaitable.drop_with_heap below
-            let results: Vec<Value> = if let HeapData::GatherFuture(gather) = this.heap.get_mut(heap_id) {
+            let results: Vec<Value> = if let MutableHeapData::GatherFuture(gather) = this.heap.get_mut(heap_id) {
                 std::mem::take(&mut gather.results)
                     .into_iter()
                     .map(|r| r.expect("all results should be filled"))
@@ -307,13 +307,17 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         // Register the pre-bound namespace
         let namespace_idx = self.namespaces.register_prebuilt(namespace_values, self.heap)?;
 
+        // Convert HeapIds to HeapPtrOwned (caller already inc_ref'd for each)
+        let owned_cells: Vec<HeapPtrOwned<Value>> =
+            frame_cells.into_iter().map(|id| self.heap.make_cell_ptr(id)).collect();
+
         // Push frame to execute the coroutine
         self.frames.push(CallFrame::new_function(
             &func.code,
             self.stack.len(),
             namespace_idx,
             func_id,
-            frame_cells,
+            owned_cells,
             Some(call_position),
         ));
 
@@ -376,7 +380,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         // Mark coroutine as completed
         if let Some(coro_id) = coroutine_id
-            && let HeapData::Coroutine(coro) = self.heap.get_mut(coro_id)
+            && let MutableHeapData::Coroutine(coro) = self.heap.get_mut(coro_id)
         {
             coro.state = CoroutineState::Completed;
         }
@@ -389,7 +393,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         if let Some(gid) = gather_id {
             // Store result in gather.results at the correct index
             if let Some(idx) = gather_result_idx
-                && let HeapData::GatherFuture(gather) = self.heap.get_mut(gid)
+                && let MutableHeapData::GatherFuture(gather) = self.heap.get_mut(gid)
             {
                 gather.results[idx] = Some(result);
             } else {
@@ -442,7 +446,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 // Steal results from gather using mem::take - avoids refcount dance
                 // (copy + inc_ref + dec_ref on gather drop). Since gather is being
                 // destroyed, we can take ownership of the values directly.
-                let results: Vec<Value> = if let HeapData::GatherFuture(gather) = self.heap.get_mut(gid) {
+                let results: Vec<Value> = if let MutableHeapData::GatherFuture(gather) = self.heap.get_mut(gid) {
                     std::mem::take(&mut gather.results)
                         .into_iter()
                         .map(|r| r.expect("all results should be filled when gather is complete"))
@@ -540,7 +544,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         // If part of a gather, propagate error to waiter
         if let Some(gid) = gather_id {
             // Get waiter and take task_ids from GatherFuture - gather is being destroyed anyway
-            let (waiter, task_ids) = if let HeapData::GatherFuture(gather) = self.heap.get_mut(gid) {
+            let (waiter, task_ids) = if let MutableHeapData::GatherFuture(gather) = self.heap.get_mut(gid) {
                 (gather.waiter, std::mem::take(&mut gather.task_ids))
             } else {
                 (None, vec![])
@@ -609,7 +613,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 ip: f.ip,
                 stack_base: f.stack_base,
                 namespace_idx: f.namespace_idx,
-                cells: f.cells,
+                // Transfer ownership from HeapPtrOwned to bare HeapId for serialization.
+                // into_heap_id() consumes without dec_ref — the serialized frame now owns the ref.
+                cells: f.cells.into_iter().map(HeapPtrOwned::into_heap_id).collect(),
                 call_position: f.call_position,
             })
             .collect();
@@ -662,13 +668,15 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                             self.module_code.expect("module_code not set for main task frame")
                         }
                     };
+                    // Convert HeapIds back to HeapPtrOwned (the serialized frame owned these refs)
+                    let cells = sf.cells.into_iter().map(|id| self.heap.make_cell_ptr(id)).collect();
                     CallFrame {
                         code,
                         ip: sf.ip,
                         stack_base: sf.stack_base,
                         namespace_idx: sf.namespace_idx,
                         function_id: sf.function_id,
-                        cells: sf.cells,
+                        cells,
                         call_position: sf.call_position,
                     }
                 })
@@ -725,7 +733,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         }
 
         // Mark coroutine as Running
-        if let HeapData::Coroutine(coro_mut) = self.heap.get_mut(coroutine_id) {
+        if let MutableHeapData::Coroutine(coro_mut) = self.heap.get_mut(coroutine_id) {
             coro_mut.state = CoroutineState::Running;
         }
 
@@ -734,12 +742,15 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         // don't have a parent frame - the coroutine is the root)
         let func = self.interns.get_function(func_id);
         let namespace_idx = self.namespaces.register_prebuilt(namespace_values, self.heap)?;
+        // Convert HeapIds to HeapPtrOwned (we already inc_ref'd above for each)
+        let owned_cells: Vec<HeapPtrOwned<Value>> =
+            frame_cells.into_iter().map(|id| self.heap.make_cell_ptr(id)).collect();
         self.frames.push(CallFrame::new_function(
             &func.code,
             self.stack.len(),
             namespace_idx,
             func_id,
-            frame_cells,
+            owned_cells,
             None, // No call position - this is the root frame for a spawned task
         ));
 
@@ -772,20 +783,20 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             // Remove from scheduler's pending_calls so it doesn't appear in get_pending_call_ids()
             self.scheduler_mut().remove_pending_call(call_id);
             // Store result directly in gather (move, not clone) and check completion
-            let (pending_empty, task_ids, waiter) = if let HeapData::GatherFuture(gather) = self.heap.get_mut(gather_id)
-            {
-                gather.results[result_idx] = Some(value); // Move value directly, no clone needed
-                // Remove from pending_calls
-                gather.pending_calls.retain(|&cid| cid != call_id);
-                // Take task_ids to avoid clone - we're checking completion so gather may be destroyed
-                (
-                    gather.pending_calls.is_empty(),
-                    std::mem::take(&mut gather.task_ids),
-                    gather.waiter,
-                )
-            } else {
-                (true, vec![], None)
-            };
+            let (pending_empty, task_ids, waiter) =
+                if let MutableHeapData::GatherFuture(gather) = self.heap.get_mut(gather_id) {
+                    gather.results[result_idx] = Some(value); // Move value directly, no clone needed
+                    // Remove from pending_calls
+                    gather.pending_calls.retain(|&cid| cid != call_id);
+                    // Take task_ids to avoid clone - we're checking completion so gather may be destroyed
+                    (
+                        gather.pending_calls.is_empty(),
+                        std::mem::take(&mut gather.task_ids),
+                        gather.waiter,
+                    )
+                } else {
+                    (true, vec![], None)
+                };
 
             // Check if gather is now complete (all external futures resolved and all tasks complete)
             if pending_empty {
@@ -802,14 +813,15 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                         // Steal results from gather using mem::take - avoids refcount dance
                         // (copy + inc_ref + dec_ref on gather drop). Since gather is being
                         // destroyed, we can take ownership of the values directly.
-                        let results: Vec<Value> = if let HeapData::GatherFuture(gather) = self.heap.get_mut(gather_id) {
-                            std::mem::take(&mut gather.results)
-                                .into_iter()
-                                .map(|r| r.expect("all results should be filled when gather is complete"))
-                                .collect()
-                        } else {
-                            vec![]
-                        };
+                        let results: Vec<Value> =
+                            if let MutableHeapData::GatherFuture(gather) = self.heap.get_mut(gather_id) {
+                                std::mem::take(&mut gather.results)
+                                    .into_iter()
+                                    .map(|r| r.expect("all results should be filled when gather is complete"))
+                                    .collect()
+                            } else {
+                                vec![]
+                            };
 
                         // Create result list - if this fails, we can't do much, just skip
                         if let Ok(list_id) = self.heap.allocate(HeapData::List(List::new(results))) {
@@ -866,7 +878,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             // gather would try to access a freed heap object.
             // Use get_mut and take to avoid allocations - gather is being destroyed anyway.
             let (waiter, task_ids, other_pending_calls) =
-                if let HeapData::GatherFuture(gather) = self.heap.get_mut(gather_id) {
+                if let MutableHeapData::GatherFuture(gather) = self.heap.get_mut(gather_id) {
                     let mut other_calls = std::mem::take(&mut gather.pending_calls);
                     other_calls.retain(|&cid| cid != call_id);
                     (gather.waiter, std::mem::take(&mut gather.task_ids), other_calls)
@@ -901,7 +913,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         } else if let Some((task_id, Some(gid))) = self.scheduler_mut().fail_for_call(call_id, error) {
             // Original path: task is directly BlockedOnCall and part of a gather
             // Take task_ids from GatherFuture - gather is being destroyed anyway
-            let task_ids: Vec<TaskId> = if let HeapData::GatherFuture(gather) = self.heap.get_mut(gid) {
+            let task_ids: Vec<TaskId> = if let MutableHeapData::GatherFuture(gather) = self.heap.get_mut(gid) {
                 std::mem::take(&mut gather.task_ids)
             } else {
                 vec![]
