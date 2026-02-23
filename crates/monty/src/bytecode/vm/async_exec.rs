@@ -14,7 +14,7 @@ use crate::{
     bytecode::vm::scheduler::{PendingCallData, Scheduler, SerializedTaskFrame, TaskState},
     defer_drop,
     exception_private::{ExcType, RunError, SimpleException},
-    heap::{HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, HeapData, HeapGuard, HeapId, HeapRef},
     intern::FunctionId,
     resource::ResourceTracker,
     types::{List, PyTrait},
@@ -123,12 +123,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         // Extract coroutine data before mutating
         let func_id = coro.func_id;
         let namespace_values: Vec<Value> = coro.namespace.iter().map(|v| v.clone_with_heap(this.heap)).collect();
-        let frame_cells: Vec<HeapId> = coro.frame_cells.clone();
-
-        // Increment refcounts for shared cell references
-        for &cell_id in &frame_cells {
-            this.heap.inc_ref_raw(cell_id);
-        }
+        let frame_cells: Vec<HeapRef> = coro.frame_cells.iter().map(|v| v.clone_with_heap(this.heap)).collect();
 
         // Mark coroutine as Running
         if let HeapData::Coroutine(coro_mut) = this.heap.get_mut_by_id(heap_id) {
@@ -295,7 +290,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         &mut self,
         func_id: FunctionId,
         namespace_values: Vec<Value>,
-        frame_cells: Vec<HeapId>,
+        frame_cells: Vec<HeapRef>,
     ) -> Result<(), RunError> {
         let call_position = self.current_position();
         let func = self.interns.get_function(func_id);
@@ -601,13 +596,17 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let frames: Vec<SerializedTaskFrame> = self
             .frames
             .drain(..)
-            .map(|f| SerializedTaskFrame {
-                function_id: f.function_id,
-                ip: f.ip,
-                stack_base: f.stack_base,
-                namespace_idx: f.namespace_idx,
-                cells: f.cells,
-                call_position: f.call_position,
+            .map(|f| {
+                let s = SerializedTaskFrame {
+                    function_id: f.function_id,
+                    ip: f.ip,
+                    stack_base: f.stack_base,
+                    namespace_idx: f.namespace_idx,
+                    cells: f.cells.iter().map(HeapRef::id).collect(),
+                    call_position: f.call_position,
+                };
+                f.cells.drop_with_heap(self.heap);
+                s
             })
             .collect();
         let stack = std::mem::take(&mut self.stack);
@@ -665,7 +664,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                         stack_base: sf.stack_base,
                         namespace_idx: sf.namespace_idx,
                         function_id: sf.function_id,
-                        cells: sf.cells,
+                        cells: sf.cells.iter().map(|id| self.heap.inc_ref_raw(*id)).collect(),
                         call_position: sf.call_position,
                         should_return: false,
                     }
@@ -710,12 +709,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         // Extract coroutine data
         let func_id = coro.func_id;
         let namespace_values: Vec<Value> = coro.namespace.iter().map(|v| v.clone_with_heap(self.heap)).collect();
-        let frame_cells: Vec<HeapId> = coro.frame_cells.clone();
-
-        // Increment refcounts for shared cell references
-        for &cell_id in &frame_cells {
-            self.heap.inc_ref_raw(cell_id);
-        }
+        let frame_cells: Vec<HeapRef> = coro.frame_cells.iter().map(|c| c.clone_with_heap(self.heap)).collect();
 
         // Mark coroutine as Running
         if let HeapData::Coroutine(coro_mut) = self.heap.get_mut_by_id(coroutine_id) {

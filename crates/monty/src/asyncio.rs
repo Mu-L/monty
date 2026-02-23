@@ -4,7 +4,11 @@
 //! and task identifiers. The host acts as the event loop - external function
 //! calls return `ExternalFuture` objects that can be awaited.
 
-use crate::{heap::HeapId, intern::FunctionId, value::Value};
+use crate::{
+    heap::{HeapId, HeapRef},
+    intern::FunctionId,
+    value::Value,
+};
 
 /// Unique identifier for external function calls.
 ///
@@ -95,9 +99,9 @@ pub(crate) struct Coroutine {
     /// Pre-bound namespace values (sized to function namespace).
     /// Contains bound parameters, captured cells, and uninitialized locals.
     pub namespace: Vec<Value>,
-    /// HeapIds of captured cells from enclosing scopes.
+    /// HeapRefs of captured cells from enclosing scopes.
     /// These are passed to the frame when execution starts.
-    pub frame_cells: Vec<HeapId>,
+    pub frame_cells: Vec<HeapRef>,
     /// Current execution state.
     pub state: CoroutineState,
 }
@@ -108,7 +112,7 @@ impl Coroutine {
     /// * `func_id` - The async function to execute
     /// * `namespace` - Pre-bound namespace with parameters and captured variables
     /// * `frame_cells` - HeapIds of captured cells from enclosing scopes
-    pub fn new(func_id: FunctionId, namespace: Vec<Value>, frame_cells: Vec<HeapId>) -> Self {
+    pub fn new(func_id: FunctionId, namespace: Vec<Value>, frame_cells: Vec<HeapRef>) -> Self {
         Self {
             func_id,
             namespace,

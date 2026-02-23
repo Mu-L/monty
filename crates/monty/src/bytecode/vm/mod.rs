@@ -24,7 +24,7 @@ use crate::{
     asyncio::{CallId, TaskId},
     bytecode::{code::Code, op::Opcode},
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{Closure, ContainsHeap, FunctionDefaults, Heap, HeapData, HeapId},
+    heap::{Closure, ContainsHeap, DropWithHeap, FunctionDefaults, Heap, HeapData, HeapId, HeapRef},
     intern::{ExtFunctionId, FunctionId, Interns, StringId},
     io::PrintWriter,
     modules::BuiltinModule,
@@ -303,7 +303,7 @@ pub struct CallFrame<'code> {
     function_id: Option<FunctionId>,
 
     /// Captured cells for closures.
-    cells: Vec<HeapId>,
+    cells: Vec<HeapRef>,
 
     /// Call site position (for tracebacks).
     call_position: Option<CodeRange>,
@@ -334,7 +334,7 @@ impl<'code> CallFrame<'code> {
         stack_base: usize,
         namespace_idx: NamespaceId,
         function_id: FunctionId,
-        cells: Vec<HeapId>,
+        cells: Vec<HeapRef>,
         call_position: Option<CodeRange>,
     ) -> Self {
         Self {
@@ -410,7 +410,7 @@ impl CallFrame<'_> {
             ip: self.ip,
             stack_base: self.stack_base,
             namespace_idx: self.namespace_idx,
-            cells: self.cells.clone(),
+            cells: self.cells.iter().map(HeapRef::id).collect(),
             call_position: self.call_position,
         }
     }
@@ -580,7 +580,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     stack_base: sf.stack_base,
                     namespace_idx: sf.namespace_idx,
                     function_id: sf.function_id,
-                    cells: sf.cells,
+                    cells: sf.cells.iter().map(|id| heap.inc_ref_raw(*id)).collect(),
                     call_position: sf.call_position,
                     should_return: false,
                 }
@@ -630,7 +630,15 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             // Move values directly - no clone, no refcount increment needed
             // (the VM owned them, now the snapshot owns them)
             stack: self.stack,
-            frames: self.frames.into_iter().map(|f| f.serialize()).collect(),
+            frames: self
+                .frames
+                .into_iter()
+                .map(|f| {
+                    let s = f.serialize();
+                    f.cells.drop_with_heap(self.heap);
+                    s
+                })
+                .collect(),
             exception_stack: self.exception_stack,
             instruction_ip: self.instruction_ip,
             next_call_id: self.next_call_id,
@@ -1304,20 +1312,10 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     // We use individual pops which reverses order, so we need to reverse back
                     let mut cells = Vec::with_capacity(cell_count);
                     for _ in 0..cell_count {
-                        // mut needed for dec_ref_forget when ref-count-panic feature is enabled
-                        #[cfg_attr(not(feature = "ref-count-panic"), expect(unused_mut))]
-                        let mut cell_val = self.pop();
-                        match &cell_val {
-                            Value::Ref(heap_id) => {
-                                // Keep the reference - the Closure will own the HeapId
-                                cells.push(heap_id.id());
-                                // Mark the Value as dereferenced since Closure takes ownership
-                                // of the reference count (we don't call drop_with_heap because
-                                // we're not decrementing the refcount, just transferring it)
-                                #[cfg(feature = "ref-count-panic")]
-                                cell_val.dec_ref_forget();
-                            }
-                            _ => {
+                        match self.pop() {
+                            Value::Ref(r) => cells.push(r),
+                            other => {
+                                other.drop_with_heap(self.heap);
                                 return Err(RunError::internal("MakeClosure: expected cell reference on stack"));
                             }
                         }
@@ -1585,10 +1583,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// Properly cleans up each frame's namespace and cell references.
     pub(super) fn cleanup_current_frames(&mut self) {
         for frame in self.frames.drain(..) {
-            // Clean up cell references
-            for cell_id in frame.cells {
-                self.heap.dec_ref_by_id(cell_id);
-            }
+            frame.cells.drop_with_heap(self.heap);
             // Clean up the namespace (but not the global namespace)
             if frame.namespace_idx != GLOBAL_NS_IDX {
                 self.namespaces.drop_with_heap(frame.namespace_idx, self.heap);
@@ -1734,7 +1729,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     ///
     /// Returns a NameError if the cell value is undefined (free variable not bound).
     fn load_cell(&mut self, slot: u16) -> RunResult<()> {
-        let cell_id = self.current_frame().cells[slot as usize];
+        let cell_id = self.current_frame().cells[slot as usize].id();
         // get_cell_value already clones with proper refcount via clone_with_heap
         let value = self.heap.get_cell_value(cell_id);
 
@@ -1760,7 +1755,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// Pops the top of stack and stores it in a closure cell.
     fn store_cell(&mut self, slot: u16) {
         let value = self.pop();
-        let cell_id = self.current_frame().cells[slot as usize];
+        let cell_id = self.current_frame().cells[slot as usize].id();
         self.heap.set_cell_value(cell_id, value);
     }
 }

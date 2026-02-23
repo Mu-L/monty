@@ -379,7 +379,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             }
             Value::DefFunction(func_id) => {
                 // Defined function without defaults or captured variables
-                self.call_def_function(*func_id, &[], Vec::new(), args)
+                self.call_def_function(*func_id, Vec::new(), Vec::new(), args)
             }
             Value::Ref(heap_id) => {
                 // Could be a closure or function with defaults - check heap
@@ -397,7 +397,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     fn call_heap_callable(&mut self, heap_id: HeapId, args: ArgValues) -> Result<CallResult, RunError> {
         let (func_id, cells, defaults) = match self.heap.get_by_id(heap_id) {
             HeapData::Closure(closure) => {
-                let cloned_cells = closure.cells.clone();
+                let cloned_cells = closure.cells.iter().map(|c| c.clone_with_heap(self.heap)).collect();
                 let cloned_defaults: Vec<Value> =
                     closure.defaults.iter().map(|v| v.clone_with_heap(self.heap)).collect();
                 (closure.func_id, cloned_cells, cloned_defaults)
@@ -412,12 +412,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             }
         };
 
-        // Increment refcounts for captured cells
-        for &cell_id in &cells {
-            self.heap.inc_ref_raw(cell_id);
-        }
-
-        self.call_def_function(func_id, &cells, defaults, args)
+        self.call_def_function(func_id, cells, defaults, args)
     }
 
     /// Calls a function with unpacked args tuple and optional kwargs dict.
@@ -623,7 +618,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     fn call_def_function(
         &mut self,
         func_id: FunctionId,
-        cells: &[HeapId],
+        cells: Vec<HeapRef>,
         defaults: Vec<Value>,
         args: ArgValues,
     ) -> Result<CallResult, RunError> {
@@ -647,7 +642,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     fn create_coroutine(
         &mut self,
         func_id: FunctionId,
-        cells: &[HeapId],
+        cells: Vec<HeapRef>,
         defaults: Vec<Value>,
         args: ArgValues,
     ) -> Result<CallResult, RunError> {
@@ -665,7 +660,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             .bind(args, defaults, this.heap, this.interns, func.name, namespace)?;
 
         // Track created cell HeapIds for the coroutine
-        let mut frame_cells: Vec<HeapId> = Vec::with_capacity(func.cell_var_count + cells.len());
+        let mut frame_cells = Vec::with_capacity(func.cell_var_count + cells.len());
 
         // 3. Create cells for variables captured by nested functions
         {
@@ -678,19 +673,18 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                     Value::Undefined
                 };
                 let cell_ref = this.heap.allocate(HeapData::Cell(CellValue(cell_value)))?;
-                frame_cells.push(cell_ref.id());
+                frame_cells.push(cell_ref.clone_with_heap(this.heap));
                 namespace.resize_with(cell_slot, || Value::Undefined);
                 namespace.push(Value::Ref(cell_ref));
             }
 
             // 4. Copy captured cells (free vars) into namespace
             let free_var_start = param_count + func.cell_var_count;
-            for (i, &cell_id) in cells.iter().enumerate() {
-                this.heap.inc_ref_raw(cell_id);
-                frame_cells.push(cell_id);
+            for (i, cell_ref) in cells.into_iter().enumerate() {
+                frame_cells.push(cell_ref.clone_with_heap(this.heap));
                 let slot = free_var_start + i;
                 namespace.resize_with(slot, || Value::Undefined);
-                namespace.push(Value::Ref(HeapRef::from_id(cell_id)));
+                namespace.push(Value::Ref(cell_ref));
             }
 
             // 5. Fill remaining slots with Undefined
@@ -712,7 +706,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     fn call_sync_function(
         &mut self,
         func_id: FunctionId,
-        cells: &[HeapId],
+        cells: Vec<HeapRef>,
         defaults: Vec<Value>,
         args: ArgValues,
     ) -> Result<CallResult, RunError> {
@@ -746,8 +740,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             default.drop_with_heap(self.heap);
         }
 
-        // Track created cell HeapIds for the frame
-        let mut frame_cells: Vec<HeapId> = Vec::with_capacity(func.cell_var_count + cells.len());
+        // Track created cells for the frame
+        let mut frame_cells = Vec::with_capacity(func.cell_var_count + cells.len());
 
         // 3. Create cells for variables captured by nested functions
         {
@@ -760,19 +754,18 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                     Value::Undefined
                 };
                 let cell_ref = self.heap.allocate(HeapData::Cell(CellValue(cell_value)))?;
-                frame_cells.push(cell_ref.id());
+                frame_cells.push(cell_ref.clone_with_heap(self.heap));
                 namespace.resize_with(cell_slot, || Value::Undefined);
                 namespace.push(Value::Ref(cell_ref));
             }
 
             // 4. Copy captured cells (free vars) into namespace
             let free_var_start = param_count + func.cell_var_count;
-            for (i, &cell_id) in cells.iter().enumerate() {
-                self.heap.inc_ref_raw(cell_id);
-                frame_cells.push(cell_id);
+            for (i, cell_ref) in cells.into_iter().enumerate() {
+                frame_cells.push(cell_ref.clone_with_heap(self.heap));
                 let slot = free_var_start + i;
                 namespace.resize_with(slot, || Value::Undefined);
-                namespace.push(Value::Ref(HeapRef::from_id(cell_id)));
+                namespace.push(Value::Ref(cell_ref));
             }
 
             // 5. Fill remaining slots with Undefined

@@ -53,17 +53,6 @@ impl HeapId {
 pub(crate) struct HeapRef(HeapId);
 
 impl HeapRef {
-    /// Creates a `HeapRef` from a raw `HeapId` without modifying reference counts.
-    ///
-    /// Use this when wrapping a `HeapId` that already has its reference count accounted for
-    /// (e.g., after `inc_ref_raw` or when transferring ownership from a `Vec<HeapId>`).
-    ///
-    /// The caller is responsible for ensuring the reference count is correct.
-    #[inline]
-    pub(crate) fn from_id(id: HeapId) -> Self {
-        Self(id)
-    }
-
     /// Returns the underlying `HeapId` for heap lookups.
     ///
     /// This does not affect reference counts — it's just an accessor
@@ -206,7 +195,7 @@ pub(crate) struct Closure {
     /// The function definition being captured.
     pub func_id: FunctionId,
     /// Captured cells from enclosing scopes.
-    pub cells: Vec<HeapId>,
+    pub cells: Vec<HeapRef>,
     /// Evaluated default parameter values (if any).
     pub defaults: Vec<Value>,
 }
@@ -570,8 +559,7 @@ impl PyTrait for HeapData {
             Self::Set(s) => s.drop_into(stack),
             Self::FrozenSet(fs) => fs.drop_into(stack),
             Self::Closure(c) => {
-                // Transfer ownership of captured cell HeapIds as HeapRefs
-                stack.extend(c.cells.into_iter().map(HeapRef));
+                stack.extend(c.cells);
                 // Drop default values that are heap references
                 for default in c.defaults {
                     default.drop_into(stack);
@@ -588,8 +576,7 @@ impl PyTrait for HeapData {
             Self::Iter(iter) => iter.drop_into(stack),
             Self::Module(m) => m.drop_into(stack),
             Self::Coroutine(coro) => {
-                // Transfer ownership of frame cell HeapIds as HeapRefs
-                stack.extend(coro.frame_cells.into_iter().map(HeapRef));
+                stack.extend(coro.frame_cells);
                 // Drop namespace values that are heap references
                 for value in coro.namespace {
                     value.drop_into(stack);
@@ -1181,16 +1168,18 @@ impl<T: ResourceTracker> Heap<T> {
         self.inc_ref_raw(heap_ref.id())
     }
 
-    /// Raw refcount increment by `HeapId` — for callers that have a `HeapId` but
-    /// not a `HeapRef` (e.g., incrementing refcounts on closure cells which are
-    /// still stored as `Vec<HeapId>`).
+    /// Raw refcount increment by `HeapId`, returning a `HeapRef` representing the new reference.
+    ///
+    /// Use this when you need a `HeapRef` to store in a `Value::Ref`. For fire-and-forget
+    /// refcount bumps (e.g., incrementing cell refcounts tracked by `Vec<HeapId>`), use
+    /// `inc_ref_by_id` instead to avoid creating a `HeapRef` that must be disposed of.
     pub(crate) fn inc_ref_raw(&self, id: HeapId) -> HeapRef {
         let value = self
             .entries
             .get(id.index())
-            .expect("Heap::inc_ref: slot missing")
+            .expect("Heap::inc_ref_raw: slot missing")
             .as_ref()
-            .expect("Heap::inc_ref: object already freed");
+            .expect("Heap::inc_ref_raw: object already freed");
         value.refcount.update(|r| r + 1);
         HeapRef(id)
     }
@@ -1832,8 +1821,8 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
         }
         HeapData::Closure(closure) => {
             // Add captured cells to work list
-            for cell_id in &closure.cells {
-                work_list.push(*cell_id);
+            for cell in &closure.cells {
+                work_list.push(cell.id());
             }
             // Add default values that are heap references
             for default in &closure.defaults {
@@ -1889,8 +1878,8 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
         }
         HeapData::Coroutine(coro) => {
             // Add captured cells to work list
-            for cell_id in &coro.frame_cells {
-                work_list.push(*cell_id);
+            for cell in &coro.frame_cells {
+                work_list.push(cell.id());
             }
             // Add namespace values that are heap references
             for value in &coro.namespace {
@@ -1922,13 +1911,17 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
 impl<T: ResourceTracker> Drop for Heap<T> {
     fn drop(&mut self) {
         // Mark all contained Objects as Dereferenced before dropping.
-        // We use drop_into for this since it handles the marking
-        // (we ignore the collected IDs since we're dropping everything anyway).
+        // We use drop_into for this since it handles the marking.
+        // The collected HeapRefs must be forgotten since we're tearing down
+        // the entire heap — dec_ref is neither needed nor possible.
         let mut dummy_stack = Vec::new();
         for value in self.entries.drain(..).flatten() {
             if let Some(data) = value.data {
                 data.drop_into(&mut dummy_stack);
             }
+        }
+        for heap_ref in dummy_stack {
+            std::mem::forget(heap_ref);
         }
     }
 }
