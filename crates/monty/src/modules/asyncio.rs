@@ -12,7 +12,7 @@ use crate::{
     asyncio::{GatherFuture, GatherItem},
     defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapId, HeapRef},
     intern::{Interns, StaticStrings},
     modules::ModuleFunctions,
     resource::{ResourceError, ResourceTracker},
@@ -34,11 +34,11 @@ pub(crate) enum AsyncioFunctions {
 /// are not implemented as they would require additional VM/scheduler features.
 ///
 /// # Returns
-/// A HeapId pointing to the newly allocated module.
+/// A HeapRef pointing to the newly allocated module.
 ///
 /// # Panics
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapId, ResourceError> {
+pub fn create_module(heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapRef, ResourceError> {
     let mut module = Module::new(StaticStrings::Asyncio);
 
     module.set_attr(
@@ -114,8 +114,8 @@ pub(crate) fn gather(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> 
     for mut arg in pos_args {
         match &arg {
             Value::Ref(id) if heap.get(id).is_coroutine() => {
-                coroutine_ids_to_cleanup.push(*id);
-                items.push(GatherItem::Coroutine(*id));
+                coroutine_ids_to_cleanup.push(id.id());
+                items.push(GatherItem::Coroutine(id.id()));
                 // Transfer ownership to GatherFuture - mark Value as consumed without dec_ref
                 #[cfg(feature = "ref-count-panic")]
                 arg.dec_ref_forget();
@@ -129,7 +129,7 @@ pub(crate) fn gather(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> 
                 arg.drop_with_heap(heap);
                 // Drop already-collected coroutine refs
                 for cid in coroutine_ids_to_cleanup {
-                    heap.dec_ref(cid);
+                    heap.dec_ref_by_id(cid);
                 }
                 return Err(ExcType::type_error(
                     "An asyncio.Future, a coroutine or an awaitable is required",

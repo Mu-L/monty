@@ -298,10 +298,10 @@ impl PyTrait for Str {
     ) -> Result<bool, crate::resource::ResourceError> {
         match &other {
             Value::Ref(other_id) => {
-                if Some(*other_id) == self_id {
+                if Some(other_id.id()) == self_id {
                     let rhs = self.0.clone();
                     self.0.push_str(&rhs);
-                } else if let HeapData::Str(rhs) = heap.get(*other_id) {
+                } else if let HeapData::Str(rhs) = heap.get(other_id) {
                     self.0.push_str(rhs.as_str());
                 } else {
                     return Ok(false);

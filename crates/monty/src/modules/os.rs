@@ -11,7 +11,7 @@
 use crate::{
     args::ArgValues,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapRef},
     intern::{Interns, StaticStrings},
     modules::ModuleFunctions,
     os::OsFunction,
@@ -36,11 +36,11 @@ pub(crate) enum OsFunctions {
 /// Both operations yield to the host via `OsFunction` callbacks.
 ///
 /// # Returns
-/// A HeapId pointing to the newly allocated module.
+/// A HeapRef pointing to the newly allocated module.
 ///
 /// # Panics
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapId, ResourceError> {
+pub fn create_module(heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapRef, ResourceError> {
     let mut module = Module::new(StaticStrings::Os);
 
     // os.getenv - function to get a single environment variable

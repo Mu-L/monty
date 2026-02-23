@@ -12,7 +12,7 @@ use crate::{
     bytecode::FrameExit,
     defer_drop,
     exception_private::{ExcType, RunError},
-    heap::{CellValue, DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{CellValue, DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRef},
     intern::{ExtFunctionId, FunctionId, Interns, StaticStrings, StringId},
     os::OsFunction,
     resource::ResourceTracker,
@@ -275,27 +275,27 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// For interned bytes (`Value::InternBytes`), uses the unified `call_bytes_method`.
     fn call_attr(&mut self, obj: Value, name_id: StringId, args: ArgValues) -> Result<CallResult, RunError> {
         let this = self;
+        defer_drop!(obj, this);
         let attr = EitherStr::Interned(name_id);
 
         match obj {
             Value::Ref(heap_id) => {
-                defer_drop!(obj, this);
                 let result = Heap::call_attr_raw(this, heap_id, &attr, args);
                 result.map(Into::into)
             }
             Value::InternString(string_id) => {
                 // Call string method on interned string literal using the unified dispatcher
-                let s = this.interns.get_str(string_id);
+                let s = this.interns.get_str(*string_id);
                 call_str_method(s, name_id, args, this.heap, this.interns).map(CallResult::Push)
             }
             Value::InternBytes(bytes_id) => {
                 // Call bytes method on interned bytes literal using the unified dispatcher
-                let b = this.interns.get_bytes(bytes_id);
+                let b = this.interns.get_bytes(*bytes_id);
                 call_bytes_method(b, name_id, args, this.heap, this.interns).map(CallResult::Push)
             }
             Value::Builtin(Builtins::Type(t)) => {
                 // Handle classmethods on type objects like dict.fromkeys()
-                call_type_method(t, name_id, args, this.heap, this.interns).map(CallResult::Push)
+                call_type_method(*t, name_id, args, this.heap, this.interns).map(CallResult::Push)
             }
             _ => {
                 // Non-heap values without method support
@@ -383,7 +383,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             }
             Value::Ref(heap_id) => {
                 // Could be a closure or function with defaults - check heap
-                self.call_heap_callable(*heap_id, args)
+                self.call_heap_callable(heap_id.id(), args)
             }
             _ => {
                 args.drop_with_heap(self.heap);
@@ -395,7 +395,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
     /// Handles calling a heap-allocated callable (closure or function with defaults).
     fn call_heap_callable(&mut self, heap_id: HeapId, args: ArgValues) -> Result<CallResult, RunError> {
-        let (func_id, cells, defaults) = match self.heap.get(heap_id) {
+        let (func_id, cells, defaults) = match self.heap.get_by_id(heap_id) {
             HeapData::Closure(closure) => {
                 let cloned_cells = closure.cells.clone();
                 let cloned_defaults: Vec<Value> =
@@ -677,10 +677,10 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 } else {
                     Value::Undefined
                 };
-                let cell_id = this.heap.allocate(HeapData::Cell(CellValue(cell_value)))?;
-                frame_cells.push(cell_id);
+                let cell_ref = this.heap.allocate(HeapData::Cell(CellValue(cell_value)))?;
+                frame_cells.push(cell_ref.id());
                 namespace.resize_with(cell_slot, || Value::Undefined);
-                namespace.push(Value::Ref(cell_id));
+                namespace.push(Value::Ref(cell_ref));
             }
 
             // 4. Copy captured cells (free vars) into namespace
@@ -690,7 +690,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 frame_cells.push(cell_id);
                 let slot = free_var_start + i;
                 namespace.resize_with(slot, || Value::Undefined);
-                namespace.push(Value::Ref(cell_id));
+                namespace.push(Value::Ref(HeapRef::from_id(cell_id)));
             }
 
             // 5. Fill remaining slots with Undefined
@@ -759,10 +759,10 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 } else {
                     Value::Undefined
                 };
-                let cell_id = self.heap.allocate(HeapData::Cell(CellValue(cell_value)))?;
-                frame_cells.push(cell_id);
+                let cell_ref = self.heap.allocate(HeapData::Cell(CellValue(cell_value)))?;
+                frame_cells.push(cell_ref.id());
                 namespace.resize_with(cell_slot, || Value::Undefined);
-                namespace.push(Value::Ref(cell_id));
+                namespace.push(Value::Ref(cell_ref));
             }
 
             // 4. Copy captured cells (free vars) into namespace
@@ -772,7 +772,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 frame_cells.push(cell_id);
                 let slot = free_var_start + i;
                 namespace.resize_with(slot, || Value::Undefined);
-                namespace.push(Value::Ref(cell_id));
+                namespace.push(Value::Ref(HeapRef::from_id(cell_id)));
             }
 
             // 5. Fill remaining slots with Undefined

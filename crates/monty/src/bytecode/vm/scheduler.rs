@@ -493,7 +493,7 @@ impl Scheduler {
             let task = self.get_task(task_id);
             if let TaskState::BlockedOnGather(gather_id) = task.state {
                 // Get inner gather's task IDs from heap
-                if let crate::heap::HeapData::GatherFuture(gather) = heap.get(gather_id) {
+                if let crate::heap::HeapData::GatherFuture(gather) = heap.get_by_id(gather_id) {
                     Some((gather_id, gather.task_ids.clone()))
                 } else {
                     None
@@ -510,16 +510,17 @@ impl Scheduler {
             }
 
             // Cleanup the inner GatherFuture - extract data first to avoid borrow conflict
-            let (items, results) = if let crate::heap::HeapData::GatherFuture(gather) = heap.get_mut(inner_gather_id) {
-                (std::mem::take(&mut gather.items), std::mem::take(&mut gather.results))
-            } else {
-                (vec![], vec![])
-            };
+            let (items, results) =
+                if let crate::heap::HeapData::GatherFuture(gather) = heap.get_mut_by_id(inner_gather_id) {
+                    (std::mem::take(&mut gather.items), std::mem::take(&mut gather.results))
+                } else {
+                    (vec![], vec![])
+                };
 
             // Now cleanup the extracted data with mutable heap access
             for item in items {
                 if let crate::asyncio::GatherItem::Coroutine(coro_id) = item {
-                    heap.dec_ref(coro_id);
+                    heap.dec_ref_by_id(coro_id);
                 }
             }
             for value in results.into_iter().flatten() {
@@ -527,7 +528,7 @@ impl Scheduler {
             }
 
             // Dec_ref the gather itself
-            heap.dec_ref(inner_gather_id);
+            heap.dec_ref_by_id(inner_gather_id);
         }
 
         // Now get mutable reference to the task for cleanup
@@ -546,7 +547,7 @@ impl Scheduler {
         // Clean up frame cell references and namespaces
         for frame in std::mem::take(&mut task.frames) {
             for cell_id in frame.cells {
-                heap.dec_ref(cell_id);
+                heap.dec_ref_by_id(cell_id);
             }
             // Clean up the namespace (but not the global namespace)
             if frame.namespace_idx != GLOBAL_NS_IDX {

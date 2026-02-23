@@ -10,7 +10,7 @@ use strum::FromRepr;
 use crate::{
     args::ArgValues,
     exception_private::RunResult,
-    heap::{Heap, HeapId},
+    heap::{Heap, HeapRef},
     intern::{Interns, StaticStrings, StringId},
     resource::{ResourceError, ResourceTracker},
     types::AttrCallResult,
@@ -53,12 +53,12 @@ impl BuiltinModule {
 
     /// Creates a new instance of this module on the heap.
     ///
-    /// Returns a HeapId pointing to the newly allocated module.
+    /// Returns a HeapRef pointing to the newly allocated module.
     ///
     /// # Panics
     ///
     /// Panics if the required strings have not been pre-interned during prepare phase.
-    pub fn create(self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapId, ResourceError> {
+    pub fn create(self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapRef, ResourceError> {
         match self {
             Self::Sys => sys::create_module(heap, interns),
             Self::Typing => typing::create_module(heap, interns),

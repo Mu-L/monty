@@ -101,7 +101,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let (list_ref, this) = list_ref_guard.as_parts();
 
         let copied_items: Vec<Value> = match iterable {
-            Value::Ref(id) => match this.heap.get(*id) {
+            Value::Ref(id) => match this.heap.get(id) {
                 HeapData::List(list) => list.as_slice().iter().map(|v| v.clone_with_heap(this.heap)).collect(),
                 HeapData::Tuple(tuple) => tuple.as_slice().iter().map(|v| v.clone_with_heap(this.heap)).collect(),
                 HeapData::Set(set) => set.storage().iter().map(|v| v.clone_with_heap(this.heap)).collect(),
@@ -170,7 +170,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         defer_drop!(list_ref, this);
 
         let copied_items: SmallVec<_> = if let Value::Ref(id) = list_ref {
-            if let HeapData::List(list) = this.heap.get(*id) {
+            if let HeapData::List(list) = this.heap.get(id) {
                 list.as_slice().iter().map(|v| v.clone_with_heap(this.heap)).collect()
             } else {
                 return Err(RunError::internal("ListToTuple: expected list"));
@@ -410,8 +410,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 return Ok(());
             }
             // Heap-allocated sequences
-            Value::Ref(heap_id) => {
-                match this.heap.get(&heap_id) {
+            Value::Ref(r) => {
+                match this.heap.get(r) {
                     HeapData::List(list) => {
                         let list_len = list.len();
                         if list_len != count {
@@ -493,8 +493,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 }
                 items
             }
-            Value::Ref(heap_id) => {
-                match this.heap.get(&heap_id) {
+            Value::Ref(r) => {
+                match this.heap.get(r) {
                     HeapData::List(list) => {
                         let list_len = list.len();
                         if list_len < min_items {

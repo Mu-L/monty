@@ -867,9 +867,9 @@ impl Executor {
         let mut unique_ids = HashSet::new();
 
         for (name, &namespace_id) in &self.name_map {
-            if let Some(Value::Ref(id)) = final_namespace.get_opt(namespace_id) {
-                counts.insert(name.clone(), heap.get_refcount(*id));
-                unique_ids.insert(*id);
+            if let Some(Value::Ref(r)) = final_namespace.get_opt(namespace_id) {
+                counts.insert(name.clone(), heap.get_refcount(r));
+                unique_ids.insert(r);
             }
         }
         let unique_refs = unique_ids.len();

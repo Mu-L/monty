@@ -685,7 +685,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
             for frame in std::mem::take(&mut task.frames) {
                 // Clean up cell references
                 for cell_id in frame.cells {
-                    self.heap.dec_ref(cell_id);
+                    self.heap.dec_ref_by_id(cell_id);
                 }
                 // Clean up the namespace (but not the global namespace)
                 if frame.namespace_idx != GLOBAL_NS_IDX {
@@ -908,7 +908,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                         }
                         Value::Float(f) => self.push(Value::Float(-f)),
                         Value::Bool(b) => self.push(Value::Int(if b { -1 } else { 0 })),
-                        Value::Ref(id) => {
+                        Value::Ref(ref id) => {
                             if let HeapData::LongInt(li) = self.heap.get(id) {
                                 let negated = -LongInt::new(li.inner().clone());
                                 value.drop_with_heap(self.heap);
@@ -935,7 +935,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     match value {
                         Value::Int(_) | Value::Float(_) => self.push(value),
                         Value::Bool(b) => self.push(Value::Int(i64::from(b))),
-                        Value::Ref(id) => {
+                        Value::Ref(ref id) => {
                             if matches!(self.heap.get(id), HeapData::LongInt(_)) {
                                 // LongInt - return as-is (value already has correct refcount)
                                 self.push(value);
@@ -958,7 +958,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                     match value {
                         Value::Int(n) => self.push(Value::Int(!n)),
                         Value::Bool(b) => self.push(Value::Int(!i64::from(b))),
-                        Value::Ref(id) => {
+                        Value::Ref(ref id) => {
                             if let HeapData::LongInt(li) = self.heap.get(id) {
                                 // LongInt bitwise NOT: ~x = -(x + 1)
                                 let inverted = -(li.inner() + 1i32);
@@ -1145,13 +1145,14 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                 Opcode::ForIter => {
                     let offset = fetch_i16!(cached_frame);
                     // Peek at the iterator on TOS and extract heap_id
-                    let Value::Ref(iter_ref) = self.peek() else {
+                    let Some(Value::Ref(iter_ref)) = self.stack.last() else {
                         return Err(RunError::internal("ForIter: expected iterator ref on stack"));
                     };
 
                     // Use advance_iterator which avoids std::mem::replace overhead
                     // by using a two-phase approach: read state, get value, update index
-                    match advance_on_heap(self.heap, iter_ref, self.interns) {
+                    let result = advance_on_heap(self.heap, iter_ref, self.interns);
+                    match result {
                         Ok(Some(value)) => self.push(value),
                         Ok(None) => {
                             // Iterator exhausted - pop it and jump to end
@@ -1309,7 +1310,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                         match &cell_val {
                             Value::Ref(heap_id) => {
                                 // Keep the reference - the Closure will own the HeapId
-                                cells.push(*heap_id);
+                                cells.push(heap_id.id());
                                 // Mark the Value as dereferenced since Closure takes ownership
                                 // of the reference count (we don't call drop_with_heap because
                                 // we're not decrementing the refcount, just transferring it)
@@ -1472,8 +1473,8 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         let module = BuiltinModule::from_repr(module_id).expect("unknown module id");
 
         // Create the module on the heap using pre-interned strings
-        let heap_id = module.create(self.heap, self.interns)?;
-        self.push(Value::Ref(heap_id));
+        let heap_ref = module.create(self.heap, self.interns)?;
+        self.push(Value::Ref(heap_ref));
         Ok(())
     }
 
@@ -1586,7 +1587,7 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
         for frame in self.frames.drain(..) {
             // Clean up cell references
             for cell_id in frame.cells {
-                self.heap.dec_ref(cell_id);
+                self.heap.dec_ref_by_id(cell_id);
             }
             // Clean up the namespace (but not the global namespace)
             if frame.namespace_idx != GLOBAL_NS_IDX {

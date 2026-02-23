@@ -479,7 +479,7 @@ impl MontyObject {
                 };
 
                 // Remove from visited set after processing
-                visited.remove(id);
+                visited.remove(&id);
                 result
             }
             Value::Builtin(Builtins::Type(t)) => Self::Type(*t),

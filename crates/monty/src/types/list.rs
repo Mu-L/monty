@@ -391,7 +391,7 @@ impl PyTrait for List {
             // Get items from other list using iadd_extend_from_heap helper
             // This handles the borrow checker limitations with lifetime propagation
             let prev_len = self.items.len();
-            if !heap.iadd_extend_list(other_ref, &mut self.items) {
+            if !heap.iadd_extend_list(other_ref.id(), &mut self.items) {
                 return Ok(false);
             }
             // Check if we added any refs and mark potential cycle
@@ -890,13 +890,13 @@ mod tests {
     fn create_heap_with_list_and_longint(
         list_items: Vec<Value>,
         index_value: BigInt,
-    ) -> (Heap<NoLimitTracker>, HeapId, HeapId) {
+    ) -> (Heap<NoLimitTracker>, HeapRef, HeapRef) {
         let mut heap = Heap::new(16, NoLimitTracker);
         let list = List::new(list_items);
-        let list_id = heap.allocate(HeapData::List(list)).unwrap();
+        let list_ref = heap.allocate(HeapData::List(list)).unwrap();
         let long_int = LongInt::new(index_value);
-        let index_id = heap.allocate(HeapData::LongInt(long_int)).unwrap();
-        (heap, list_id, index_id)
+        let index_ref = heap.allocate(HeapData::LongInt(long_int)).unwrap();
+        (heap, list_ref, index_ref)
     }
 
     /// Tests py_setitem with a LongInt index that fits in i64.
@@ -906,71 +906,68 @@ mod tests {
     /// deserialization of crafted snapshot data.
     #[test]
     fn py_setitem_longint_fits_in_i64() {
-        let (mut heap, list_id, index_id) =
+        let (mut heap, list_ref, index_ref) =
             create_heap_with_list_and_longint(vec![Value::Int(10), Value::Int(20), Value::Int(30)], BigInt::from(1));
         let interns = create_test_interns();
 
         // Use heap.with_entry_mut to avoid double mutable borrow
-        let key = Value::Ref(index_id);
+        let key = Value::Ref(index_ref);
         let new_value = Value::Int(99);
-        heap.inc_ref(index_id);
 
-        let result = heap.with_entry_mut(list_id, |heap, data| data.py_setitem(key, new_value, heap, &interns));
+        let result = heap.with_entry_mut(&list_ref, |heap, data| data.py_setitem(key, new_value, heap, &interns));
 
         assert!(result.is_ok());
 
         // Verify the list was updated by checking it matches expected Int value
-        let HeapData::List(list) = heap.get(list_id) else {
+        let HeapData::List(list) = heap.get(&list_ref) else {
             panic!("expected list");
         };
         assert!(matches!(list.as_slice()[1], Value::Int(99)));
 
         // Clean up
-        Value::Ref(list_id).drop_with_heap(&mut heap);
+        list_ref.drop_with_heap(&mut heap);
     }
 
     /// Tests py_setitem with a negative LongInt index that fits in i64.
     #[test]
     fn py_setitem_longint_negative_fits_in_i64() {
-        let (mut heap, list_id, index_id) = create_heap_with_list_and_longint(
+        let (mut heap, list_ref, index_ref) = create_heap_with_list_and_longint(
             vec![Value::Int(10), Value::Int(20), Value::Int(30)],
             BigInt::from(-1), // Last element
         );
         let interns = create_test_interns();
 
-        let key = Value::Ref(index_id);
+        let key = Value::Ref(index_ref);
         let new_value = Value::Int(99);
-        heap.inc_ref(index_id);
 
-        let result = heap.with_entry_mut(list_id, |heap, data| data.py_setitem(key, new_value, heap, &interns));
+        let result = heap.with_entry_mut(&list_ref, |heap, data| data.py_setitem(key, new_value, heap, &interns));
 
         assert!(result.is_ok());
 
         // Verify the last element was updated
-        let HeapData::List(list) = heap.get(list_id) else {
+        let HeapData::List(list) = heap.get(&list_ref) else {
             panic!("expected list");
         };
         assert!(matches!(list.as_slice()[2], Value::Int(99)));
 
-        Value::Ref(list_id).drop_with_heap(&mut heap);
+        list_ref.drop_with_heap(&mut heap);
     }
 
     /// Tests py_setitem with i64::MAX as a LongInt index.
     #[test]
     fn py_setitem_longint_at_i64_max() {
-        let (mut heap, list_id, index_id) =
+        let (mut heap, list_ref, index_ref) =
             create_heap_with_list_and_longint(vec![Value::Int(10)], BigInt::from(i64::MAX));
         let interns = create_test_interns();
 
-        let key = Value::Ref(index_id);
+        let key = Value::Ref(index_ref);
         let new_value = Value::Int(99);
-        heap.inc_ref(index_id);
 
         // This should fail with IndexError because i64::MAX is out of bounds for a 1-element list
-        let result = heap.with_entry_mut(list_id, |heap, data| data.py_setitem(key, new_value, heap, &interns));
+        let result = heap.with_entry_mut(&list_ref, |heap, data| data.py_setitem(key, new_value, heap, &interns));
 
         assert!(result.is_err());
 
-        Value::Ref(list_id).drop_with_heap(&mut heap);
+        Value::Ref(list_ref).drop_with_heap(&mut heap);
     }
 }

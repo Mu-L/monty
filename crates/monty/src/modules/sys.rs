@@ -8,7 +8,7 @@
 //! - `stderr`: Marker for standard error (no real functionality)
 
 use crate::{
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapRef},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
     types::{Module, NamedTuple},
@@ -17,12 +17,12 @@ use crate::{
 
 /// Creates the `sys` module and allocates it on the heap.
 ///
-/// Returns a HeapId pointing to the newly allocated module.
+/// Returns a HeapRef pointing to the newly allocated module.
 ///
 /// # Panics
 ///
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapId, ResourceError> {
+pub fn create_module(heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapRef, ResourceError> {
     let mut module = Module::new(StaticStrings::Sys);
 
     // sys.platform

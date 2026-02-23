@@ -8,7 +8,7 @@
 
 use crate::{
     builtins::Builtins,
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapRef},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
     types::{Module, Type},
@@ -17,12 +17,12 @@ use crate::{
 
 /// Creates the `pathlib` module and allocates it on the heap.
 ///
-/// Returns a HeapId pointing to the newly allocated module.
+/// Returns a HeapRef pointing to the newly allocated module.
 ///
 /// # Panics
 ///
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapId, ResourceError> {
+pub fn create_module(heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> Result<HeapRef, ResourceError> {
     let mut module = Module::new(StaticStrings::Pathlib);
 
     // pathlib.Path - the Path class (callable to create Path instances)

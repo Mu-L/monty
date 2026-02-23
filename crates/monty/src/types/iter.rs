@@ -90,10 +90,8 @@ impl MontyIter {
     /// Returns an error if the value is not iterable.
     /// For strings, copies the string content for byte-offset based iteration.
     /// For ranges, the data is copied so the heap reference is dropped immediately.
-    pub fn new(mut value: Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Self> {
-        let Some(iter_value) = IterValue::new(value, heap, interns) else {
-            return Err(ExcType::type_error_not_iterable(value.py_type(heap)));
-        };
+    pub fn new(value: Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Self> {
+        let iter_value = IterValue::new(value, heap, interns)?;
         Ok(Self { index: 0, iter_value })
     }
 
@@ -300,7 +298,7 @@ impl MontyIter {
                 Ok(Some(Value::Int(i64::from(bytes[i]))))
             }
             IterValue::HeapRef {
-                heap_id,
+                heap_ref,
                 len,
                 checks_mutation,
             } => {
@@ -312,7 +310,7 @@ impl MontyIter {
                 }
                 let i = self.index;
                 let expected_len = if *checks_mutation { *len } else { None };
-                let item = get_heap_item(heap, *heap_id, i, expected_len)?;
+                let item = get_heap_item(heap, heap_ref.id(), i, expected_len)?;
                 // Check for list exhaustion (list can shrink during iteration)
                 let Some(item) = item else {
                     return Ok(None);
@@ -331,10 +329,10 @@ impl MontyIter {
     pub fn size_hint(&self, heap: &Heap<impl ResourceTracker>) -> usize {
         let len = match &self.iter_value {
             IterValue::Range { len, .. } | IterValue::IterStr { len, .. } | IterValue::InternBytes { len, .. } => *len,
-            IterValue::HeapRef { heap_id, len, .. } => {
+            IterValue::HeapRef { heap_ref, len, .. } => {
                 // For List (len=None), check current length dynamically
                 len.unwrap_or_else(|| {
-                    let HeapData::List(list) = heap.get(heap_id) else {
+                    let HeapData::List(list) = heap.get(heap_ref) else {
                         panic!("HeapRef with len=None should only be List")
                     };
                     list.len()
@@ -456,7 +454,7 @@ fn get_heap_item(
     index: usize,
     expected_len: Option<usize>,
 ) -> RunResult<Option<Value>> {
-    match heap.get(heap_id) {
+    match heap.get_by_id(heap_id) {
         HeapData::List(list) => {
             // Check if list shrunk during iteration
             if index >= list.len() {
@@ -534,16 +532,16 @@ pub fn iterator_next(
     };
 
     // Check that it's actually an iterator
-    if !matches!(heap.get(*iter_id), HeapData::Iter(_)) {
+    if !matches!(heap.get(iter_id), HeapData::Iter(_)) {
         if let Some(d) = default {
             d.drop_with_heap(heap);
         }
-        let data_type = heap.get(*iter_id).py_type(heap);
+        let data_type = heap.get(iter_id).py_type(heap);
         return Err(ExcType::type_error(format!("'{data_type}' object is not an iterator")));
     }
 
     // Get next item using the MontyIter::advance_on_heap method
-    match advance_on_heap(heap, *iter_id, interns)? {
+    match advance_on_heap(heap, iter_id, interns)? {
         Some(item) => {
             // Drop default if provided since we don't need it
             if let Some(d) = default {
@@ -676,7 +674,7 @@ impl IterValue {
     fn from_heap_data(heap_ref: HeapRef, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Self> {
         let mut heap_ref_guard = HeapGuard::new(heap_ref, heap);
         let (heap_ref, heap) = heap_ref_guard.as_parts();
-        match heap.get(&heap_ref) {
+        match heap.get(heap_ref) {
             // List: no captured len (checked dynamically), no mutation check
             HeapData::List(_) => Ok(Self::HeapRef {
                 heap_ref: heap_ref_guard.into_inner(),

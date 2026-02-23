@@ -755,7 +755,7 @@ impl Set {
     ) -> RunResult<()> {
         // Try to get entries from a Set/FrozenSet directly
         let entries_opt = match &other {
-            Value::Ref(id) => match heap.get(*id) {
+            Value::Ref(id) => match heap.get(id) {
                 HeapData::Set(other_set) => Some(other_set.0.clone_entries(heap)),
                 HeapData::FrozenSet(other_set) => Some(other_set.0.clone_entries(heap)),
                 _ => None,
@@ -848,7 +848,7 @@ impl Set {
     ) -> RunResult<bool> {
         // Try to get entries from a Set/FrozenSet directly
         let entries_opt = match other {
-            Value::Ref(id) => match heap.get(*id) {
+            Value::Ref(id) => match heap.get(id) {
                 HeapData::Set(other_set) => Some(other_set.0.clone_entries(heap)),
                 HeapData::FrozenSet(other_set) => Some(other_set.0.clone_entries(heap)),
                 _ => None,
@@ -880,7 +880,7 @@ impl Set {
     ) -> RunResult<bool> {
         // Try to get entries from a Set/FrozenSet directly
         let entries_opt = match other {
-            Value::Ref(id) => match heap.get(*id) {
+            Value::Ref(id) => match heap.get(id) {
                 HeapData::Set(other_set) => Some(other_set.0.clone_entries(heap)),
                 HeapData::FrozenSet(other_set) => Some(other_set.0.clone_entries(heap)),
                 _ => None,
@@ -912,7 +912,7 @@ impl Set {
     ) -> RunResult<bool> {
         // Try to get entries from a Set/FrozenSet directly
         let entries_opt = match other {
-            Value::Ref(id) => match heap.get(*id) {
+            Value::Ref(id) => match heap.get(id) {
                 HeapData::Set(other_set) => Some(other_set.0.clone_entries(heap)),
                 HeapData::FrozenSet(other_set) => Some(other_set.0.clone_entries(heap)),
                 _ => None,
@@ -943,7 +943,7 @@ impl Set {
     ) -> RunResult<SetStorage> {
         // Try to get entries from a Set/FrozenSet directly
         let entries_opt = match &value {
-            Value::Ref(id) => match heap.get(*id) {
+            Value::Ref(id) => match heap.get(id) {
                 HeapData::Set(set) => Some(set.0.clone_entries(heap)),
                 HeapData::FrozenSet(set) => Some(set.0.clone_entries(heap)),
                 _ => None,
@@ -1232,7 +1232,7 @@ impl FrozenSet {
     ) -> RunResult<bool> {
         // Try to get entries from a Set/FrozenSet directly
         let entries_opt = match other {
-            Value::Ref(id) => match heap.get(*id) {
+            Value::Ref(id) => match heap.get(id) {
                 HeapData::Set(other_set) => Some(other_set.0.clone_entries(heap)),
                 HeapData::FrozenSet(other_set) => Some(other_set.0.clone_entries(heap)),
                 _ => None,
@@ -1264,7 +1264,7 @@ impl FrozenSet {
     ) -> RunResult<bool> {
         // Try to get entries from a Set/FrozenSet directly
         let entries_opt = match other {
-            Value::Ref(id) => match heap.get(*id) {
+            Value::Ref(id) => match heap.get(id) {
                 HeapData::Set(other_set) => Some(other_set.0.clone_entries(heap)),
                 HeapData::FrozenSet(other_set) => Some(other_set.0.clone_entries(heap)),
                 _ => None,
@@ -1296,7 +1296,7 @@ impl FrozenSet {
     ) -> RunResult<bool> {
         // Try to get entries from a Set/FrozenSet directly
         let entries_opt = match other {
-            Value::Ref(id) => match heap.get(*id) {
+            Value::Ref(id) => match heap.get(id) {
                 HeapData::Set(other_set) => Some(other_set.0.clone_entries(heap)),
                 HeapData::FrozenSet(other_set) => Some(other_set.0.clone_entries(heap)),
                 _ => None,

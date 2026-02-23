@@ -53,6 +53,17 @@ impl HeapId {
 pub(crate) struct HeapRef(HeapId);
 
 impl HeapRef {
+    /// Creates a `HeapRef` from a raw `HeapId` without modifying reference counts.
+    ///
+    /// Use this when wrapping a `HeapId` that already has its reference count accounted for
+    /// (e.g., after `inc_ref_raw` or when transferring ownership from a `Vec<HeapId>`).
+    ///
+    /// The caller is responsible for ensuring the reference count is correct.
+    #[inline]
+    pub(crate) fn from_id(id: HeapId) -> Self {
+        Self(id)
+    }
+
     /// Returns the underlying `HeapId` for heap lookups.
     ///
     /// This does not affect reference counts — it's just an accessor
@@ -68,17 +79,6 @@ impl HeapRef {
     #[inline]
     pub(crate) fn clone_with_heap(&self, heap: &Heap<impl ResourceTracker>) -> Self {
         heap.inc_ref(self)
-    }
-
-    /// Creates a duplicate `HeapRef` without incrementing the reference count.
-    ///
-    /// Used by the two-phase clone pattern (`copy_for_extend` + separate `inc_ref`)
-    /// where heap access is not available at copy time. The caller **must** call
-    /// `heap.inc_ref()` on the returned `HeapRef` before it can be independently
-    /// dropped, otherwise refcounts will be incorrect.
-    #[inline]
-    pub(crate) fn duplicate_uncounted(&self) -> Self {
-        Self(self.0)
     }
 }
 
@@ -1064,6 +1064,8 @@ impl<T: ResourceTracker> Heap<T> {
             .allocate(HeapData::Tuple(Tuple::default()))
             .expect("Failed to allocate empty tuple singleton");
         debug_assert_eq!(empty_tuple.0, EMPTY_TUPLE_ID);
+        #[cfg(feature = "ref-count-panic")]
+        std::mem::forget(empty_tuple); // Leak the empty tuple singleton to keep it alive for the program duration
         this
     }
 
@@ -1166,9 +1168,9 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// The returned `Value` has its reference count incremented, so the caller
     /// owns a reference and must call `dec_ref` when done.
-    pub fn get_empty_tuple(&mut self) -> Value {
+    pub fn get_empty_tuple(&self) -> Value {
         // Return existing singleton with incremented refcount
-        Value::Ref(HeapRef(EMPTY_TUPLE_ID))
+        Value::Ref(self.inc_ref_raw(EMPTY_TUPLE_ID))
     }
 
     /// Increments the reference count for an existing heap entry, returning a new owned `HeapRef`.
@@ -1201,7 +1203,13 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
-    pub fn dec_ref(&mut self, HeapRef(id): HeapRef) {
+    pub fn dec_ref(&mut self, heap_ref: HeapRef) {
+        let id = heap_ref.id();
+
+        // Avoid panic on heap ref drop with `ref-count-panic` feature
+        #[cfg_attr(not(feature = "ref-count-panic"), expect(clippy::forget_non_drop))]
+        std::mem::forget(heap_ref);
+
         let slot = self.entries.get_mut(id.index()).expect("Heap::dec_ref: slot missing");
         let entry = slot.as_mut().expect("Heap::dec_ref: object already freed");
         if entry.refcount.get() > 1 {
@@ -1478,13 +1486,12 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// # Panics
     /// Panics if the ID is invalid, the value has been freed, or the entry is not a Cell.
-    pub fn set_cell_value(&mut self, heap_ref: &HeapRef, value: Value) {
-        let id = heap_ref.id();
+    pub fn set_cell_value(&mut self, id: HeapId, value: Value) {
         // The guard will clean up the new value if we panic, or the old value if we swap
         let mut guard = HeapGuard::new(value, self);
         let (value, this) = guard.as_parts_mut();
 
-        match &mut this.get_mut(id) {
+        match &mut this.get_mut_raw(id) {
             HeapData::Cell(c) => std::mem::swap(&mut c.0, value),
             _ => panic!("Heap::set_cell_value: entry is not a Cell"),
         }
@@ -1499,7 +1506,7 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// Returns `true` if successful, `false` if the source ID is not a List.
     pub fn iadd_extend_list(&mut self, source_id: HeapId, dest: &mut Vec<Value>) -> bool {
-        if let HeapData::List(list) = self.get(source_id) {
+        if let HeapData::List(list) = self.get_by_id(source_id) {
             let items: Vec<Value> = list.as_slice().iter().map(|v| v.clone_with_heap(self)).collect();
             dest.extend(items);
             true
@@ -1527,7 +1534,7 @@ impl<T: ResourceTracker> Heap<T> {
         } else {
             restore_data!(self, id, data, "mult_ref_by_i64");
             let count = i64_to_repeat_count(int_val)?;
-            self.mult_sequence_raw(id, count)
+            self.mult_sequence(id, count)
         }
     }
 
@@ -1538,14 +1545,15 @@ impl<T: ResourceTracker> Heap<T> {
     /// - `LongInt * sequence` or `sequence * LongInt`: sequence repetition
     /// - Anything else: returns `Ok(None)` for unsupported type combinations
     pub fn mult_heap_values(&mut self, id1: &HeapRef, id2: &HeapRef) -> RunResult<Option<Value>> {
-        // Extract the information we need from a single lookup of both values
-        let id1_raw = id1.id();
-        let id2_raw = id2.id();
         enum MultKind {
             LongInts { a_bits: u64, b_bits: u64 },
             SeqTimesLong { seq_id: HeapId, count: usize },
             Unsupported,
         }
+
+        // Extract the information we need from a single lookup of both values
+        let id1_raw = id1.id();
+        let id2_raw = id2.id();
 
         let kind = self.with_two(id1, id2, |_heap, left, right| match (left, right) {
             (HeapData::LongInt(a), HeapData::LongInt(b)) => Ok(MultKind::LongInts {
@@ -1575,7 +1583,7 @@ impl<T: ResourceTracker> Heap<T> {
                     }
                 })?)
             }
-            MultKind::SeqTimesLong { seq_id, count } => self.mult_sequence_raw(seq_id, count),
+            MultKind::SeqTimesLong { seq_id, count } => self.mult_sequence(seq_id, count),
             MultKind::Unsupported => Ok(None),
         }
     }
@@ -1595,7 +1603,7 @@ impl<T: ResourceTracker> Heap<T> {
     /// * `Ok(None)` - If the heap entry is not a sequence type
     /// * `Err` - If allocation fails due to resource limits
     pub fn mult_sequence(&mut self, id: HeapId, count: usize) -> RunResult<Option<Value>> {
-        match self.get(id) {
+        match self.get_by_id(id) {
             HeapData::Str(s) => {
                 check_repeat_size(s.len(), count, &self.tracker)?;
                 Ok(Some(Value::Ref(
@@ -1845,7 +1853,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
         HeapData::Cell(cell) => {
             // Cell can contain a reference to another heap value
             if let Value::Ref(id) = &cell.0 {
-                work_list.push(*id);
+                work_list.push(id.id());
             }
         }
         HeapData::Dataclass(dc) => {
