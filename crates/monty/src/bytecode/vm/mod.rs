@@ -33,7 +33,7 @@ use crate::{
     parse::CodeRange,
     resource::ResourceTracker,
     types::{LongInt, MontyIter, PyTrait, iter::advance_on_heap},
-    value::{BitwiseOp, Value},
+    value::{BitwiseOp, EitherStr, Value},
 };
 
 /// Result of executing Await opcode.
@@ -161,6 +161,8 @@ macro_rules! jump_relative {
 /// - `FramePushed`: Reload the cached frame (a new frame was pushed)
 /// - `External(ext_id, args)`: Return `FrameExit::ExternalCall` to yield to host
 /// - `OsCall(func, args)`: Return `FrameExit::OsCall` to yield to host
+/// - `MethodCall(name, args)`: Return `FrameExit::MethodCall` to yield to host
+/// - `AwaitValue(value)`: Push value, then implicitly await it via `exec_get_awaitable`
 /// - `Err(err)`: Handle the exception via `catch_sync!`
 macro_rules! handle_call_result {
     ($self:expr, $cached_frame:ident, $result:expr) => {
@@ -186,6 +188,35 @@ macro_rules! handle_call_result {
                     args,
                     call_id,
                 });
+            }
+            Ok(CallResult::MethodCall(method_name, args)) => {
+                let call_id = $self.allocate_call_id();
+                // Sync cached IP back to frame before snapshot for resume
+                $self.current_frame_mut().ip = $cached_frame.ip;
+                return Ok(FrameExit::MethodCall {
+                    method_name,
+                    args,
+                    call_id,
+                });
+            }
+            Ok(CallResult::AwaitValue(value)) => {
+                // Push the value and implicitly await it (used by asyncio.run())
+                $self.push(value);
+                $self.current_frame_mut().ip = $cached_frame.ip;
+                match $self.exec_get_awaitable() {
+                    Ok(AwaitResult::ValueReady(value)) => {
+                        $self.push(value);
+                    }
+                    Ok(AwaitResult::FramePushed) => {
+                        reload_cache!($self, $cached_frame);
+                    }
+                    Ok(AwaitResult::Yield(pending_calls)) => {
+                        return Ok(FrameExit::ResolveFutures(pending_calls));
+                    }
+                    Err(e) => {
+                        catch_sync!($self, $cached_frame, e);
+                    }
+                }
             }
             Err(err) => catch_sync!($self, $cached_frame, err),
         }
@@ -220,6 +251,21 @@ pub enum FrameExit {
         /// ID of the os function to call.
         function: OsFunction,
         /// Arguments for the external function (includes both positional and keyword args).
+        args: ArgValues,
+        /// Unique ID for this call, used for async correlation.
+        call_id: CallId,
+    },
+
+    /// Execution paused for a dataclass method call.
+    ///
+    /// The caller should invoke the method on the original Python dataclass and call
+    /// `resume()` with the result. The `method_name` is the attribute name (e.g.
+    /// `"distance"`) and `args` includes the dataclass instance as the first argument
+    /// (`self`).
+    MethodCall {
+        /// Method name (e.g., "distance").
+        method_name: EitherStr,
+        /// Arguments including the dataclass instance as the first positional arg.
         args: ArgValues,
         /// Unique ID for this call, used for async correlation.
         call_id: CallId,
@@ -261,6 +307,10 @@ pub struct CallFrame<'code> {
 
     /// Call site position (for tracebacks).
     call_position: Option<CodeRange>,
+
+    /// When this frame returns (or exits with an exception) the VM should exit the run loop
+    /// and return to the caller. Supports `evaluate_function`.
+    should_return: bool,
 }
 
 impl<'code> CallFrame<'code> {
@@ -274,6 +324,7 @@ impl<'code> CallFrame<'code> {
             function_id: None,
             cells: Vec::new(),
             call_position: None,
+            should_return: false,
         }
     }
 
@@ -294,6 +345,7 @@ impl<'code> CallFrame<'code> {
             function_id: Some(function_id),
             cells,
             call_position,
+            should_return: false,
         }
     }
 }
@@ -349,6 +401,10 @@ pub struct SerializedFrame {
 impl CallFrame<'_> {
     /// Converts this frame to a serializable representation.
     fn serialize(&self) -> SerializedFrame {
+        assert!(
+            !self.should_return,
+            "cannot serialize frame marked for return - not yet supported"
+        );
         SerializedFrame {
             function_id: self.function_id,
             ip: self.ip,
@@ -409,7 +465,11 @@ pub struct VMSnapshot {
 /// Executes compiled bytecode using a stack-based execution model.
 /// The instruction pointer (IP) lives in each `CallFrame`, not here,
 /// to avoid sync bugs on call/return.
-pub struct VM<'a, T: ResourceTracker, P: PrintWriter> {
+///
+/// # Lifetimes
+/// * `'a` - Lifetime of the heap, namespaces, interns, and the print writer borrow
+/// * `'p` - Lifetime of the callback reference inside [`PrintWriter::Callback`]
+pub struct VM<'a, 'p, T: ResourceTracker> {
     /// Operand stack - values being computed.
     stack: Vec<Value>,
 
@@ -417,16 +477,16 @@ pub struct VM<'a, T: ResourceTracker, P: PrintWriter> {
     frames: Vec<CallFrame<'a>>,
 
     /// Heap for reference-counted objects.
-    heap: &'a mut Heap<T>,
+    pub(crate) heap: &'a mut Heap<T>,
 
     /// Namespace stack for variable storage.
     namespaces: &'a mut Namespaces,
 
     /// Interned strings/bytes.
-    interns: &'a Interns,
+    pub(crate) interns: &'a Interns,
 
-    /// Print output writer.
-    print_writer: &'a mut P,
+    /// Print output writer, borrowed so callers retain access to collected output.
+    pub(crate) print_writer: &'a mut PrintWriter<'p>,
 
     /// Stack of exceptions being handled for nested except blocks.
     ///
@@ -461,13 +521,13 @@ pub struct VM<'a, T: ResourceTracker, P: PrintWriter> {
     module_code: Option<&'a Code>,
 }
 
-impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
+impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
     /// Creates a new VM with the given runtime context.
     pub fn new(
         heap: &'a mut Heap<T>,
         namespaces: &'a mut Namespaces,
         interns: &'a Interns,
-        print_writer: &'a mut P,
+        print_writer: &'a mut PrintWriter<'p>,
     ) -> Self {
         Self {
             stack: Vec::with_capacity(64),
@@ -503,7 +563,7 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
         heap: &'a mut Heap<T>,
         namespaces: &'a mut Namespaces,
         interns: &'a Interns,
-        print_writer: &'a mut P,
+        print_writer: &'a mut PrintWriter<'p>,
     ) -> Self {
         // Reconstruct call frames from serialized form
         let frames = snapshot
@@ -522,6 +582,7 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                     function_id: sf.function_id,
                     cells: sf.cells,
                     call_position: sf.call_position,
+                    should_return: false,
                 }
             })
             .collect();
@@ -544,7 +605,10 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
     pub fn check_snapshot(mut self, result: &RunResult<FrameExit>) -> Option<VMSnapshot> {
         if matches!(
             result,
-            Ok(FrameExit::ExternalCall { .. } | FrameExit::OsCall { .. } | FrameExit::ResolveFutures(_))
+            Ok(FrameExit::ExternalCall { .. }
+                | FrameExit::OsCall { .. }
+                | FrameExit::MethodCall { .. }
+                | FrameExit::ResolveFutures(_))
         ) {
             Some(self.snapshot())
         } else {
@@ -701,12 +765,7 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                     value.drop_with_heap(self.heap);
                 }
                 Opcode::Dup => {
-                    // Copy without incrementing refcount first (avoids borrow conflict)
-                    let value = self.peek().copy_for_extend();
-                    // Now we can safely increment refcount and push
-                    if let Value::Ref(id) = &value {
-                        self.heap.inc_ref(*id);
-                    }
+                    let value = self.peek().clone_with_heap(self.heap);
                     self.push(value);
                 }
                 Opcode::Rot2 => {
@@ -725,21 +784,16 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                 // Constants & Literals
                 Opcode::LoadConst => {
                     let idx = fetch_u16!(cached_frame);
-                    // Copy without incrementing refcount first (avoids borrow conflict)
-                    let value = cached_frame.code.constants().get(idx).copy_for_extend();
+                    let value = cached_frame.code.constants().get(idx);
                     // Handle InternLongInt specially - convert to heap-allocated LongInt
                     if let Value::InternLongInt(long_int_id) = value {
-                        let bi = self.interns.get_long_int(long_int_id).clone();
+                        let bi = self.interns.get_long_int(*long_int_id).clone();
                         match LongInt::new(bi).into_value(self.heap) {
                             Ok(v) => self.push(v),
                             Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
                         }
                     } else {
-                        // Now we can safely increment refcount for Ref values
-                        if let Value::Ref(id) = &value {
-                            self.heap.inc_ref(*id);
-                        }
-                        self.push(value);
+                        self.push(value.clone_with_heap(self.heap));
                     }
                 }
                 Opcode::LoadNone => self.push(Value::None),
@@ -1127,9 +1181,12 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                     let builtin_id = fetch_u8!(cached_frame);
                     let arg_count = fetch_u8!(cached_frame) as usize;
 
+                    // Sync IP before call (builtins like map() may call evaluate_function
+                    // which pushes frames and runs a nested run() loop)
+                    self.current_frame_mut().ip = cached_frame.ip;
+
                     match self.exec_call_builtin_function(builtin_id, arg_count) {
                         Ok(result) => self.push(result),
-                        // IP sync deferred to error path (no frame push possible)
                         Err(err) => catch_sync!(self, cached_frame, err),
                     }
                 }
@@ -1338,7 +1395,11 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
                         continue;
                     }
                     // Pop current frame and push return value
-                    self.pop_frame();
+                    if self.pop_frame() {
+                        // This frame indicated evaluation should stop - return to host with value
+                        // e.g. `evaluate_function`
+                        return Ok(FrameExit::Return(value));
+                    }
                     self.push(value);
                     // Reload cache from parent frame
                     reload_cache!(self, cached_frame);
@@ -1488,7 +1549,11 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
     /// Pops the current frame from the call stack.
     ///
     /// Cleans up the frame's stack region and namespace (except for global namespace).
-    pub(super) fn pop_frame(&mut self) {
+    /// Syncs `instruction_ip` to the parent frame's IP so that exception handling
+    /// looks up handlers in the correct frame's exception table.
+    ///
+    /// Returns `true` if this frame indicated evaluation should stop when popped.
+    pub(super) fn pop_frame(&mut self) -> bool {
         let frame = self.frames.pop().expect("no frame to pop");
         // Clean up frame's stack region
         while self.stack.len() > frame.stack_base {
@@ -1499,6 +1564,12 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
         if frame.namespace_idx != GLOBAL_NS_IDX {
             self.namespaces.drop_with_heap(frame.namespace_idx, self.heap);
         }
+        // Sync instruction_ip to the parent frame so exception table lookups
+        // target the correct frame after returning from a nested run() call.
+        if let Some(parent) = self.frames.last() {
+            self.instruction_ip = parent.ip;
+        }
+        frame.should_return
     }
 
     /// Cleans up all frames for the current task before switching tasks.
@@ -1558,8 +1629,7 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
     /// or `NameError` if the name doesn't exist in any scope.
     fn load_local(&mut self, cached_frame: &CachedFrame<'a>, slot: u16) -> RunResult<()> {
         let namespace = self.namespaces.get(cached_frame.namespace_idx);
-        // Copy without incrementing refcount first (avoids borrow conflict)
-        let value = namespace.get(NamespaceId::new(slot as usize)).copy_for_extend();
+        let value = namespace.get(NamespaceId::new(slot as usize));
 
         // Check for undefined value - raise appropriate error based on whether
         // this is a true local (assigned somewhere) or an undefined reference
@@ -1575,11 +1645,7 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
             return Err(err);
         }
 
-        // Now we can safely increment refcount and push
-        if let Value::Ref(id) = &value {
-            self.heap.inc_ref(*id);
-        }
-        self.push(value);
+        self.push(value.clone_with_heap(self.heap));
         Ok(())
     }
 
@@ -1693,7 +1759,7 @@ impl<'a, T: ResourceTracker, P: PrintWriter> VM<'a, T, P> {
 }
 
 // `heap` is not a public field on VM, so this implementation needs to go here rather than in `heap.rs`
-impl<T: ResourceTracker, P: PrintWriter> ContainsHeap for VM<'_, T, P> {
+impl<T: ResourceTracker> ContainsHeap for VM<'_, '_, T> {
     type ResourceTracker = T;
     fn heap_mut(&mut self) -> &mut Heap<T> {
         self.heap

@@ -13,7 +13,7 @@ default-members = ["crates/monty-cli"]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.5"
+version = "0.0.7"
 rust-version = "1.90"
 license = "MIT"
 authors = ["Samuel Colvin <samuel@pydantic.dev>"]
@@ -70,6 +70,7 @@ dbg_macro = "warn"
 use_self = "warn"
 allow_attributes = "warn"
 undocumented_unsafe_blocks = "warn"
+redundant_clone = "warn"
 
 # in general we lint against the pedantic group, but we will whitelist
 # certain lints which we don't want to enforce
