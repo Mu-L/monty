@@ -342,22 +342,24 @@ impl MontyObject {
             Value::Float(f) => Self::Float(*f),
             Value::InternString(string_id) => Self::String(interns.get_str(*string_id).to_owned()),
             Value::InternBytes(bytes_id) => Self::Bytes(interns.get_bytes(*bytes_id).to_owned()),
-            Value::Ref(id) => {
+            Value::Ref(r) => {
+                let id = r.id();
+
                 // Check for cycle
-                if visited.contains(id) {
+                if visited.contains(&id) {
                     // Cycle detected - return appropriate placeholder
-                    return match heap.get(*id) {
-                        HeapData::List(_) => Self::Cycle(*id, "[...]".to_owned()),
-                        HeapData::Tuple(_) | HeapData::NamedTuple(_) => Self::Cycle(*id, "(...)".to_owned()),
-                        HeapData::Dict(_) => Self::Cycle(*id, "{...}".to_owned()),
-                        _ => Self::Cycle(*id, "...".to_owned()),
+                    return match heap.get(r) {
+                        HeapData::List(_) => Self::Cycle(id, "[...]".to_owned()),
+                        HeapData::Tuple(_) | HeapData::NamedTuple(_) => Self::Cycle(id, "(...)".to_owned()),
+                        HeapData::Dict(_) => Self::Cycle(id, "{...}".to_owned()),
+                        _ => Self::Cycle(id, "...".to_owned()),
                     };
                 }
 
                 // Mark this id as being visited
-                visited.insert(*id);
+                visited.insert(id);
 
-                let result = match heap.get(*id) {
+                let result = match heap.get(r) {
                     HeapData::Str(s) => Self::String(s.as_str().to_owned()),
                     HeapData::Bytes(b) => Self::Bytes(b.as_slice().to_owned()),
                     HeapData::List(list) => Self::List(

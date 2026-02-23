@@ -34,7 +34,7 @@ use crate::{
     args::ArgValues,
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapData, HeapGuard, HeapId},
+    heap::{Heap, HeapData, HeapGuard, HeapId, HeapRef},
     intern::{Interns, StaticStrings},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::Type,
@@ -53,7 +53,7 @@ use crate::{
 ///
 /// # GC Optimization
 /// The `contains_refs` flag tracks whether the tuple contains any `Value::Ref` items.
-/// This allows `collect_child_ids` and `py_dec_ref_ids` to skip iteration when the
+/// This allows `collect_child_ids` and `drop_into` to skip iteration when the
 /// tuple contains only primitive values (ints, bools, None, etc.).
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Tuple {
@@ -88,7 +88,7 @@ impl Tuple {
 
     /// Returns whether the tuple contains any heap references.
     ///
-    /// When false, `collect_child_ids` and `py_dec_ref_ids` can skip iteration.
+    /// When false, `collect_child_ids` and `drop_into` can skip iteration.
     #[inline]
     #[must_use]
     pub fn contains_refs(&self) -> bool {
@@ -169,7 +169,7 @@ impl PyTrait for Tuple {
     fn py_getitem(&self, key: &Value, heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(id) = key
-            && let HeapData::Slice(slice) = heap.get(*id)
+            && let HeapData::Slice(slice) = heap.get(id)
         {
             let (start, stop, step) = slice
                 .indices(self.items.len())
@@ -237,17 +237,13 @@ impl PyTrait for Tuple {
     ///
     /// Called during garbage collection to decrement refcounts of nested values.
     /// When `ref-count-panic` is enabled, also marks all Values as Dereferenced.
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
         // Skip iteration if no refs - GC optimization for tuples of primitives
         if !self.contains_refs {
             return;
         }
-        for obj in &mut self.items {
-            if let Value::Ref(id) = obj {
-                stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
-                obj.dec_ref_forget();
-            }
+        for obj in self.items {
+            obj.drop_into(stack);
         }
     }
 

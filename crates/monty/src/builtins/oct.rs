@@ -33,8 +33,8 @@ pub fn builtin_oct(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> Ru
             let heap_id = heap.allocate(HeapData::Str(Str::new(s.to_string())))?;
             Ok(Value::Ref(heap_id))
         }
-        Value::Ref(id) => {
-            if let HeapData::LongInt(li) = heap.get(*id) {
+        Value::Ref(r) => {
+            if let HeapData::LongInt(li) = heap.get(r) {
                 let oct_str = format_bigint_oct(li.inner());
                 let heap_id = heap.allocate(HeapData::Str(Str::new(oct_str)))?;
                 Ok(Value::Ref(heap_id))

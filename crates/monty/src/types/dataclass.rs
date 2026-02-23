@@ -8,7 +8,7 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapId},
+    heap::{Heap, HeapId, HeapRef},
     intern::Interns,
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::{AttrCallResult, Type},
@@ -36,7 +36,7 @@ use crate::{
 ///
 /// # Reference Counting
 /// The `attrs` Dict contains Values that may be heap-allocated. The
-/// `py_dec_ref_ids` method properly handles decrementing refcounts for
+/// `drop_into` method properly handles decrementing refcounts for
 /// all attribute values when the dataclass instance is freed.
 ///
 /// # Attribute Access
@@ -203,9 +203,9 @@ impl PyTrait for Dataclass {
         Ok(self.name == other.name && self.attrs.py_eq(&other.attrs, heap, guard, interns)?)
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
         // Delegate to the attrs Dict which handles all nested heap references
-        self.attrs.py_dec_ref_ids(stack);
+        self.attrs.drop_into(stack);
     }
 
     fn py_bool(&self, _heap: &Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
@@ -296,9 +296,7 @@ impl PyTrait for Dataclass {
         // Only public methods (no underscore prefix = no dunders, no private)
         if !attr_str.starts_with('_') && self.attrs.get_by_str(attr_str, vm.heap, vm.interns).is_none() {
             // Clone self and prepend to args for the method call
-            // inc_ref works even when data is taken out (refcount metadata is separate)
-            vm.heap.inc_ref(self_id);
-            let self_arg = Value::Ref(self_id);
+            let self_arg = Value::Ref(vm.heap.inc_ref_raw(self_id));
             let args_with_self = args.prepend(self_arg);
             Ok(AttrCallResult::MethodCall(attr.clone(), args_with_self))
         } else {

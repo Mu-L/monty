@@ -33,8 +33,8 @@ pub fn builtin_ord(heap: &mut Heap<impl ResourceTracker>, args: ArgValues, inter
                 .into())
             }
         }
-        Value::Ref(id) => {
-            if let HeapData::Str(s) = heap.get(*id) {
+        Value::Ref(r) => {
+            if let HeapData::Str(s) = heap.get(r) {
                 let mut chars = s.as_str().chars();
                 if let (Some(c), None) = (chars.next(), chars.next()) {
                     Ok(Value::Int(c as i64))

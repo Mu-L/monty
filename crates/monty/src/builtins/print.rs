@@ -129,7 +129,7 @@ fn extract_string_kwarg(
         Value::None => Ok(None),
         Value::InternString(string_id) => Ok(Some(interns.get_str(*string_id).to_owned())),
         Value::Ref(id) => {
-            if let HeapData::Str(s) = heap.get(*id) {
+            if let HeapData::Str(s) = heap.get(id) {
                 return Ok(Some(s.as_str().to_owned()));
             }
             Err(SimpleException::new_msg(

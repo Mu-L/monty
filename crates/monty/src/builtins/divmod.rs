@@ -40,8 +40,8 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                 Ok(allocate_tuple(smallvec![quot_val, rem_val], heap)?)
             }
         }
-        (Value::Int(x), Value::Ref(id)) => {
-            if let HeapData::LongInt(li) = heap.get(*id) {
+        (Value::Int(x), Value::Ref(r)) => {
+            if let HeapData::LongInt(li) = heap.get(r) {
                 if li.is_zero() {
                     Err(ExcType::divmod_by_zero())
                 } else {
@@ -61,8 +61,8 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                 .into())
             }
         }
-        (Value::Ref(id), Value::Int(y)) => {
-            if let HeapData::LongInt(li) = heap.get(*id) {
+        (Value::Ref(r), Value::Int(y)) => {
+            if let HeapData::LongInt(li) = heap.get(r) {
                 if *y == 0 {
                     Err(ExcType::divmod_by_zero())
                 } else {
@@ -82,8 +82,8 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                 .into())
             }
         }
-        (Value::Ref(id1), Value::Ref(id2)) => {
-            let x_bi = if let HeapData::LongInt(li) = heap.get(*id1) {
+        (Value::Ref(r1), Value::Ref(r2)) => {
+            let x_bi = if let HeapData::LongInt(li) = heap.get(r1) {
                 li.inner().clone()
             } else {
                 let a_type = a.py_type(heap);
@@ -94,7 +94,7 @@ pub fn builtin_divmod(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) ->
                 )
                 .into());
             };
-            if let HeapData::LongInt(li) = heap.get(*id2) {
+            if let HeapData::LongInt(li) = heap.get(r2) {
                 if li.is_zero() {
                     Err(ExcType::divmod_by_zero())
                 } else {

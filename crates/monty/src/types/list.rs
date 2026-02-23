@@ -10,7 +10,7 @@ use crate::{
     bytecode::VM,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunError, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRef},
     intern::{Interns, StaticStrings},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     sorting::{apply_permutation, sort_indices},
@@ -49,14 +49,14 @@ use crate::{
 ///
 /// # GC Optimization
 /// The `contains_refs` flag tracks whether the list contains any `Value::Ref` items.
-/// This allows `collect_child_ids` and `py_dec_ref_ids` to skip iteration when the
+/// This allows `collect_child_ids` and `drop_into` to skip iteration when the
 /// list contains only primitive values (ints, bools, None, etc.), significantly
 /// improving GC performance for lists of primitives.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct List {
     items: Vec<Value>,
     /// True if any item in the list is a `Value::Ref`. Used to skip iteration
-    /// in `collect_child_ids` and `py_dec_ref_ids` when no refs are present.
+    /// in `collect_child_ids` and `drop_into` when no refs are present.
     contains_refs: bool,
 }
 
@@ -102,7 +102,7 @@ impl List {
 
     /// Returns whether the list contains any heap references.
     ///
-    /// When false, `collect_child_ids` and `py_dec_ref_ids` can skip iteration.
+    /// When false, `collect_child_ids` and `drop_into` can skip iteration.
     #[inline]
     #[must_use]
     pub fn contains_refs(&self) -> bool {
@@ -216,7 +216,7 @@ impl PyTrait for List {
     fn py_getitem(&self, key: &Value, heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(id) = key
-            && let HeapData::Slice(slice) = heap.get(*id)
+            && let HeapData::Slice(slice) = heap.get(id)
         {
             // Clone the slice to release the borrow on heap before calling getitem_slice
             let slice = slice.clone();
@@ -260,7 +260,7 @@ impl PyTrait for List {
             Value::Int(i) => *i,
             Value::Bool(b) => i64::from(*b),
             Value::Ref(heap_id) => {
-                if let HeapData::LongInt(li) = heap.get(*heap_id) {
+                if let HeapData::LongInt(li) = heap.get(heap_id) {
                     if let Some(i) = li.to_i64() {
                         i
                     } else {
@@ -324,17 +324,13 @@ impl PyTrait for List {
         Ok(true)
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
         // Skip iteration if no refs - major GC optimization for lists of primitives
         if !self.contains_refs {
             return;
         }
-        for obj in &mut self.items {
-            if let Value::Ref(id) = obj {
-                stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
-                obj.dec_ref_forget();
-            }
+        for obj in self.items {
+            obj.drop_into(stack);
         }
     }
 
@@ -375,9 +371,11 @@ impl PyTrait for List {
         _interns: &Interns,
     ) -> Result<bool, crate::resource::ResourceError> {
         // Extract the value ID first, keeping `other` around to drop later
-        let Value::Ref(other_id) = &other else { return Ok(false) };
+        let Value::Ref(other_ref) = &other else {
+            return Ok(false);
+        };
 
-        if Some(*other_id) == self_id {
+        if Some(other_ref.id()) == self_id {
             // Self-extend: clone our own items with proper refcounting
             let items = self
                 .items
@@ -393,7 +391,7 @@ impl PyTrait for List {
             // Get items from other list using iadd_extend_from_heap helper
             // This handles the borrow checker limitations with lifetime propagation
             let prev_len = self.items.len();
-            if !heap.iadd_extend_list(*other_id, &mut self.items) {
+            if !heap.iadd_extend_list(other_ref, &mut self.items) {
                 return Ok(false);
             }
             // Check if we added any refs and mark potential cycle

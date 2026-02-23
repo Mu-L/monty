@@ -49,8 +49,8 @@ fn isinstance_check(obj_type: Type, classinfo: &Value, heap: &Heap<impl Resource
         }
 
         // Tuple of types (possibly nested): isinstance(x, (int, (str, bytes)))
-        Value::Ref(id) => {
-            if let HeapData::Tuple(tuple) = heap.get(*id) {
+        Value::Ref(r) => {
+            if let HeapData::Tuple(tuple) = heap.get(r) {
                 for v in tuple.as_slice() {
                     if isinstance_check(obj_type, v, heap)? {
                         return Ok(true);

@@ -4,7 +4,7 @@ use crate::{
     args::ArgValues,
     defer_drop_mut,
     exception_private::RunResult,
-    heap::{Heap, HeapData},
+    heap::{DropWithHeap, Heap, HeapData},
     intern::Interns,
     resource::ResourceTracker,
     types::{List, MontyIter, allocate_tuple, tuple::TupleVec},

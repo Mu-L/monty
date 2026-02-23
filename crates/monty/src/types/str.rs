@@ -13,7 +13,7 @@ use crate::{
     args::ArgValues,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRef},
     intern::{Interns, StaticStrings, StringId},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::Type,
@@ -224,7 +224,7 @@ impl PyTrait for Str {
     fn py_getitem(&self, key: &Value, heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(id) = key
-            && let HeapData::Slice(slice) = heap.get(*id)
+            && let HeapData::Slice(slice) = heap.get(id)
         {
             // Clone the slice to release the borrow on heap before calling getitem_slice
             let slice = slice.clone();
@@ -250,7 +250,7 @@ impl PyTrait for Str {
     }
 
     /// Interns don't contain nested heap references.
-    fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
+    fn drop_into(self, _stack: &mut Vec<HeapRef>) {
         // No-op: strings don't hold Value references
     }
 
@@ -532,7 +532,7 @@ fn str_join(
                 result.push_str(interns.get_str(*id));
             }
             Value::Ref(heap_id) => {
-                if let HeapData::Str(s) = heap.get(*heap_id) {
+                if let HeapData::Str(s) = heap.get(heap_id) {
                     result.push_str(s.as_str());
                 } else {
                     let t = item.py_type(heap);
@@ -1135,7 +1135,7 @@ fn extract_str_or_tuple_of_str(
 ) -> RunResult<Vec<String>> {
     match value {
         Value::InternString(id) => Ok(vec![interns.get_str(*id).to_owned()]),
-        Value::Ref(heap_id) => match heap.get(*heap_id) {
+        Value::Ref(heap_id) => match heap.get(heap_id) {
             HeapData::Str(s) => Ok(vec![s.as_str().to_owned()]),
             HeapData::Tuple(tuple) => {
                 let items = tuple.as_slice();
@@ -1157,7 +1157,7 @@ fn extract_string_arg(value: &Value, heap: &Heap<impl ResourceTracker>, interns:
     match value {
         Value::InternString(id) => Ok(interns.get_str(*id).to_owned()),
         Value::Ref(heap_id) => {
-            if let HeapData::Str(s) = heap.get(*heap_id) {
+            if let HeapData::Str(s) = heap.get(heap_id) {
                 Ok(s.as_str().to_owned())
             } else {
                 Err(ExcType::type_error("expected str"))
@@ -1172,7 +1172,7 @@ fn extract_int_arg(value: &Value, heap: &Heap<impl ResourceTracker>) -> RunResul
     match value {
         Value::Int(i) => Ok(*i),
         Value::Ref(heap_id) => {
-            if let HeapData::LongInt(li) = heap.get(*heap_id) {
+            if let HeapData::LongInt(li) = heap.get(heap_id) {
                 // Try to convert to i64
                 li.to_i64().ok_or_else(|| ExcType::type_error("integer too large"))
             } else {

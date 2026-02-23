@@ -75,7 +75,7 @@ use crate::{
     args::ArgValues,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult, SimpleException},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRef},
     intern::{Interns, StaticStrings, StringId},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::List,
@@ -209,7 +209,7 @@ impl Bytes {
                 let b = interns.get_bytes(*bytes_id);
                 b.to_vec()
             }
-            Some(v @ Value::Ref(id)) => match heap.get(*id) {
+            Some(v @ Value::Ref(id)) => match heap.get(id) {
                 HeapData::Str(s) => s.as_str().as_bytes().to_vec(),
                 HeapData::Bytes(b) => b.as_slice().to_vec(),
                 _ => return Err(ExcType::type_error_bytes_init(v.py_type(heap))),
@@ -263,7 +263,7 @@ impl PyTrait for Bytes {
     fn py_getitem(&self, key: &Value, heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(id) = key
-            && let HeapData::Slice(slice) = heap.get(*id)
+            && let HeapData::Slice(slice) = heap.get(id)
         {
             let (start, stop, step) = slice
                 .indices(self.0.len())
@@ -293,7 +293,7 @@ impl PyTrait for Bytes {
     }
 
     /// Bytes don't contain nested heap references.
-    fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
+    fn drop_into(self, _stack: &mut Vec<HeapRef>) {
         // No-op: bytes don't hold Value references
     }
 
@@ -544,7 +544,7 @@ fn get_encoding_str<'a>(
 ) -> RunResult<&'a str> {
     match encoding {
         Value::InternString(id) => Ok(interns.get_str(*id)),
-        Value::Ref(id) => match heap.get(*id) {
+        Value::Ref(id) => match heap.get(id) {
             HeapData::Str(s) => Ok(s.as_str()),
             _ => Err(ExcType::type_error(
                 "decode() argument 'encoding' must be str, not bytes",
@@ -763,7 +763,7 @@ fn extract_bytes_for_prefix_suffix(
         Value::InternString(_) => Err(ExcType::type_error(format!(
             "{method_name} first arg must be bytes or a tuple of bytes, not str"
         ))),
-        Value::Ref(id) => match heap.get(*id) {
+        Value::Ref(id) => match heap.get(id) {
             HeapData::Bytes(b) => Ok(PrefixSuffixArg::Single(b.as_slice().to_vec())),
             HeapData::Str(_) => Err(ExcType::type_error(format!(
                 "{method_name} first arg must be bytes or a tuple of bytes, not str"
@@ -806,7 +806,7 @@ fn extract_single_bytes_for_prefix_suffix(
     match value {
         Value::InternBytes(id) => Ok(interns.get_bytes(*id).to_vec()),
         Value::InternString(_) => Err(ExcType::type_error("expected bytes, not str")),
-        Value::Ref(id) => match heap.get(*id) {
+        Value::Ref(id) => match heap.get(id) {
             HeapData::Bytes(b) => Ok(b.as_slice().to_vec()),
             _ => Err(ExcType::type_error("expected bytes")),
         },
@@ -826,7 +826,7 @@ fn extract_bytes_only<'a>(
     match value {
         Value::InternBytes(id) => Ok(interns.get_bytes(*id)),
         Value::InternString(_) => Err(ExcType::type_error("a bytes-like object is required, not 'str'")),
-        Value::Ref(id) => match heap.get(*id) {
+        Value::Ref(id) => match heap.get(id) {
             HeapData::Bytes(b) => Ok(b.as_slice()),
             HeapData::Str(_) => Err(ExcType::type_error("a bytes-like object is required, not 'str'")),
             _ => Err(ExcType::type_error("a bytes-like object is required")),
@@ -2122,7 +2122,7 @@ fn bytes_join(
                 result.extend_from_slice(interns.get_bytes(*id));
             }
             Value::Ref(heap_id) => {
-                if let HeapData::Bytes(b) = heap.get(*heap_id) {
+                if let HeapData::Bytes(b) = heap.get(heap_id) {
                     result.extend_from_slice(b.as_slice());
                 } else {
                     let t = item.py_type(heap);
@@ -2238,7 +2238,7 @@ fn parse_bytes_hex_args(
     let sep_bytes = match sep_value {
         Value::InternString(id) => interns.get_str(*id).as_bytes(),
         Value::InternBytes(id) => interns.get_bytes(*id),
-        Value::Ref(heap_id) => match heap.get(*heap_id) {
+        Value::Ref(heap_id) => match heap.get(heap_id) {
             HeapData::Str(s) => s.as_bytes(),
             HeapData::Bytes(b) => b.as_slice(),
             _ => return Err(ExcType::type_error("sep must be str or bytes")),
@@ -2275,7 +2275,7 @@ pub fn bytes_fromhex(args: ArgValues, heap: &mut Heap<impl ResourceTracker>, int
     let hex_str = match hex_value {
         Value::InternString(id) => interns.get_str(*id),
         Value::Ref(heap_id) => {
-            if let HeapData::Str(s) = heap.get(*heap_id) {
+            if let HeapData::Str(s) = heap.get(heap_id) {
                 s.as_str()
             } else {
                 return Err(ExcType::type_error("fromhex() argument must be str, not bytes"));

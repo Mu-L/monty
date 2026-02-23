@@ -137,7 +137,7 @@ fn two_arg_pow(base: &Value, exp: &Value, heap: &mut Heap<impl ResourceTracker>)
         (Value::Int(b), Value::Int(e)) => int_pow_int(*b, *e, heap),
         (Value::Int(b), Value::Ref(id)) => {
             // Clone to avoid borrow conflict with heap mutation
-            let e_bi = if let HeapData::LongInt(li) = heap.get(*id) {
+            let e_bi = if let HeapData::LongInt(li) = heap.get(id) {
                 li.inner().clone()
             } else {
                 return Err(ExcType::binary_type_error(
@@ -148,9 +148,9 @@ fn two_arg_pow(base: &Value, exp: &Value, heap: &mut Heap<impl ResourceTracker>)
             };
             int_pow_longint(*b, &e_bi, heap)
         }
-        (Value::Ref(id), Value::Int(e)) => {
+        (Value::Ref(r), Value::Int(e)) => {
             // Clone to avoid borrow conflict with heap mutation
-            let b_bi = if let HeapData::LongInt(li) = heap.get(*id) {
+            let b_bi = if let HeapData::LongInt(li) = heap.get(r) {
                 li.inner().clone()
             } else {
                 return Err(ExcType::binary_type_error(
@@ -161,9 +161,9 @@ fn two_arg_pow(base: &Value, exp: &Value, heap: &mut Heap<impl ResourceTracker>)
             };
             longint_pow_int(&b_bi, *e, heap)
         }
-        (Value::Ref(id1), Value::Ref(id2)) => {
+        (Value::Ref(r1), Value::Ref(r2)) => {
             // Clone both to avoid borrow conflict with heap mutation
-            let b_bi = if let HeapData::LongInt(li) = heap.get(*id1) {
+            let b_bi = if let HeapData::LongInt(li) = heap.get(r1) {
                 li.inner().clone()
             } else {
                 return Err(ExcType::binary_type_error(
@@ -172,7 +172,7 @@ fn two_arg_pow(base: &Value, exp: &Value, heap: &mut Heap<impl ResourceTracker>)
                     exp.py_type(heap),
                 ));
             };
-            let e_bi = if let HeapData::LongInt(li) = heap.get(*id2) {
+            let e_bi = if let HeapData::LongInt(li) = heap.get(r2) {
                 li.inner().clone()
             } else {
                 return Err(ExcType::binary_type_error(

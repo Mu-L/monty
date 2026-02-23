@@ -11,7 +11,7 @@ use crate::{
     args::ArgValues,
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapId, HeapRef},
     intern::Interns,
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::{PyTrait, Type},
@@ -214,7 +214,7 @@ impl PyTrait for Range {
     fn py_getitem(&self, key: &Value, heap: &mut Heap<impl ResourceTracker>, _interns: &Interns) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(id) = key
-            && let HeapData::Slice(slice) = heap.get(*id)
+            && let HeapData::Slice(slice) = heap.get(id)
         {
             // Clone the slice to release the borrow on heap before calling getitem_slice
             let slice = slice.clone();
@@ -282,7 +282,7 @@ impl PyTrait for Range {
         }
     }
 
-    fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
+    fn drop_into(self, _stack: &mut Vec<HeapRef>) {
         // Range doesn't contain heap references, nothing to do
     }
 

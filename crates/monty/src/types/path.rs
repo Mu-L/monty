@@ -14,7 +14,7 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapId, HeapRef},
     intern::{Interns, StaticStrings},
     os::OsFunction,
     resource::{DepthGuard, ResourceError, ResourceTracker},
@@ -291,7 +291,7 @@ fn extract_path_string<'a>(
 ) -> RunResult<&'a str> {
     match val {
         Value::InternString(string_id) => Ok(interns.get_str(*string_id)),
-        Value::Ref(heap_id) => match heap.get(*heap_id) {
+        Value::Ref(heap_id) => match heap.get(heap_id) {
             HeapData::Str(s) => Ok(s.as_str()),
             HeapData::Path(p) => Ok(p.as_str()),
             _ => Err(ExcType::type_error(format!(
@@ -322,7 +322,7 @@ fn fold_joinpath(
 ///
 /// In Python, `Path('/usr') / 'bin'` produces `Path('/usr/bin')`.
 pub(crate) fn path_div(
-    path_id: HeapId,
+    path_ref: &HeapRef,
     other: &Value,
     heap: &mut Heap<impl ResourceTracker>,
     interns: &Interns,
@@ -330,7 +330,7 @@ pub(crate) fn path_div(
     // Extract the right-hand side as a string
     let other_str = match other {
         Value::InternString(string_id) => interns.get_str(*string_id).to_owned(),
-        Value::Ref(other_id) => match heap.get(*other_id) {
+        Value::Ref(other_ref) => match heap.get(other_ref) {
             HeapData::Str(s) => s.as_str().to_owned(),
             HeapData::Path(p) => p.as_str().to_owned(),
             _ => return Ok(None),
@@ -339,7 +339,7 @@ pub(crate) fn path_div(
     };
 
     // Get the path string
-    let path_str = match heap.get(path_id) {
+    let path_str = match heap.get(path_ref) {
         HeapData::Path(p) => p.as_str().to_owned(),
         _ => return Ok(None),
     };
@@ -485,7 +485,7 @@ impl PyTrait for Path {
         write!(f, "PosixPath('{}')", self.path)
     }
 
-    fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
+    fn drop_into(self, _stack: &mut Vec<HeapRef>) {
         // Path doesn't contain heap references, nothing to do
     }
 

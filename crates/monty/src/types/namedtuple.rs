@@ -22,7 +22,7 @@ use ahash::AHashSet;
 use super::PyTrait;
 use crate::{
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapId},
+    heap::{Heap, HeapId, HeapRef},
     intern::{Interns, StringId},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::{AttrCallResult, Type},
@@ -38,12 +38,12 @@ use crate::{
 /// # Reference Counting
 ///
 /// When a named tuple is freed, all contained heap references have their refcounts
-/// decremented via `py_dec_ref_ids`.
+/// decremented via `drop_into`.
 ///
 /// # GC Optimization
 ///
 /// The `contains_refs` flag tracks whether the tuple contains any `Value::Ref` items.
-/// This allows `py_dec_ref_ids` to skip iteration when the tuple contains only
+/// This allows `drop_into` to skip iteration when the tuple contains only
 /// primitive values (ints, bools, None, etc.).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NamedTuple {
@@ -111,7 +111,7 @@ impl NamedTuple {
 
     /// Returns whether the tuple contains any heap references.
     ///
-    /// When false, `py_dec_ref_ids` can skip iteration.
+    /// When false, `drop_into` can skip iteration.
     #[inline]
     #[must_use]
     pub fn contains_refs(&self) -> bool {
@@ -205,17 +205,13 @@ impl PyTrait for NamedTuple {
     ///
     /// Called during garbage collection to decrement refcounts of nested values.
     /// When `ref-count-panic` is enabled, also marks all Values as Dereferenced.
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
         // Skip iteration if no refs - GC optimization for tuples of primitives
         if !self.contains_refs {
             return;
         }
-        for obj in &mut self.items {
-            if let Value::Ref(id) = obj {
-                stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
-                obj.dec_ref_forget();
-            }
+        for obj in self.items {
+            obj.drop_into(stack);
         }
     }
 

@@ -17,7 +17,7 @@ use crate::{
     asyncio::CallId,
     builtins::Builtins,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapId, HeapRef},
     intern::{BytesId, ExtFunctionId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
     modules::ModuleFunctions,
     resource::{
@@ -87,7 +87,7 @@ pub(crate) enum Value {
     ExternalFuture(CallId),
 
     // Heap-allocated values (stored in arena)
-    Ref(HeapId),
+    Ref(HeapRef),
 
     /// Sentinel value indicating this Value was properly cleaned up via `drop_with_heap`.
     /// Only exists when `ref-count-panic` feature is enabled. Used to verify reference counting
@@ -95,18 +95,6 @@ pub(crate) enum Value {
     /// Drop impl will panic.
     #[cfg(feature = "ref-count-panic")]
     Dereferenced,
-}
-
-/// Drop implementation that panics if a `Ref` variant is dropped without calling `drop_with_heap`.
-/// This helps catch reference counting bugs during development/testing.
-/// Only enabled when the `ref-count-panic` feature is active.
-#[cfg(feature = "ref-count-panic")]
-impl Drop for Value {
-    fn drop(&mut self) {
-        if let Self::Ref(id) = self {
-            panic!("Value::Ref({id:?}) dropped without calling drop_with_heap() - this is a reference counting bug");
-        }
-    }
 }
 
 impl From<bool> for Value {
@@ -132,7 +120,7 @@ impl PyTrait for Value {
             Self::Marker(m) => m.py_type(),
             Self::Property(_) => Type::Property,
             Self::ExternalFuture(_) => Type::Coroutine,
-            Self::Ref(id) => heap.get(*id).py_type(heap),
+            Self::Ref(id) => heap.get(id).py_type(heap),
             #[cfg(feature = "ref-count-panic")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
@@ -152,7 +140,7 @@ impl PyTrait for Value {
             // Count Unicode characters, not bytes, to match Python semantics
             Self::InternString(string_id) => Some(interns.get_str(*string_id).chars().count()),
             Self::InternBytes(bytes_id) => Some(interns.get_bytes(*bytes_id).len()),
-            Self::Ref(id) => heap.get(*id).py_len(heap, interns),
+            Self::Ref(id) => heap.get(id).py_len(heap, interns),
             _ => None,
         }
     }
@@ -180,7 +168,7 @@ impl PyTrait for Value {
 
             // Int == LongInt comparison
             (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     Ok(BigInt::from(*a) == *li.inner())
                 } else {
                     Ok(false)
@@ -188,7 +176,7 @@ impl PyTrait for Value {
             }
             // LongInt == Int comparison
             (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     Ok(*li.inner() == BigInt::from(*b))
                 } else {
                     Ok(false)
@@ -199,14 +187,14 @@ impl PyTrait for Value {
             (Self::InternString(s1), Self::InternString(s2)) => Ok(s1 == s2),
             // for strings we need to account for the fact they might be either interned or not
             (Self::InternString(string_id), Self::Ref(id2)) => {
-                if let HeapData::Str(s2) = heap.get(*id2) {
+                if let HeapData::Str(s2) = heap.get(id2) {
                     Ok(interns.get_str(*string_id) == s2.as_str())
                 } else {
                     Ok(false)
                 }
             }
             (Self::Ref(id1), Self::InternString(string_id)) => {
-                if let HeapData::Str(s1) = heap.get(*id1) {
+                if let HeapData::Str(s1) = heap.get(id1) {
                     Ok(s1.as_str() == interns.get_str(*string_id))
                 } else {
                     Ok(false)
@@ -220,14 +208,14 @@ impl PyTrait for Value {
             }
             // same for bytes
             (Self::InternBytes(bytes_id), Self::Ref(id2)) => {
-                if let HeapData::Bytes(b2) = heap.get(*id2) {
+                if let HeapData::Bytes(b2) = heap.get(id2) {
                     Ok(interns.get_bytes(*bytes_id) == b2.as_slice())
                 } else {
                     Ok(false)
                 }
             }
             (Self::Ref(id1), Self::InternBytes(bytes_id)) => {
-                if let HeapData::Bytes(b1) = heap.get(*id1) {
+                if let HeapData::Bytes(b1) = heap.get(id1) {
                     Ok(b1.as_slice() == interns.get_bytes(*bytes_id))
                 } else {
                     Ok(false)
@@ -239,7 +227,7 @@ impl PyTrait for Value {
                     return Ok(true);
                 }
                 // Need to use with_two for proper borrow management
-                heap.with_two(*id1, *id2, |heap, left, right| left.py_eq(right, heap, guard, interns))
+                heap.with_two(id1, id2, |heap, left, right| left.py_eq(right, heap, guard, interns))
             }
 
             // Builtins equality - just check the enums are equal
@@ -277,7 +265,7 @@ impl PyTrait for Value {
             (_, Self::Bool(s)) => self.py_cmp(&Self::Int(i64::from(*s)), heap, guard, interns),
             // Int vs LongInt comparison
             (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     Ok(BigInt::from(*a).partial_cmp(li.inner()))
                 } else {
                     Ok(None)
@@ -285,34 +273,32 @@ impl PyTrait for Value {
             }
             // LongInt vs Int comparison
             (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     Ok(li.inner().partial_cmp(&BigInt::from(*b)))
                 } else {
                     Ok(None)
                 }
             }
             // Ref vs Ref comparison: handles LongInt and Str
-            (Self::Ref(id1), Self::Ref(id2)) => {
-                Ok(heap.with_two(*id1, *id2, |_heap, left, right| match (left, right) {
-                    (HeapData::LongInt(a), HeapData::LongInt(b)) => a.inner().partial_cmp(b.inner()),
-                    (HeapData::Str(a), HeapData::Str(b)) => a.as_str().partial_cmp(b.as_str()),
-                    _ => None,
-                }))
-            }
+            (Self::Ref(id1), Self::Ref(id2)) => Ok(heap.with_two(id1, id2, |_heap, left, right| match (left, right) {
+                (HeapData::LongInt(a), HeapData::LongInt(b)) => a.inner().partial_cmp(b.inner()),
+                (HeapData::Str(a), HeapData::Str(b)) => a.as_str().partial_cmp(b.as_str()),
+                _ => None,
+            })),
             // Interned string comparisons
             (Self::InternString(s1), Self::InternString(s2)) => {
                 Ok(interns.get_str(*s1).partial_cmp(interns.get_str(*s2)))
             }
             // Cross-type string comparisons: interned vs heap-allocated
             (Self::InternString(s1), Self::Ref(id2)) => {
-                if let HeapData::Str(s2) = heap.get(*id2) {
+                if let HeapData::Str(s2) = heap.get(id2) {
                     Ok(interns.get_str(*s1).partial_cmp(s2.as_str()))
                 } else {
                     Ok(None)
                 }
             }
             (Self::Ref(id1), Self::InternString(s2)) => {
-                if let HeapData::Str(s1) = heap.get(*id1) {
+                if let HeapData::Str(s1) = heap.get(id1) {
                     Ok(s1.as_str().partial_cmp(interns.get_str(*s2)))
                 } else {
                     Ok(None)
@@ -325,12 +311,9 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        if let Self::Ref(id) = self {
-            stack.push(*id);
-            // Mark as Dereferenced to prevent Drop panic
-            #[cfg(feature = "ref-count-panic")]
-            self.dec_ref_forget();
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
+        if let Self::Ref(heap_ref) = self {
+            stack.push(heap_ref);
         }
     }
 
@@ -351,7 +334,7 @@ impl PyTrait for Value {
             Self::ExternalFuture(_) => true,                    // ExternalFutures are always truthy
             Self::InternString(string_id) => !interns.get_str(*string_id).is_empty(),
             Self::InternBytes(bytes_id) => !interns.get_bytes(*bytes_id).is_empty(),
-            Self::Ref(id) => heap.get(*id).py_bool(heap, interns),
+            Self::Ref(id) => heap.get(id).py_bool(heap, interns),
             #[cfg(feature = "ref-count-panic")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
@@ -392,10 +375,10 @@ impl PyTrait for Value {
             Self::Marker(m) => m.py_repr_fmt(f),
             Self::Property(p) => write!(f, "<property {p:?}>"),
             Self::ExternalFuture(call_id) => write!(f, "<coroutine external_future({})>", call_id.raw()),
-            Self::Ref(id) => {
-                if heap_ids.contains(id) {
+            Self::Ref(r) => {
+                if heap_ids.contains(&r.id()) {
                     // Cycle detected - write type-specific placeholder following Python semantics
-                    match heap.get(*id) {
+                    match heap.get(r) {
                         HeapData::List(_) => f.write_str("[...]"),
                         HeapData::Tuple(_) => f.write_str("(...)"),
                         HeapData::Dict(_) => f.write_str("{...}"),
@@ -403,9 +386,9 @@ impl PyTrait for Value {
                         _ => f.write_str("..."),
                     }
                 } else {
-                    heap_ids.insert(*id);
-                    let result = heap.get(*id).py_repr_fmt(f, heap, heap_ids, guard, interns);
-                    heap_ids.remove(id);
+                    heap_ids.insert(r.id());
+                    let result = heap.get(r).py_repr_fmt(f, heap, heap_ids, guard, interns);
+                    heap_ids.remove(&r.id());
                     result
                 }
             }
@@ -422,7 +405,7 @@ impl PyTrait for Value {
     ) -> Cow<'static, str> {
         match self {
             Self::InternString(string_id) => interns.get_str(*string_id).to_owned().into(),
-            Self::Ref(id) => heap.get(*id).py_str(heap, guard, interns),
+            Self::Ref(id) => heap.get(id).py_str(heap, guard, interns),
             _ => self.py_repr(heap, guard, interns),
         }
     }
@@ -446,7 +429,7 @@ impl PyTrait for Value {
             }
             // Int + LongInt
             (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     let result = LongInt::from(*a) + LongInt::new(li.inner().clone());
                     result.into_value(heap).map(Some)
                 } else {
@@ -455,7 +438,7 @@ impl PyTrait for Value {
             }
             // LongInt + Int
             (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     let result = LongInt::new(li.inner().clone()) + LongInt::from(*b);
                     result.into_value(heap).map(Some)
                 } else {
@@ -468,10 +451,10 @@ impl PyTrait for Value {
             (Self::Float(a), Self::Int(b)) => Ok(Some(Self::Float(a + *b as f64))),
             (Self::Ref(id1), Self::Ref(id2)) => {
                 // Check if both are LongInts
-                let is_longint1 = matches!(heap.get(*id1), HeapData::LongInt(_));
-                let is_longint2 = matches!(heap.get(*id2), HeapData::LongInt(_));
+                let is_longint1 = matches!(heap.get(id1), HeapData::LongInt(_));
+                let is_longint2 = matches!(heap.get(id2), HeapData::LongInt(_));
                 if is_longint1 && is_longint2 {
-                    heap.with_two(*id1, *id2, |heap, left, right| {
+                    heap.with_two(id1, id2, |heap, left, right| {
                         if let (HeapData::LongInt(a), HeapData::LongInt(b)) = (left, right) {
                             let result = LongInt::new(a.inner() + b.inner());
                             result.into_value(heap).map(Some)
@@ -480,7 +463,7 @@ impl PyTrait for Value {
                         }
                     })
                 } else {
-                    heap.with_two(*id1, *id2, |heap, left, right| left.py_add(right, heap, interns))
+                    heap.with_two(id1, id2, |heap, left, right| left.py_add(right, heap, interns))
                 }
             }
             (Self::InternString(s1), Self::InternString(s2)) => {
@@ -489,7 +472,7 @@ impl PyTrait for Value {
             }
             // for strings we need to account for the fact they might be either interned or not
             (Self::InternString(string_id), Self::Ref(id2)) => {
-                if let HeapData::Str(s2) = heap.get(*id2) {
+                if let HeapData::Str(s2) = heap.get(id2) {
                     let concat = format!("{}{}", interns.get_str(*string_id), s2.as_str());
                     Ok(Some(Self::Ref(heap.allocate(HeapData::Str(concat.into()))?)))
                 } else {
@@ -497,7 +480,7 @@ impl PyTrait for Value {
                 }
             }
             (Self::Ref(id1), Self::InternString(string_id)) => {
-                if let HeapData::Str(s1) = heap.get(*id1) {
+                if let HeapData::Str(s1) = heap.get(id1) {
                     let concat = format!("{}{}", s1.as_str(), interns.get_str(*string_id));
                     Ok(Some(Self::Ref(heap.allocate(HeapData::Str(concat.into()))?)))
                 } else {
@@ -514,7 +497,7 @@ impl PyTrait for Value {
                 Ok(Some(Self::Ref(heap.allocate(HeapData::Bytes(b.into()))?)))
             }
             (Self::InternBytes(bytes_id), Self::Ref(id2)) => {
-                if let HeapData::Bytes(b2) = heap.get(*id2) {
+                if let HeapData::Bytes(b2) = heap.get(id2) {
                     let bytes1 = interns.get_bytes(*bytes_id);
                     let mut b = Vec::with_capacity(bytes1.len() + b2.len());
                     b.extend_from_slice(bytes1);
@@ -525,7 +508,7 @@ impl PyTrait for Value {
                 }
             }
             (Self::Ref(id1), Self::InternBytes(bytes_id)) => {
-                if let HeapData::Bytes(b1) = heap.get(*id1) {
+                if let HeapData::Bytes(b1) = heap.get(id1) {
                     let bytes2 = interns.get_bytes(*bytes_id);
                     let mut b = Vec::with_capacity(b1.len() + bytes2.len());
                     b.extend_from_slice(b1);
@@ -557,7 +540,7 @@ impl PyTrait for Value {
             }
             // Int - LongInt
             (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     let result = LongInt::from(*a) - LongInt::new(li.inner().clone());
                     result.into_value(heap).map(Some)
                 } else {
@@ -566,7 +549,7 @@ impl PyTrait for Value {
             }
             // LongInt - Int
             (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     let result = LongInt::new(li.inner().clone()) - LongInt::from(*b);
                     result.into_value(heap).map(Some)
                 } else {
@@ -575,10 +558,10 @@ impl PyTrait for Value {
             }
             // LongInt - LongInt
             (Self::Ref(id1), Self::Ref(id2)) => {
-                let is_longint1 = matches!(heap.get(*id1), HeapData::LongInt(_));
-                let is_longint2 = matches!(heap.get(*id2), HeapData::LongInt(_));
+                let is_longint1 = matches!(heap.get(id1), HeapData::LongInt(_));
+                let is_longint2 = matches!(heap.get(id2), HeapData::LongInt(_));
                 if is_longint1 && is_longint2 {
-                    heap.with_two(*id1, *id2, |heap, left, right| {
+                    heap.with_two(id1, id2, |heap, left, right| {
                         if let (HeapData::LongInt(a), HeapData::LongInt(b)) = (left, right) {
                             let result = LongInt::new(a.inner() - b.inner());
                             result.into_value(heap).map(Some)
@@ -616,7 +599,7 @@ impl PyTrait for Value {
             // Int % LongInt
             (Self::Int(a), Self::Ref(id)) => {
                 // Clone to avoid borrow conflict with heap mutation
-                let b_clone = if let HeapData::LongInt(li) = heap.get(*id) {
+                let b_clone = if let HeapData::LongInt(li) = heap.get(id) {
                     if li.is_zero() {
                         return Err(ExcType::zero_division().into());
                     }
@@ -633,7 +616,7 @@ impl PyTrait for Value {
                     return Err(ExcType::zero_division().into());
                 }
                 // Clone to avoid borrow conflict with heap mutation
-                let a_clone = if let HeapData::LongInt(li) = heap.get(*id) {
+                let a_clone = if let HeapData::LongInt(li) = heap.get(id) {
                     li.inner().clone()
                 } else {
                     return Ok(None);
@@ -643,14 +626,14 @@ impl PyTrait for Value {
             }
             // LongInt % LongInt
             (Self::Ref(id1), Self::Ref(id2)) => {
-                let is_longint1 = matches!(heap.get(*id1), HeapData::LongInt(_));
-                let is_longint2 = matches!(heap.get(*id2), HeapData::LongInt(_));
+                let is_longint1 = matches!(heap.get(id1), HeapData::LongInt(_));
+                let is_longint2 = matches!(heap.get(id2), HeapData::LongInt(_));
                 if is_longint1 && is_longint2 {
                     // Check for zero division first
-                    if matches!(heap.get(*id2), HeapData::LongInt(li) if li.is_zero()) {
+                    if matches!(heap.get(id2), HeapData::LongInt(li) if li.is_zero()) {
                         return Err(ExcType::zero_division().into());
                     }
-                    Ok(heap.with_two(*id1, *id2, |heap, left, right| {
+                    Ok(heap.with_two(id1, id2, |heap, left, right| {
                         if let (HeapData::LongInt(a), HeapData::LongInt(b)) = (left, right) {
                             let bi = a.inner().mod_floor(b.inner());
                             LongInt::new(bi).into_value(heap).map(Some)
@@ -734,7 +717,7 @@ impl PyTrait for Value {
                 Ok(true)
             }
             (Self::InternString(string_id), Self::Ref(id2)) => {
-                let result = if let HeapData::Str(s2) = heap.get(*id2) {
+                let result = if let HeapData::Str(s2) = heap.get(id2) {
                     let concat = format!("{}{}", interns.get_str(*string_id), s2.as_str());
                     *self = Self::Ref(heap.allocate(HeapData::Str(concat.into()))?);
                     true
@@ -746,7 +729,7 @@ impl PyTrait for Value {
                 Ok(result)
             }
             (Self::Ref(id1), Self::InternString(string_id)) => {
-                if let HeapData::Str(s1) = heap.get_mut(*id1) {
+                if let HeapData::Str(s1) = heap.get_mut(id1) {
                     s1.as_string_mut().push_str(interns.get_str(*string_id));
                     Ok(true)
                 } else {
@@ -764,7 +747,7 @@ impl PyTrait for Value {
                 Ok(true)
             }
             (Self::InternBytes(bytes_id), Self::Ref(id2)) => {
-                let result = if let HeapData::Bytes(b2) = heap.get(*id2) {
+                let result = if let HeapData::Bytes(b2) = heap.get(id2) {
                     let bytes1 = interns.get_bytes(*bytes_id);
                     let mut b = Vec::with_capacity(bytes1.len() + b2.len());
                     b.extend_from_slice(bytes1);
@@ -779,7 +762,7 @@ impl PyTrait for Value {
                 Ok(result)
             }
             (Self::Ref(id1), Self::InternBytes(bytes_id)) => {
-                if let HeapData::Bytes(b1) = heap.get_mut(*id1) {
+                if let HeapData::Bytes(b1) = heap.get_mut(id1) {
                     b1.as_vec_mut().extend_from_slice(interns.get_bytes(*bytes_id));
                     Ok(true)
                 } else {
@@ -787,7 +770,7 @@ impl PyTrait for Value {
                 }
             }
             (Self::Ref(id), Self::Ref(_)) => {
-                heap.with_entry_mut(*id, |heap, data| data.py_iadd(other, heap, Some(*id), interns))
+                heap.with_entry_mut(id, |heap, data| data.py_iadd(other, heap, Some(id.id()), interns))
             }
             _ => {
                 // Drop other if it's a Ref (ensure proper refcounting for unsupported type combinations)
@@ -815,11 +798,11 @@ impl PyTrait for Value {
                 }
             }
             // Int * Ref (LongInt or sequence)
-            (Self::Int(a), Self::Ref(id)) => heap.mult_ref_by_i64(*id, *a),
+            (Self::Int(a), Self::Ref(id)) => heap.mult_ref_by_i64(id, *a),
             // Ref * Int (LongInt or sequence)
-            (Self::Ref(id), Self::Int(b)) => heap.mult_ref_by_i64(*id, *b),
+            (Self::Ref(id), Self::Int(b)) => heap.mult_ref_by_i64(id, *b),
             // Ref * Ref (LongInt * LongInt, sequence * LongInt, etc.)
-            (Self::Ref(id1), Self::Ref(id2)) => heap.mult_heap_values(*id1, *id2),
+            (Self::Ref(id1), Self::Ref(id2)) => heap.mult_heap_values(id1, id2),
             (Self::Float(a), Self::Float(b)) => Ok(Some(Self::Float(a * b))),
             (Self::Int(a), Self::Float(b)) => Ok(Some(Self::Float(*a as f64 * b))),
             (Self::Float(a), Self::Int(b)) => Ok(Some(Self::Float(a * *b as f64))),
@@ -866,7 +849,7 @@ impl PyTrait for Value {
 
             // String repetition with LongInt: "ab" * bigint or bigint * "ab"
             (Self::InternString(s), Self::Ref(id)) | (Self::Ref(id), Self::InternString(s)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     let count = longint_to_repeat_count(li)?;
                     let str_ref = interns.get_str(*s);
                     check_repeat_size(str_ref.len(), count, heap.tracker())?;
@@ -879,7 +862,7 @@ impl PyTrait for Value {
 
             // Bytes repetition with LongInt: b"ab" * bigint or bigint * b"ab"
             (Self::InternBytes(b), Self::Ref(id)) | (Self::Ref(id), Self::InternBytes(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     let count = longint_to_repeat_count(li)?;
                     let bytes_ref = interns.get_bytes(*b);
                     check_repeat_size(bytes_ref.len(), count, heap.tracker())?;
@@ -911,7 +894,7 @@ impl PyTrait for Value {
             }
             // Int / LongInt
             (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     if li.is_zero() {
                         Err(ExcType::zero_division().into())
                     } else {
@@ -926,7 +909,7 @@ impl PyTrait for Value {
             }
             // LongInt / Int
             (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     if *b == 0 {
                         Err(ExcType::zero_division().into())
                     } else {
@@ -941,15 +924,15 @@ impl PyTrait for Value {
             }
             // LongInt / LongInt or LongInt / Float or Float / LongInt
             (Self::Ref(id1), Self::Ref(id2)) => {
-                let is_longint1 = matches!(heap.get(*id1), HeapData::LongInt(_));
-                let is_longint2 = matches!(heap.get(*id2), HeapData::LongInt(_));
+                let is_longint1 = matches!(heap.get(id1), HeapData::LongInt(_));
+                let is_longint2 = matches!(heap.get(id2), HeapData::LongInt(_));
                 if is_longint1 && is_longint2 {
                     // Check for zero division first
-                    if matches!(heap.get(*id2), HeapData::LongInt(li) if li.is_zero()) {
+                    if matches!(heap.get(id2), HeapData::LongInt(li) if li.is_zero()) {
                         return Err(ExcType::zero_division().into());
                     }
                     Ok(
-                        heap.with_two(*id1, *id2, |_heap, left, right| -> RunResult<Option<Self>> {
+                        heap.with_two(id1, id2, |_heap, left, right| -> RunResult<Option<Self>> {
                             if let (HeapData::LongInt(a), HeapData::LongInt(b)) = (left, right) {
                                 let a_f64 = a.to_f64().unwrap_or(f64::INFINITY);
                                 let b_f64 = b.to_f64().unwrap_or(f64::INFINITY);
@@ -965,7 +948,7 @@ impl PyTrait for Value {
             }
             // LongInt / Float
             (Self::Ref(id), Self::Float(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     if *b == 0.0 {
                         Err(ExcType::zero_division().into())
                     } else {
@@ -978,7 +961,7 @@ impl PyTrait for Value {
             }
             // Float / LongInt
             (Self::Float(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     if li.is_zero() {
                         Err(ExcType::zero_division().into())
                     } else {
@@ -1049,9 +1032,9 @@ impl PyTrait for Value {
             _ => {
                 // Check for Path / (str or Path) - path concatenation
                 if let Self::Ref(id) = self
-                    && matches!(heap.get(*id), HeapData::Path(_))
+                    && matches!(heap.get(id), HeapData::Path(_))
                 {
-                    return path::path_div(*id, other, heap, interns);
+                    return path::path_div(id, other, heap, interns);
                 }
                 Ok(None)
             }
@@ -1075,7 +1058,7 @@ impl PyTrait for Value {
             }
             // Int // LongInt
             (Self::Int(a), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     if li.is_zero() {
                         Err(ExcType::zero_division().into())
                     } else {
@@ -1088,7 +1071,7 @@ impl PyTrait for Value {
             }
             // LongInt // Int
             (Self::Ref(id), Self::Int(b)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     if *b == 0 {
                         Err(ExcType::zero_division().into())
                     } else {
@@ -1101,14 +1084,14 @@ impl PyTrait for Value {
             }
             // LongInt // LongInt
             (Self::Ref(id1), Self::Ref(id2)) => {
-                let is_longint1 = matches!(heap.get(*id1), HeapData::LongInt(_));
-                let is_longint2 = matches!(heap.get(*id2), HeapData::LongInt(_));
+                let is_longint1 = matches!(heap.get(id1), HeapData::LongInt(_));
+                let is_longint2 = matches!(heap.get(id2), HeapData::LongInt(_));
                 if is_longint1 && is_longint2 {
                     // Check for zero division first
-                    if matches!(heap.get(*id2), HeapData::LongInt(li) if li.is_zero()) {
+                    if matches!(heap.get(id2), HeapData::LongInt(li) if li.is_zero()) {
                         return Err(ExcType::zero_division().into());
                     }
-                    Ok(heap.with_two(*id1, *id2, |heap, left, right| {
+                    Ok(heap.with_two(id1, id2, |heap, left, right| {
                         if let (HeapData::LongInt(a), HeapData::LongInt(b)) = (left, right) {
                             let bi = a.inner().div_floor(b.inner());
                             LongInt::new(bi).into_value(heap).map(Some)
@@ -1227,7 +1210,7 @@ impl PyTrait for Value {
             }
             // LongInt ** Int
             (Self::Ref(id), Self::Int(exp)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     if li.is_zero() && *exp < 0 {
                         Err(ExcType::zero_negative_power())
                     } else if *exp >= 0 {
@@ -1265,7 +1248,7 @@ impl PyTrait for Value {
             }
             // Int ** LongInt (only small positive exponents make sense)
             (Self::Int(base), Self::Ref(id)) => {
-                if let HeapData::LongInt(li) = heap.get(*id) {
+                if let HeapData::LongInt(li) = heap.get(id) {
                     if *base == 0 && li.is_negative() {
                         Err(ExcType::zero_negative_power())
                     } else if !li.is_negative() {
@@ -1397,15 +1380,14 @@ impl PyTrait for Value {
 
     fn py_getitem(&self, key: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Self> {
         match self {
-            Self::Ref(id) => {
+            Self::Ref(r) => {
                 // Need to take entry out to allow mutable heap access
-                let id = *id;
-                heap.with_entry_mut(id, |heap, data| data.py_getitem(key, heap, interns))
+                heap.with_entry_mut(r, |heap, data| data.py_getitem(key, heap, interns))
             }
             Self::InternString(string_id) => {
                 // Check for slice first
                 if let Self::Ref(key_id) = key
-                    && let HeapData::Slice(slice_obj) = heap.get(*key_id)
+                    && let HeapData::Slice(slice_obj) = heap.get(key_id)
                 {
                     let s = interns.get_str(*string_id);
                     let char_count = s.chars().count();
@@ -1431,7 +1413,7 @@ impl PyTrait for Value {
             Self::InternBytes(bytes_id) => {
                 // Check for slice first
                 if let Self::Ref(key_id) = key
-                    && let HeapData::Slice(slice_obj) = heap.get(*key_id)
+                    && let HeapData::Slice(slice_obj) = heap.get(key_id)
                 {
                     let bytes = interns.get_bytes(*bytes_id);
                     let (start, stop, step) = slice_obj
@@ -1465,10 +1447,7 @@ impl PyTrait for Value {
         interns: &Interns,
     ) -> RunResult<()> {
         match self {
-            Self::Ref(id) => {
-                let id = *id;
-                heap.with_entry_mut(id, |heap, data| data.py_setitem(key, value, heap, interns))
-            }
+            Self::Ref(r) => heap.with_entry_mut(r, |heap, data| data.py_setitem(key, value, heap, interns)),
             _ => Err(ExcType::type_error(format!(
                 "'{}' object does not support item assignment",
                 self.py_type(heap)
@@ -1509,7 +1488,7 @@ impl Value {
                 INTERN_LONG_INT_ID_TAG | (long_int_id.index() & INTERN_LONG_INT_ID_MASK)
             }
             // Already heap-allocated (includes Range and Exception), return id within a dedicated tag range
-            Self::Ref(id) => heap_tagged_id(*id),
+            Self::Ref(r) => heap_tagged_id(r.id()),
             // Value-based IDs for immediate types (no heap allocation!)
             Self::Int(v) => int_value_id(*v),
             Self::Float(v) => float_value_id(*v),
@@ -1531,7 +1510,7 @@ impl Value {
     /// Returns the Ref ID if this value is a reference, otherwise returns None.
     pub fn ref_id(&self) -> Option<HeapId> {
         match self {
-            Self::Ref(id) => Some(*id),
+            Self::Ref(r) => Some(r.id()),
             _ => None,
         }
     }
@@ -1541,7 +1520,7 @@ impl Value {
     /// Used for error messages in `from module import name` when the name doesn't exist.
     pub fn module_name(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> String {
         match self {
-            Self::Ref(id) => match heap.get(*id) {
+            Self::Ref(id) => match heap.get(id) {
                 HeapData::Module(module) => interns.get_str(module.name()).to_string(),
                 _ => "<unknown>".to_string(),
             },
@@ -1591,7 +1570,7 @@ impl Value {
                 return Some(hasher.finish());
             }
             // For heap-allocated values (includes Range and Exception), compute hash lazily and cache it
-            Self::Ref(id) => return heap.get_or_compute_hash(*id, interns),
+            Self::Ref(id) => return heap.get_or_compute_hash(id, interns),
             _ => {}
         }
 
@@ -1644,7 +1623,7 @@ impl Value {
                 // Use with_entry_mut to temporarily take ownership of the container.
                 // This allows iterating over container elements while calling py_eq
                 // (which needs &mut Heap for comparing nested heap values).
-                heap.with_entry_mut(*heap_id, |heap, data| match data {
+                heap.with_entry_mut(heap_id, |heap, data| match data {
                     HeapData::List(list) => {
                         let mut guard = DepthGuard::default();
                         for el in list.as_slice() {
@@ -1727,10 +1706,10 @@ impl Value {
         interns: &Interns,
     ) -> RunResult<AttrCallResult> {
         match self {
-            Self::Ref(heap_id) => {
+            Self::Ref(r) => {
                 // Use with_entry_mut to get access to both data and heap without borrow conflicts.
                 // This allows py_getattr to allocate (for computed attributes) while we hold the data.
-                let opt_result = heap.with_entry_mut(*heap_id, |heap, data| data.py_getattr(attr, heap, interns))?;
+                let opt_result = heap.with_entry_mut(r, |heap, data| data.py_getattr(attr, heap, interns))?;
                 if let Some(call_result) = opt_result {
                     return Ok(call_result);
                 }
@@ -1769,13 +1748,12 @@ impl Value {
     ) -> RunResult<()> {
         let attr_name = interns.get_str(name_id);
 
-        if let Self::Ref(heap_id) = self {
-            let heap_id = *heap_id;
-            let is_dataclass = matches!(heap.get(heap_id), HeapData::Dataclass(_));
+        if let Self::Ref(r) = self {
+            let is_dataclass = matches!(heap.get(r), HeapData::Dataclass(_));
 
             if is_dataclass {
                 let name_value = Self::InternString(name_id);
-                heap.with_entry_mut(heap_id, |heap, data| {
+                heap.with_entry_mut(r, |heap, data| {
                     if let HeapData::Dataclass(dc) = data {
                         match dc.set_attr(name_value, value, heap, interns) {
                             Ok(old_value) => {
@@ -1791,7 +1769,7 @@ impl Value {
                     }
                 })
             } else {
-                let type_name = heap.get(heap_id).py_type(heap);
+                let type_name = heap.get(r).py_type(heap);
                 value.drop_with_heap(heap);
                 Err(ExcType::attribute_error_no_setattr(type_name, attr_name))
             }
@@ -1815,7 +1793,7 @@ impl Value {
         match self {
             Self::Int(i) => Ok(*i),
             Self::Ref(heap_id) => {
-                if let HeapData::LongInt(li) = heap.get(*heap_id) {
+                if let HeapData::LongInt(li) = heap.get(heap_id) {
                     li.to_i64().ok_or_else(ExcType::overflow_shift_count)
                 } else {
                     let msg = format!("'{}' object cannot be interpreted as an integer", self.py_type(heap));
@@ -1844,7 +1822,7 @@ impl Value {
             Self::Int(i) => Ok(*i),
             Self::Bool(b) => Ok(i64::from(*b)),
             Self::Ref(heap_id) => {
-                if let HeapData::LongInt(li) = heap.get(*heap_id) {
+                if let HeapData::LongInt(li) = heap.get(heap_id) {
                     li.to_i64().ok_or_else(ExcType::index_error_int_too_large)
                 } else {
                     Err(ExcType::type_error_indices(container_type, self.py_type(heap)))
@@ -1946,10 +1924,7 @@ impl Value {
     #[must_use]
     pub fn clone_with_heap(&self, heap: &Heap<impl ResourceTracker>) -> Self {
         match self {
-            Self::Ref(id) => {
-                heap.inc_ref(*id);
-                Self::Ref(*id)
-            }
+            Self::Ref(r) => Self::Ref(r.clone_with_heap(heap)),
             // Immediate values can be copied without heap interaction
             other => other.clone_immediate(),
         }
@@ -1968,8 +1943,8 @@ impl Value {
     #[cfg(not(feature = "ref-count-panic"))]
     #[inline]
     pub fn drop_with_heap(self, heap: &mut Heap<impl ResourceTracker>) {
-        if let Self::Ref(id) = self {
-            heap.dec_ref(id);
+        if let Self::Ref(r) = self {
+            heap.dec_ref(r);
         }
     }
     /// With `ref-count-panic` enabled, `Ref` variants are replaced with `Dereferenced` and
@@ -1978,9 +1953,9 @@ impl Value {
     #[cfg(feature = "ref-count-panic")]
     pub fn drop_with_heap(mut self, heap: &mut Heap<impl ResourceTracker>) {
         let old = std::mem::replace(&mut self, Self::Dereferenced);
-        if let Self::Ref(id) = &old {
-            heap.dec_ref(*id);
-            std::mem::forget(old);
+        if let Self::Ref(r) = old {
+            heap.dec_ref(r);
+            std::mem::forget(self);
         }
     }
 
@@ -2014,7 +1989,7 @@ impl Value {
 
     /// Mark as Dereferenced to prevent Drop panic
     ///
-    /// This should be called from `py_dec_ref_ids` methods only
+    /// This should be called from `drop_into` methods only
     #[cfg(feature = "ref-count-panic")]
     pub fn dec_ref_forget(&mut self) {
         let old = std::mem::replace(self, Self::Dereferenced);
@@ -2028,7 +2003,7 @@ impl Value {
     pub fn as_either_str(&self, heap: &Heap<impl ResourceTracker>) -> Option<EitherStr> {
         match self {
             Self::InternString(id) => Some(EitherStr::Interned(*id)),
-            Self::Ref(heap_id) => match heap.get(*heap_id) {
+            Self::Ref(heap_id) => match heap.get(heap_id) {
                 HeapData::Str(s) => Some(EitherStr::Heap(s.as_str().to_owned())),
                 _ => None,
             },
@@ -2040,7 +2015,7 @@ impl Value {
     pub fn is_str(&self, heap: &Heap<impl ResourceTracker>) -> bool {
         match self {
             Self::InternString(_) => true,
-            Self::Ref(heap_id) => matches!(heap.get(*heap_id), HeapData::Str(_)),
+            Self::Ref(heap_id) => matches!(heap.get(heap_id), HeapData::Str(_)),
             _ => false,
         }
     }
@@ -2413,7 +2388,7 @@ fn extract_bigint(value: &Value, heap: &Heap<impl ResourceTracker>) -> Option<Bi
         Value::Int(i) => Some(BigInt::from(*i)),
         Value::Bool(b) => Some(BigInt::from(i64::from(*b))),
         Value::Ref(id) => {
-            if let HeapData::LongInt(li) = heap.get(*id) {
+            if let HeapData::LongInt(li) = heap.get(id) {
                 Some(li.inner().clone())
             } else {
                 None
@@ -2439,7 +2414,7 @@ fn str_contains(
             Ok(container_str.contains(item_str))
         }
         Value::Ref(item_heap_id) => {
-            if let HeapData::Str(item_str) = heap.get(*item_heap_id) {
+            if let HeapData::Str(item_str) = heap.get(item_heap_id) {
                 Ok(container_str.contains(item_str.as_str()))
             } else {
                 Err(ExcType::type_error("'in <str>' requires string as left operand"))
@@ -2501,7 +2476,7 @@ mod tests {
     ///
     /// This bypasses `LongInt::into_value()` which would demote i64-fitting values.
     /// Used to test defensive code paths that handle LongInt-as-index scenarios.
-    fn create_heap_with_longint(value: BigInt) -> (Heap<NoLimitTracker>, HeapId) {
+    fn create_heap_with_longint(value: BigInt) -> (Heap<NoLimitTracker>, HeapRef) {
         let mut heap = Heap::new(16, NoLimitTracker);
         let long_int = LongInt::new(value);
         let heap_id = heap.allocate(HeapData::LongInt(long_int)).unwrap();

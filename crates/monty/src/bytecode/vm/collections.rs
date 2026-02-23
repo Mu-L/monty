@@ -140,7 +140,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         // Extend the list
         if let Value::Ref(id) = list_ref
-            && let HeapData::List(list) = this.heap.get_mut(*id)
+            && let HeapData::List(list) = this.heap.get_mut(id)
         {
             // Update contains_refs before extending
             if has_refs {
@@ -210,7 +210,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         // Check that mapping is a dict (Ref pointing to Dict) and clone key-value pairs
         let copied_items: Vec<(Value, Value)> = if let Value::Ref(id) = mapping {
-            if let HeapData::Dict(dict) = this.heap.get(*id) {
+            if let HeapData::Dict(dict) = this.heap.get(id) {
                 dict.iter()
                     .map(|(k, v)| (k.clone_with_heap(this.heap), v.clone_with_heap(this.heap)))
                     .collect()
@@ -224,9 +224,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         };
 
         // Merge into the dict, validating string keys
-        let dict_id = if let Value::Ref(id) = dict_ref {
-            *id
-        } else {
+        let Value::Ref(dict_id) = dict_ref else {
             return Err(RunError::internal("DictMerge: expected dict ref"));
         };
 
@@ -234,7 +232,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             // Validate key is a string (InternString or heap-allocated Str)
             let is_string = match &key {
                 Value::InternString(_) => true,
-                Value::Ref(id) => matches!(this.heap.get(*id), HeapData::Str(_)),
+                Value::Ref(id) => matches!(this.heap.get(id), HeapData::Str(_)),
                 _ => false,
             };
             if !is_string {
@@ -247,7 +245,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             let key_str = match &key {
                 Value::InternString(id) => this.interns.get_str(*id).to_string(),
                 Value::Ref(id) => {
-                    if let HeapData::Str(s) = this.heap.get(*id) {
+                    if let HeapData::Str(s) = this.heap.get(id) {
                         s.as_str().to_string()
                     } else {
                         "<unknown>".to_string()
@@ -293,7 +291,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let list_pos = stack_len - 1 - depth;
 
         // Get the list reference
-        let Value::Ref(list_id) = self.stack[list_pos] else {
+        let Value::Ref(list_id) = &self.stack[list_pos] else {
             value.drop_with_heap(self.heap);
             return Err(RunError::internal("ListAppend: expected list ref on stack"));
         };
@@ -321,7 +319,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let set_pos = stack_len - 1 - depth;
 
         // Get the set reference
-        let Value::Ref(set_id) = self.stack[set_pos] else {
+        let Value::Ref(set_id) = &self.stack[set_pos] else {
             value.drop_with_heap(self.heap);
             return Err(RunError::internal("SetAdd: expected set ref on stack"));
         };
@@ -351,7 +349,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let dict_pos = stack_len - 1 - depth;
 
         // Get the dict reference
-        let Value::Ref(dict_id) = self.stack[dict_pos] else {
+        let Value::Ref(dict_id) = &self.stack[dict_pos] else {
             key.drop_with_heap(self.heap);
             value.drop_with_heap(self.heap);
             return Err(RunError::internal("DictSetItem: expected dict ref on stack"));
@@ -413,7 +411,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             }
             // Heap-allocated sequences
             Value::Ref(heap_id) => {
-                match this.heap.get(*heap_id) {
+                match this.heap.get(&heap_id) {
                     HeapData::List(list) => {
                         let list_len = list.len();
                         if list_len != count {
@@ -496,7 +494,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 items
             }
             Value::Ref(heap_id) => {
-                match this.heap.get(*heap_id) {
+                match this.heap.get(&heap_id) {
                     HeapData::List(list) => {
                         let list_len = list.len();
                         if list_len < min_items {

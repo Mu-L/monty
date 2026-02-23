@@ -4,7 +4,7 @@ use crate::{
     args::ArgValues,
     bytecode::VM,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapGuard, HeapId},
+    heap::{Heap, HeapGuard, HeapId, HeapRef},
     intern::{Interns, StringId},
     resource::ResourceTracker,
     types::{AttrCallResult, Dict, PyTrait},
@@ -93,8 +93,8 @@ impl Module {
     }
 
     /// Collects child HeapIds for reference counting.
-    pub fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        self.attrs.py_dec_ref_ids(stack);
+    pub fn drop_into(self, stack: &mut Vec<HeapRef>) {
+        self.attrs.drop_into(stack);
     }
 
     /// Gets an attribute by string ID for the `py_getattr` trait method.

@@ -17,7 +17,7 @@ use crate::{
     args::ArgValues,
     bytecode::VM,
     exception_private::{ExcType, RunResult, SimpleException},
-    heap::{Heap, HeapId},
+    heap::{Heap, HeapId, HeapRef},
     intern::{ExtFunctionId, Interns},
     os::OsFunction,
     resource::{DepthGuard, ResourceTracker},
@@ -149,7 +149,7 @@ pub trait PyTrait {
     /// When the `ref-count-panic` feature is enabled, this method also marks all
     /// contained `Value`s as `Dereferenced` to prevent Drop panics. This
     /// co-locates the cleanup logic with the reference collection logic.
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>);
+    fn drop_into(self, stack: &mut Vec<HeapRef>);
 
     /// Returns the truthiness of the value following Python semantics.
     ///

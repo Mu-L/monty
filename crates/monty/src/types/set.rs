@@ -8,7 +8,7 @@ use crate::{
     args::ArgValues,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapId, HeapRef},
     intern::{Interns, StaticStrings},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::Type,
@@ -257,14 +257,10 @@ impl SetStorage {
         self.entries.get(index).map(|e| &e.value)
     }
 
-    /// Collects heap IDs for reference counting cleanup.
-    fn collect_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        for entry in &mut self.entries {
-            if let Value::Ref(id) = &entry.value {
-                stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
-                entry.value.dec_ref_forget();
-            }
+    /// Collects owned `HeapRef`s from set entries for reference counting cleanup.
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
+        for entry in self.entries {
+            entry.value.drop_into(stack);
         }
     }
 
@@ -625,8 +621,8 @@ impl PyTrait for Set {
         self.0.eq(&other.0, heap, guard, interns)
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        self.0.collect_dec_ref_ids(stack);
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
+        self.0.drop_into(stack);
     }
 
     fn py_bool(&self, _heap: &Heap<impl ResourceTracker>, _interns: &Interns) -> bool {
@@ -1120,8 +1116,8 @@ impl PyTrait for FrozenSet {
         self.0.eq(&other.0, heap, guard, interns)
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        self.0.collect_dec_ref_ids(stack);
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
+        self.0.drop_into(stack);
     }
 
     fn py_bool(&self, _heap: &Heap<impl ResourceTracker>, _interns: &Interns) -> bool {

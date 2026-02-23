@@ -11,7 +11,7 @@ use crate::{
     args::ArgValues,
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapId, HeapRef},
     intern::{Interns, StaticStrings},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::{AttrCallResult, PyTrait, Type},
@@ -222,7 +222,7 @@ impl PyTrait for Slice {
         f.write_char(')')
     }
 
-    fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
+    fn drop_into(self, _stack: &mut Vec<HeapRef>) {
         // Slice doesn't contain heap references, nothing to do
     }
 

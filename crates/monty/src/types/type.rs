@@ -227,7 +227,7 @@ impl Type {
                     Value::InternString(string_id) => parse_int_from_str(interns.get_str(*string_id), heap),
                     Value::Ref(heap_id) => {
                         // Clone data to release the borrow on heap before mutation
-                        match heap.get(*heap_id) {
+                        match heap.get(heap_id) {
                             HeapData::Str(s) => {
                                 let s = s.to_string();
                                 parse_int_from_str(&s, heap)
@@ -251,7 +251,7 @@ impl Type {
                     Value::InternString(string_id) => {
                         Ok(Value::Float(parse_f64_from_str(interns.get_str(*string_id))?))
                     }
-                    Value::Ref(heap_id) => match heap.get(*heap_id) {
+                    Value::Ref(r) => match heap.get(r) {
                         HeapData::Str(s) => Ok(Value::Float(parse_f64_from_str(s.as_str())?)),
                         _ => Err(ExcType::type_error_float_conversion(v.py_type(heap))),
                     },

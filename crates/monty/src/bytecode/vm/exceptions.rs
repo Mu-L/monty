@@ -74,7 +74,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let simple_exc = match exc_value {
             // Exception instance on heap
             Value::Ref(heap_id) => {
-                if let HeapData::Exception(exc) = this.heap.get(*heap_id) {
+                if let HeapData::Exception(exc) = this.heap.get_by_id(heap_id) {
                     // Clone the exception (guard handles cleanup at scope exit)
                     exc.clone()
                 } else {
@@ -278,7 +278,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             }
             // Tuple of exception types
             Value::Ref(id) => {
-                if let HeapData::Tuple(tuple) = self.heap.get(*id) {
+                if let HeapData::Tuple(tuple) = self.heap.get(id) {
                     for v in tuple.as_slice() {
                         if self.check_exc_match_inner(exc_type_enum, v)? {
                             return Ok(true);

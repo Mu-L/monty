@@ -34,8 +34,8 @@ pub fn builtin_abs(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> Ru
         }
         Value::Float(f) => Ok(Value::Float(f.abs())),
         Value::Bool(b) => Ok(Value::Int(i64::from(*b))),
-        Value::Ref(id) => {
-            if let HeapData::LongInt(li) = heap.get(*id) {
+        Value::Ref(r) => {
+            if let HeapData::LongInt(li) = heap.get(r) {
                 Ok(li.abs().into_value(heap)?)
             } else {
                 Err(SimpleException::new_msg(

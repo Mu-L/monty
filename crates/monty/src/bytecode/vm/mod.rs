@@ -1145,13 +1145,13 @@ impl<'a, 'p, T: ResourceTracker> VM<'a, 'p, T> {
                 Opcode::ForIter => {
                     let offset = fetch_i16!(cached_frame);
                     // Peek at the iterator on TOS and extract heap_id
-                    let Value::Ref(heap_id) = *self.peek() else {
+                    let Value::Ref(iter_ref) = self.peek() else {
                         return Err(RunError::internal("ForIter: expected iterator ref on stack"));
                     };
 
                     // Use advance_iterator which avoids std::mem::replace overhead
                     // by using a two-phase approach: read state, get value, update index
-                    match advance_on_heap(self.heap, heap_id, self.interns) {
+                    match advance_on_heap(self.heap, iter_ref, self.interns) {
                         Ok(Some(value)) => self.push(value),
                         Ok(None) => {
                             // Iterator exhausted - pop it and jump to end

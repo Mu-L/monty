@@ -39,6 +39,65 @@ impl HeapId {
     }
 }
 
+/// A non-Copy handle to a heap entry, representing an owned strong reference.
+///
+/// `HeapRef` wraps a `HeapId` but is deliberately non-Copy and non-Clone.
+/// This prevents accidental aliasing of owned references — to create a second
+/// `HeapRef` to the same object, you must explicitly call `clone_with_heap()`
+/// which increments the reference count.
+///
+/// Use `id()` to get the underlying `HeapId` for read-only heap lookups.
+#[derive(Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub(crate) struct HeapRef(HeapId);
+
+impl HeapRef {
+    /// Returns the underlying `HeapId` for heap lookups.
+    ///
+    /// This does not affect reference counts — it's just an accessor
+    /// for the identity of the referenced heap object.
+    #[inline]
+    pub fn id(&self) -> HeapId {
+        self.0
+    }
+
+    /// Creates a new `HeapRef` by incrementing the reference count for the given ID.
+    ///
+    /// This is the proper way to create a second reference to an existing heap object.
+    #[inline]
+    pub(crate) fn clone_with_heap(&self, heap: &Heap<impl ResourceTracker>) -> Self {
+        heap.inc_ref(self)
+    }
+
+    /// Creates a duplicate `HeapRef` without incrementing the reference count.
+    ///
+    /// Used by the two-phase clone pattern (`copy_for_extend` + separate `inc_ref`)
+    /// where heap access is not available at copy time. The caller **must** call
+    /// `heap.inc_ref()` on the returned `HeapRef` before it can be independently
+    /// dropped, otherwise refcounts will be incorrect.
+    #[inline]
+    pub(crate) fn duplicate_uncounted(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl DropWithHeap for HeapRef {
+    fn drop_with_heap<T: ResourceTracker>(self, heap: &mut Heap<T>) {
+        heap.dec_ref(self);
+    }
+}
+
+/// Drop implementation that panics if a `Ref` variant is dropped without calling `drop_with_heap`.
+/// This helps catch reference counting bugs during development/testing.
+/// Only enabled when the `ref-count-panic` feature is active.
+#[cfg(feature = "ref-count-panic")]
+impl Drop for HeapRef {
+    fn drop(&mut self) {
+        panic!("{self:?} dropped without calling drop_with_heap() - this is a reference counting bug");
+    }
+}
+
 /// The empty tuple is a singleton which is allocated at startup.
 const EMPTY_TUPLE_ID: HeapId = HeapId(0);
 
@@ -500,52 +559,52 @@ impl PyTrait for HeapData {
         }
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
         match self {
-            Self::Str(s) => s.py_dec_ref_ids(stack),
-            Self::Bytes(b) => b.py_dec_ref_ids(stack),
-            Self::List(l) => l.py_dec_ref_ids(stack),
-            Self::Tuple(t) => t.py_dec_ref_ids(stack),
-            Self::NamedTuple(nt) => nt.py_dec_ref_ids(stack),
-            Self::Dict(d) => d.py_dec_ref_ids(stack),
-            Self::Set(s) => s.py_dec_ref_ids(stack),
-            Self::FrozenSet(fs) => fs.py_dec_ref_ids(stack),
-            Self::Closure(closure) => {
-                // Decrement ref count for captured cells
-                stack.extend(closure.cells.iter().copied());
-                // Decrement ref count for default values that are heap references
-                for default in &mut closure.defaults {
-                    default.py_dec_ref_ids(stack);
+            Self::Str(s) => s.drop_into(stack),
+            Self::Bytes(b) => b.drop_into(stack),
+            Self::List(l) => l.drop_into(stack),
+            Self::Tuple(t) => t.drop_into(stack),
+            Self::NamedTuple(nt) => nt.drop_into(stack),
+            Self::Dict(d) => d.drop_into(stack),
+            Self::Set(s) => s.drop_into(stack),
+            Self::FrozenSet(fs) => fs.drop_into(stack),
+            Self::Closure(c) => {
+                // Transfer ownership of captured cell HeapIds as HeapRefs
+                stack.extend(c.cells.into_iter().map(HeapRef));
+                // Drop default values that are heap references
+                for default in c.defaults {
+                    default.drop_into(stack);
                 }
             }
             Self::FunctionDefaults(fd) => {
-                // Decrement ref count for default values that are heap references
-                for default in &mut fd.defaults {
-                    default.py_dec_ref_ids(stack);
+                // Drop default values that are heap references
+                for default in fd.defaults {
+                    default.drop_into(stack);
                 }
             }
-            Self::Cell(cell) => cell.0.py_dec_ref_ids(stack),
-            Self::Dataclass(dc) => dc.py_dec_ref_ids(stack),
-            Self::Iter(iter) => iter.py_dec_ref_ids(stack),
-            Self::Module(m) => m.py_dec_ref_ids(stack),
+            Self::Cell(c) => c.0.drop_into(stack),
+            Self::Dataclass(dc) => dc.drop_into(stack),
+            Self::Iter(iter) => iter.drop_into(stack),
+            Self::Module(m) => m.drop_into(stack),
             Self::Coroutine(coro) => {
-                // Decrement ref count for frame cells
-                stack.extend(coro.frame_cells.iter().copied());
-                // Decrement ref count for namespace values that are heap references
-                for value in &mut coro.namespace {
-                    value.py_dec_ref_ids(stack);
+                // Transfer ownership of frame cell HeapIds as HeapRefs
+                stack.extend(coro.frame_cells.into_iter().map(HeapRef));
+                // Drop namespace values that are heap references
+                for value in coro.namespace {
+                    value.drop_into(stack);
                 }
             }
             Self::GatherFuture(gather) => {
-                // Decrement ref count for coroutine HeapIds
-                for item in &gather.items {
+                // Transfer ownership of coroutine HeapIds as HeapRefs
+                for item in gather.items {
                     if let GatherItem::Coroutine(id) = item {
-                        stack.push(*id);
+                        stack.push(HeapRef(id));
                     }
                 }
-                // Decrement ref count for result values that are heap references
-                for result in gather.results.iter_mut().flatten() {
-                    result.py_dec_ref_ids(stack);
+                // Drop result values that are heap references
+                for result in gather.results.into_iter().flatten() {
+                    result.drop_into(stack);
                 }
             }
             // Range, Slice, Exception, LongInt, and Path have no nested heap references
@@ -1004,7 +1063,7 @@ impl<T: ResourceTracker> Heap<T> {
         let empty_tuple = this
             .allocate(HeapData::Tuple(Tuple::default()))
             .expect("Failed to allocate empty tuple singleton");
-        debug_assert_eq!(empty_tuple, EMPTY_TUPLE_ID);
+        debug_assert_eq!(empty_tuple.0, EMPTY_TUPLE_ID);
         this
     }
 
@@ -1066,7 +1125,7 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// When allocating a container that contains heap references, marks potential
     /// cycles to enable garbage collection.
-    pub fn allocate(&mut self, data: HeapData) -> Result<HeapId, ResourceError> {
+    pub fn allocate(&mut self, data: HeapData) -> Result<HeapRef, ResourceError> {
         self.tracker.on_allocate(|| data.py_estimate_size())?;
         if data.is_gc_tracked() {
             self.allocations_since_gc = self.allocations_since_gc.wrapping_add(1);
@@ -1096,7 +1155,7 @@ impl<T: ResourceTracker> Heap<T> {
             HeapId(id)
         };
 
-        Ok(id)
+        Ok(HeapRef(id))
     }
 
     /// Returns the singleton empty tuple.
@@ -1109,15 +1168,21 @@ impl<T: ResourceTracker> Heap<T> {
     /// owns a reference and must call `dec_ref` when done.
     pub fn get_empty_tuple(&mut self) -> Value {
         // Return existing singleton with incremented refcount
-        self.inc_ref(EMPTY_TUPLE_ID);
-        Value::Ref(EMPTY_TUPLE_ID)
+        Value::Ref(HeapRef(EMPTY_TUPLE_ID))
     }
 
-    /// Increments the reference count for an existing heap entry.
+    /// Increments the reference count for an existing heap entry, returning a new owned `HeapRef`.
     ///
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
-    pub fn inc_ref(&self, id: HeapId) {
+    pub fn inc_ref(&self, heap_ref: &HeapRef) -> HeapRef {
+        self.inc_ref_raw(heap_ref.id())
+    }
+
+    /// Raw refcount increment by `HeapId` — for callers that have a `HeapId` but
+    /// not a `HeapRef` (e.g., incrementing refcounts on closure cells which are
+    /// still stored as `Vec<HeapId>`).
+    pub(crate) fn inc_ref_raw(&self, id: HeapId) -> HeapRef {
         let value = self
             .entries
             .get(id.index())
@@ -1125,6 +1190,7 @@ impl<T: ResourceTracker> Heap<T> {
             .as_ref()
             .expect("Heap::inc_ref: object already freed");
         value.refcount.update(|r| r + 1);
+        HeapRef(id)
     }
 
     /// Decrements the reference count and frees the value (plus children) once it hits zero.
@@ -1135,7 +1201,7 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
-    pub fn dec_ref(&mut self, id: HeapId) {
+    pub fn dec_ref(&mut self, HeapRef(id): HeapRef) {
         let slot = self.entries.get_mut(id.index()).expect("Heap::dec_ref: slot missing");
         let entry = slot.as_mut().expect("Heap::dec_ref: object already freed");
         if entry.refcount.get() > 1 {
@@ -1150,16 +1216,21 @@ impl<T: ResourceTracker> Heap<T> {
             }
 
             // Collect child IDs and mark Values as Dereferenced (when ref-count-panic enabled)
-            if let Some(mut data) = value.data {
-                let mut child_ids = Vec::new();
-                data.py_dec_ref_ids(&mut child_ids);
-                drop(data);
+            if let Some(data) = value.data {
+                let mut child_refs = Vec::new();
+                data.drop_into(&mut child_refs);
                 // Recursively decrement children
-                for child_id in child_ids {
-                    self.dec_ref(child_id);
+                for child_ref in child_refs {
+                    self.dec_ref(child_ref);
                 }
             }
         }
+    }
+
+    /// Decrements the reference count by raw `HeapId` — for callers that have a
+    /// `HeapId` but not a `HeapRef` (e.g., async task cleanup, scheduler).
+    pub(crate) fn dec_ref_by_id(&mut self, id: HeapId) {
+        self.dec_ref(HeapRef(id));
     }
 
     /// Returns an immutable reference to the heap data stored at the given ID.
@@ -1168,7 +1239,7 @@ impl<T: ResourceTracker> Heap<T> {
     /// Panics if the value ID is invalid, the value has already been freed,
     /// or the data is currently borrowed via `with_entry_mut`/`call_attr`.
     #[must_use]
-    pub fn get(&self, id: HeapId) -> &HeapData {
+    pub fn get(&self, HeapRef(id): &HeapRef) -> &HeapData {
         self.entries
             .get(id.index())
             .expect("Heap::get: slot missing")
@@ -1184,7 +1255,32 @@ impl<T: ResourceTracker> Heap<T> {
     /// # Panics
     /// Panics if the value ID is invalid, the value has already been freed,
     /// or the data is currently borrowed via `with_entry_mut`/`call_attr`.
-    pub fn get_mut(&mut self, id: HeapId) -> &mut HeapData {
+    pub fn get_mut(&mut self, heap_ref: &HeapRef) -> &mut HeapData {
+        self.get_mut_raw(heap_ref.id())
+    }
+
+    /// Raw immutable access by `HeapId` — for callers that have a `HeapId` but
+    /// not a `HeapRef` (e.g., GC, serialization, async task management).
+    pub(crate) fn get_by_id(&self, id: HeapId) -> &HeapData {
+        self.entries
+            .get(id.index())
+            .expect("Heap::get_by_id: slot missing")
+            .as_ref()
+            .expect("Heap::get_by_id: object already freed")
+            .data
+            .as_ref()
+            .expect("Heap::get_by_id: data currently borrowed")
+    }
+
+    /// Raw mutable access by `HeapId` — for callers that have a `HeapId` but
+    /// not a `HeapRef` (e.g., async task management, internal heap operations).
+    pub(crate) fn get_mut_by_id(&mut self, id: HeapId) -> &mut HeapData {
+        self.get_mut_raw(id)
+    }
+
+    /// Raw mutable access by `HeapId` — for internal use within `Heap` methods
+    /// that already extracted the id (e.g., via `take_data!` / `HeapGuard`).
+    fn get_mut_raw(&mut self, id: HeapId) -> &mut HeapData {
         self.entries
             .get_mut(id.index())
             .expect("Heap::get_mut: slot missing")
@@ -1203,7 +1299,8 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
-    pub fn get_or_compute_hash(&mut self, id: HeapId, interns: &Interns) -> Option<u64> {
+    pub fn get_or_compute_hash(&mut self, HeapRef(id): &HeapRef, interns: &Interns) -> Option<u64> {
+        let id = *id;
         let entry = self
             .entries
             .get_mut(id.index())
@@ -1264,10 +1361,11 @@ impl<T: ResourceTracker> Heap<T> {
         // smell. We need the full VM here to enable method implementations to enter
         // user-defined functions.
         vm: &mut VM<'_, '_, T>,
-        id: HeapId,
+        heap_ref: &HeapRef,
         attr: &EitherStr,
         args: ArgValues,
     ) -> RunResult<AttrCallResult> {
+        let id = heap_ref.id();
         // Take data out so the borrow of self.entries ends
         let heap = &mut *vm.heap;
         let mut data = take_data!(heap, id, "call_attr");
@@ -1286,10 +1384,11 @@ impl<T: ResourceTracker> Heap<T> {
     /// The data is temporarily taken from the heap entry, so the closure can safely
     /// mutate both the entry data and the heap (e.g. to allocate new values).
     /// The data is automatically restored after the closure completes.
-    pub fn with_entry_mut<F, R>(&mut self, id: HeapId, f: F) -> R
+    pub fn with_entry_mut<F, R>(&mut self, heap_ref: &HeapRef, f: F) -> R
     where
         F: FnOnce(&mut Self, &mut HeapData) -> R,
     {
+        let id = heap_ref.id();
         // Take data out in a block so the borrow of self.entries ends
         let mut data = take_data!(self, id, "with_entry_mut");
 
@@ -1304,28 +1403,30 @@ impl<T: ResourceTracker> Heap<T> {
     /// simultaneously while still permitting mutable access to the heap (e.g. to
     /// allocate results). Automatically restores both entries after the closure
     /// finishes executing.
-    pub fn with_two<F, R>(&mut self, left: HeapId, right: HeapId, f: F) -> R
+    pub fn with_two<F, R>(&mut self, left: &HeapRef, right: &HeapRef, f: F) -> R
     where
         F: FnOnce(&mut Self, &HeapData, &HeapData) -> R,
     {
-        if left == right {
+        let left_id = left.id();
+        let right_id = right.id();
+        if left_id == right_id {
             // Same value - take data once and pass it twice
-            let data = take_data!(self, left, "with_two");
+            let data = take_data!(self, left_id, "with_two");
 
             let result = f(self, &data, &data);
 
-            restore_data!(self, left, data, "with_two");
+            restore_data!(self, left_id, data, "with_two");
             result
         } else {
             // Different values - take both
-            let left_data = take_data!(self, left, "with_two (left)");
-            let right_data = take_data!(self, right, "with_two (right)");
+            let left_data = take_data!(self, left_id, "with_two (left)");
+            let right_data = take_data!(self, right_id, "with_two (right)");
 
             let result = f(self, &left_data, &right_data);
 
             // Restore in reverse order
-            restore_data!(self, right, right_data, "with_two (right)");
-            restore_data!(self, left, left_data, "with_two (left)");
+            restore_data!(self, right_id, right_data, "with_two (right)");
+            restore_data!(self, left_id, left_data, "with_two (left)");
             result
         }
     }
@@ -1338,7 +1439,7 @@ impl<T: ResourceTracker> Heap<T> {
     /// Panics if the value ID is invalid or the value has already been freed.
     #[must_use]
     #[cfg(feature = "ref-count-return")]
-    pub fn get_refcount(&self, id: HeapId) -> usize {
+    pub fn get_refcount(&self, HeapRef(id): &HeapRef) -> usize {
         self.entries
             .get(id.index())
             .expect("Heap::get_refcount: slot missing")
@@ -1367,7 +1468,7 @@ impl<T: ResourceTracker> Heap<T> {
     /// # Panics
     /// Panics if the ID is invalid, the value has been freed, or the entry is not a Cell.
     pub fn get_cell_value(&self, id: HeapId) -> Value {
-        match self.get(id) {
+        match self.get_by_id(id) {
             HeapData::Cell(c) => c.0.clone_with_heap(self),
             _ => panic!("Heap::get_cell_value: entry is not a Cell"),
         }
@@ -1377,7 +1478,8 @@ impl<T: ResourceTracker> Heap<T> {
     ///
     /// # Panics
     /// Panics if the ID is invalid, the value has been freed, or the entry is not a Cell.
-    pub fn set_cell_value(&mut self, id: HeapId, value: Value) {
+    pub fn set_cell_value(&mut self, heap_ref: &HeapRef, value: Value) {
+        let id = heap_ref.id();
         // The guard will clean up the new value if we panic, or the old value if we swap
         let mut guard = HeapGuard::new(value, self);
         let (value, this) = guard.as_parts_mut();
@@ -1413,7 +1515,8 @@ impl<T: ResourceTracker> Heap<T> {
     /// count. This avoids multiple `heap.get()` calls by looking up the data once.
     ///
     /// Returns `Ok(None)` if the heap entry is neither a LongInt nor a sequence type.
-    pub fn mult_ref_by_i64(&mut self, id: HeapId, int_val: i64) -> RunResult<Option<Value>> {
+    pub fn mult_ref_by_i64(&mut self, heap_ref: &HeapRef, int_val: i64) -> RunResult<Option<Value>> {
+        let id = heap_ref.id();
         let data = take_data!(self, id, "mult_ref_by_i64");
 
         if let HeapData::LongInt(li) = &data {
@@ -1424,7 +1527,7 @@ impl<T: ResourceTracker> Heap<T> {
         } else {
             restore_data!(self, id, data, "mult_ref_by_i64");
             let count = i64_to_repeat_count(int_val)?;
-            self.mult_sequence(id, count)
+            self.mult_sequence_raw(id, count)
         }
     }
 
@@ -1434,8 +1537,10 @@ impl<T: ResourceTracker> Heap<T> {
     /// - `LongInt * LongInt`: integer multiplication with size pre-check
     /// - `LongInt * sequence` or `sequence * LongInt`: sequence repetition
     /// - Anything else: returns `Ok(None)` for unsupported type combinations
-    pub fn mult_heap_values(&mut self, id1: HeapId, id2: HeapId) -> RunResult<Option<Value>> {
+    pub fn mult_heap_values(&mut self, id1: &HeapRef, id2: &HeapRef) -> RunResult<Option<Value>> {
         // Extract the information we need from a single lookup of both values
+        let id1_raw = id1.id();
+        let id2_raw = id2.id();
         enum MultKind {
             LongInts { a_bits: u64, b_bits: u64 },
             SeqTimesLong { seq_id: HeapId, count: usize },
@@ -1447,12 +1552,14 @@ impl<T: ResourceTracker> Heap<T> {
                 a_bits: a.bits(),
                 b_bits: b.bits(),
             }),
-            (_, HeapData::LongInt(li)) => {
-                longint_to_repeat_count(li).map(|c| MultKind::SeqTimesLong { seq_id: id1, count: c })
-            }
-            (HeapData::LongInt(li), _) => {
-                longint_to_repeat_count(li).map(|c| MultKind::SeqTimesLong { seq_id: id2, count: c })
-            }
+            (_, HeapData::LongInt(li)) => longint_to_repeat_count(li).map(|c| MultKind::SeqTimesLong {
+                seq_id: id1_raw,
+                count: c,
+            }),
+            (HeapData::LongInt(li), _) => longint_to_repeat_count(li).map(|c| MultKind::SeqTimesLong {
+                seq_id: id2_raw,
+                count: c,
+            }),
             _ => Ok(MultKind::Unsupported),
         })?;
 
@@ -1468,7 +1575,7 @@ impl<T: ResourceTracker> Heap<T> {
                     }
                 })?)
             }
-            MultKind::SeqTimesLong { seq_id, count } => self.mult_sequence(seq_id, count),
+            MultKind::SeqTimesLong { seq_id, count } => self.mult_sequence_raw(seq_id, count),
             MultKind::Unsupported => Ok(None),
         }
     }
@@ -1593,8 +1700,8 @@ impl<T: ResourceTracker> Heap<T> {
 
                 // Mark Values as Dereferenced when ref-count-panic is enabled
                 #[cfg(feature = "ref-count-panic")]
-                if let Some(mut data) = value.data {
-                    data.py_dec_ref_ids(&mut Vec::new());
+                if let Some(data) = value.data {
+                    data.drop_into(&mut Vec::new());
                 }
             }
         }
@@ -1661,7 +1768,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             }
             for value in list.as_slice() {
                 if let Value::Ref(id) = value {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1672,7 +1779,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             }
             for value in tuple.as_slice() {
                 if let Value::Ref(id) = value {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1683,7 +1790,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             }
             for value in nt.as_vec() {
                 if let Value::Ref(id) = value {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1694,24 +1801,24 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             }
             for (k, v) in dict {
                 if let Value::Ref(id) = k {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
                 if let Value::Ref(id) = v {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
         HeapData::Set(set) => {
             for value in set.storage().iter() {
                 if let Value::Ref(id) = value {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
         HeapData::FrozenSet(frozenset) => {
             for value in frozenset.storage().iter() {
                 if let Value::Ref(id) = value {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1723,7 +1830,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             // Add default values that are heap references
             for default in &closure.defaults {
                 if let Value::Ref(id) = default {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1731,7 +1838,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             // Add default values that are heap references
             for default in &fd.defaults {
                 if let Value::Ref(id) = default {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1745,17 +1852,17 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             // Dataclass attrs are stored in a Dict - iterate through entries
             for (k, v) in dc.attrs() {
                 if let Value::Ref(id) = k {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
                 if let Value::Ref(id) = v {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
         HeapData::Iter(iter) => {
             // Iterator holds a reference to the iterable being iterated
-            if let Value::Ref(id) = iter.value() {
-                work_list.push(*id);
+            if let Some(r) = iter.heap_ref() {
+                work_list.push(r.id());
             }
         }
         HeapData::Module(m) => {
@@ -1765,10 +1872,10 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             }
             for (k, v) in m.attrs() {
                 if let Value::Ref(id) = k {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
                 if let Value::Ref(id) = v {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1780,7 +1887,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             // Add namespace values that are heap references
             for value in &coro.namespace {
                 if let Value::Ref(id) = value {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1794,7 +1901,7 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
             // Add result values that are heap references
             for result in gather.results.iter().flatten() {
                 if let Value::Ref(id) = result {
-                    work_list.push(*id);
+                    work_list.push(id.id());
                 }
             }
         }
@@ -1807,12 +1914,12 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
 impl<T: ResourceTracker> Drop for Heap<T> {
     fn drop(&mut self) {
         // Mark all contained Objects as Dereferenced before dropping.
-        // We use py_dec_ref_ids for this since it handles the marking
+        // We use drop_into for this since it handles the marking
         // (we ignore the collected IDs since we're dropping everything anyway).
         let mut dummy_stack = Vec::new();
-        for value in self.entries.iter_mut().flatten() {
-            if let Some(data) = &mut value.data {
-                data.py_dec_ref_ids(&mut dummy_stack);
+        for value in self.entries.drain(..).flatten() {
+            if let Some(data) = value.data {
+                data.drop_into(&mut dummy_stack);
             }
         }
     }

@@ -33,7 +33,7 @@
 use crate::{
     args::ArgValues,
     exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRef},
     intern::{BytesId, Interns, StringId},
     resource::ResourceTracker,
     types::{PyTrait, Range, str::allocate_char},
@@ -50,10 +50,8 @@ use crate::{
 pub struct MontyIter {
     /// Current iteration index, shared across all iterator types.
     index: usize,
-    /// Type-specific iteration data.
+    /// Type-specific iteration data, includes the heap reference for heap-based iterators.
     iter_value: IterValue,
-    /// the actual Value being iterated over.
-    value: Value,
 }
 
 impl MontyIter {
@@ -75,7 +73,7 @@ impl MontyIter {
 
         // Check if already an iterator - return self
         if let Value::Ref(id) = &iterable
-            && matches!(heap.get(*id), HeapData::Iter(_))
+            && matches!(heap.get(id), HeapData::Iter(_))
         {
             // Already an iterator - return it (refcount already correct from caller)
             return Ok(iterable);
@@ -93,35 +91,15 @@ impl MontyIter {
     /// For strings, copies the string content for byte-offset based iteration.
     /// For ranges, the data is copied so the heap reference is dropped immediately.
     pub fn new(mut value: Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Self> {
-        if let Some(iter_value) = IterValue::new(&value, heap, interns) {
-            // For Range, we copy next/step/len into ForIterValue::Range, so we don't need
-            // to keep the heap object alive during iteration. Drop it immediately to avoid
-            // GC issues (the Range isn't in any namespace slot, so GC wouldn't see it).
-            // Same for IterStr which copies the string content.
-            if matches!(iter_value, IterValue::Range { .. } | IterValue::IterStr { .. }) {
-                value.drop_with_heap(heap);
-                value = Value::None;
-            }
-            Ok(Self {
-                index: 0,
-                iter_value,
-                value,
-            })
-        } else {
-            let err = ExcType::type_error_not_iterable(value.py_type(heap));
-            value.drop_with_heap(heap);
-            Err(err)
-        }
-    }
-
-    /// Drops the iterator and its held value properly.
-    pub fn drop_with_heap(self, heap: &mut Heap<impl ResourceTracker>) {
-        self.value.drop_with_heap(heap);
+        let Some(iter_value) = IterValue::new(value, heap, interns) else {
+            return Err(ExcType::type_error_not_iterable(value.py_type(heap)));
+        };
+        Ok(Self { index: 0, iter_value })
     }
 
     /// Collects HeapIds from this iterator for reference counting cleanup.
-    pub fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        self.value.py_dec_ref_ids(stack);
+    pub fn drop_into(self, stack: &mut Vec<HeapRef>) {
+        self.iter_value.drop_into(stack);
     }
 
     /// Returns whether this iterator holds a heap reference (`Value::Ref`).
@@ -130,14 +108,18 @@ impl MontyIter {
     #[inline]
     #[must_use]
     pub fn has_refs(&self) -> bool {
-        matches!(self.value, Value::Ref(_))
+        matches!(self.iter_value, IterValue::HeapRef { .. })
     }
 
     /// Returns a reference to the underlying value being iterated.
     ///
     /// Used by GC to traverse heap references held by the iterator.
-    pub fn value(&self) -> &Value {
-        &self.value
+    pub fn heap_ref(&self) -> Option<&HeapRef> {
+        if let IterValue::HeapRef { heap_ref, .. } = &self.iter_value {
+            Some(heap_ref)
+        } else {
+            None
+        }
     }
 
     /// Returns the current iterator state without mutation.
@@ -174,7 +156,7 @@ impl MontyIter {
                 }
             }
             IterValue::HeapRef {
-                heap_id,
+                heap_ref,
                 len,
                 checks_mutation,
             } => {
@@ -186,7 +168,7 @@ impl MontyIter {
                     return None;
                 }
                 Some(IterState::HeapIndex {
-                    heap_id: *heap_id,
+                    heap_id: heap_ref.id(),
                     index: self.index,
                     expected_len: if *checks_mutation { *len } else { None },
                 })
@@ -352,7 +334,7 @@ impl MontyIter {
             IterValue::HeapRef { heap_id, len, .. } => {
                 // For List (len=None), check current length dynamically
                 len.unwrap_or_else(|| {
-                    let HeapData::List(list) = heap.get(*heap_id) else {
+                    let HeapData::List(list) = heap.get(heap_id) else {
                         panic!("HeapRef with len=None should only be List")
                     };
                     list.len()
@@ -411,13 +393,13 @@ impl<T: ResourceTracker> Iterator for HeapedMontyIter<'_, T> {
 /// Returns `Err` for dict/set size changes or allocation failures.
 pub(crate) fn advance_on_heap(
     heap: &mut Heap<impl ResourceTracker>,
-    iter_id: HeapId,
+    iter_ref: &HeapRef,
     interns: &Interns,
 ) -> RunResult<Option<Value>> {
     // Fast path: Range and InternBytes don't need additional heap access,
     // so we can handle them with a single mutable borrow.
     {
-        let HeapData::Iter(iter) = heap.get_mut(iter_id) else {
+        let HeapData::Iter(iter) = heap.get_mut(iter_ref) else {
             panic!("advance_on_heap: expected Iterator on heap");
         };
         if let Some(result) = iter.try_advance_simple(interns) {
@@ -428,7 +410,7 @@ pub(crate) fn advance_on_heap(
 
     // Multi-phase approach for IterStr and HeapRef (need heap access during value retrieval)
     // Phase 1: Get iterator state (immutable borrow ends after this block)
-    let HeapData::Iter(iter) = heap.get(iter_id) else {
+    let HeapData::Iter(iter) = heap.get(iter_ref) else {
         panic!("advance_on_heap: expected Iterator on heap");
     };
     let Some(state) = iter.iter_state() else {
@@ -456,7 +438,7 @@ pub(crate) fn advance_on_heap(
     };
 
     // Phase 3: Advance the iterator
-    let HeapData::Iter(iter) = heap.get_mut(iter_id) else {
+    let HeapData::Iter(iter) = heap.get_mut(iter_ref) else {
         panic!("advance_on_heap: expected Iterator on heap");
     };
     iter.advance(string_char_len);
@@ -606,7 +588,7 @@ enum IterState {
 ///
 /// Each variant stores the data needed to iterate over a specific type,
 /// excluding the index which is stored in the parent `MontyIter` struct.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 enum IterValue {
     /// Iterating over a Range, yields `Value::Int`.
     Range {
@@ -642,19 +624,19 @@ enum IterValue {
     /// - `checks_mutation`: `true` for Dict/Set (raises RuntimeError if size changes),
     ///   `false` for other types.
     HeapRef {
-        heap_id: HeapId,
+        heap_ref: HeapRef,
         len: Option<usize>,
         checks_mutation: bool,
     },
 }
 
 impl IterValue {
-    fn new(value: &Value, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Option<Self> {
-        match &value {
-            Value::InternString(string_id) => Some(Self::from_str(interns.get_str(*string_id))),
-            Value::InternBytes(bytes_id) => Some(Self::from_intern_bytes(*bytes_id, interns)),
-            Value::Ref(heap_id) => Self::from_heap_data(*heap_id, heap),
-            _ => None,
+    fn new(value: Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Self> {
+        match value {
+            Value::InternString(string_id) => Ok(Self::from_str(interns.get_str(string_id))),
+            Value::InternBytes(bytes_id) => Ok(Self::from_intern_bytes(bytes_id, interns)),
+            Value::Ref(r) => Self::from_heap_data(r, heap),
+            other => Err(ExcType::type_error_not_iterable(other.py_type(heap))),
         }
     }
 
@@ -691,50 +673,70 @@ impl IterValue {
     }
 
     /// Creates an iterator value from heap data.
-    fn from_heap_data(heap_id: HeapId, heap: &Heap<impl ResourceTracker>) -> Option<Self> {
-        match heap.get(heap_id) {
+    fn from_heap_data(heap_ref: HeapRef, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Self> {
+        let mut heap_ref_guard = HeapGuard::new(heap_ref, heap);
+        let (heap_ref, heap) = heap_ref_guard.as_parts();
+        match heap.get(&heap_ref) {
             // List: no captured len (checked dynamically), no mutation check
-            HeapData::List(_) => Some(Self::HeapRef {
-                heap_id,
+            HeapData::List(_) => Ok(Self::HeapRef {
+                heap_ref: heap_ref_guard.into_inner(),
                 len: None,
                 checks_mutation: false,
             }),
             // Tuple/NamedTuple/Bytes/FrozenSet: captured len, no mutation check
-            HeapData::Tuple(tuple) => Some(Self::HeapRef {
-                heap_id,
-                len: Some(tuple.as_slice().len()),
-                checks_mutation: false,
-            }),
-            HeapData::NamedTuple(namedtuple) => Some(Self::HeapRef {
-                heap_id,
-                len: Some(namedtuple.len()),
-                checks_mutation: false,
-            }),
-            HeapData::Bytes(b) => Some(Self::HeapRef {
-                heap_id,
-                len: Some(b.len()),
-                checks_mutation: false,
-            }),
-            HeapData::FrozenSet(frozenset) => Some(Self::HeapRef {
-                heap_id,
-                len: Some(frozenset.len()),
-                checks_mutation: false,
-            }),
+            HeapData::Tuple(tuple) => {
+                let len = tuple.as_slice().len();
+                Ok(Self::HeapRef {
+                    heap_ref: heap_ref_guard.into_inner(),
+                    len: Some(len),
+                    checks_mutation: false,
+                })
+            }
+            HeapData::NamedTuple(namedtuple) => {
+                let len = namedtuple.len();
+                Ok(Self::HeapRef {
+                    heap_ref: heap_ref_guard.into_inner(),
+                    len: Some(len),
+                    checks_mutation: false,
+                })
+            }
+            HeapData::Bytes(b) => {
+                let len = b.len();
+                Ok(Self::HeapRef {
+                    heap_ref: heap_ref_guard.into_inner(),
+                    len: Some(len),
+                    checks_mutation: false,
+                })
+            }
+            HeapData::FrozenSet(frozenset) => {
+                let len = frozenset.len();
+                Ok(Self::HeapRef {
+                    heap_ref: heap_ref_guard.into_inner(),
+                    len: Some(len),
+                    checks_mutation: false,
+                })
+            }
             // Dict/Set: captured len, WITH mutation check
-            HeapData::Dict(dict) => Some(Self::HeapRef {
-                heap_id,
-                len: Some(dict.len()),
-                checks_mutation: true,
-            }),
-            HeapData::Set(set) => Some(Self::HeapRef {
-                heap_id,
-                len: Some(set.len()),
-                checks_mutation: true,
-            }),
+            HeapData::Dict(dict) => {
+                let len = dict.len();
+                Ok(Self::HeapRef {
+                    heap_ref: heap_ref_guard.into_inner(),
+                    len: Some(len),
+                    checks_mutation: true,
+                })
+            }
+            HeapData::Set(set) => {
+                let len = set.len();
+                Ok(Self::HeapRef {
+                    heap_ref: heap_ref_guard.into_inner(),
+                    len: Some(len),
+                    checks_mutation: true,
+                })
+            }
             // String: copy content for iteration
-            HeapData::Str(s) => Some(Self::from_str(s.as_str())),
+            HeapData::Str(s) => Ok(Self::from_str(s.as_str())),
             // Range: copy values for iteration
-            HeapData::Range(range) => Some(Self::from_range(range)),
+            HeapData::Range(range) => Ok(Self::from_range(range)),
             // Closures, FunctionDefaults, Cells, Exceptions, Dataclasses, Iterators, LongInts, Slices, Modules,
             // Paths, and async types are not iterable
             HeapData::Closure(_)
@@ -748,7 +750,17 @@ impl IterValue {
             | HeapData::Module(_)
             | HeapData::Path(_)
             | HeapData::Coroutine(_)
-            | HeapData::GatherFuture(_) => None,
+            | HeapData::GatherFuture(_) => {
+                let (r, heap) = heap_ref_guard.into_parts();
+                let value = Value::Ref(r);
+                Err(ExcType::type_error_not_iterable(value.py_type(heap)))
+            }
+        }
+    }
+
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
+        if let Self::HeapRef { heap_ref, .. } = self {
+            stack.push(heap_ref);
         }
     }
 }
@@ -756,6 +768,15 @@ impl IterValue {
 impl DropWithHeap for MontyIter {
     #[inline]
     fn drop_with_heap<T: ResourceTracker>(self, heap: &mut Heap<T>) {
-        Self::drop_with_heap(self, heap);
+        self.iter_value.drop_with_heap(heap);
+    }
+}
+
+impl DropWithHeap for IterValue {
+    #[inline]
+    fn drop_with_heap<T: ResourceTracker>(self, heap: &mut Heap<T>) {
+        if let Self::HeapRef { heap_ref, .. } = self {
+            heap_ref.drop_with_heap(heap);
+        }
     }
 }

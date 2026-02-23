@@ -170,8 +170,8 @@ impl ExcType {
                 Value::InternString(string_id) => {
                     Ok(SimpleException::new_msg(self, interns.get_str(*string_id).to_owned()))
                 }
-                Value::Ref(heap_id) => {
-                    if let HeapData::Str(s) = heap.get(*heap_id) {
+                Value::Ref(r) => {
+                    if let HeapData::Str(s) = heap.get(r) {
                         Ok(SimpleException::new_msg(self, s.as_str().to_owned()))
                     } else {
                         Err(RunError::internal(

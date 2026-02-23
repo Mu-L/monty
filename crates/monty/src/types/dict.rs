@@ -13,7 +13,7 @@ use crate::{
     args::{ArgValues, KwargsValues},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRef},
     intern::{Interns, StaticStrings},
     resource::{DepthGuard, ResourceError, ResourceTracker},
     types::Type,
@@ -53,7 +53,7 @@ use crate::{
 ///
 /// # GC Optimization
 /// The `contains_refs` flag tracks whether the dict contains any `Value::Ref` items.
-/// This allows `collect_child_ids` and `py_dec_ref_ids` to skip iteration when the
+/// This allows `collect_child_ids` and `drop_into` to skip iteration when the
 /// dict contains only primitive values (ints, bools, None, etc.), significantly
 /// improving GC performance for dicts of primitives.
 #[derive(Debug, Default)]
@@ -63,7 +63,7 @@ pub(crate) struct Dict {
     /// entries is a dense vec maintaining entry order.
     entries: Vec<DictEntry>,
     /// True if any key or value in the dict is a `Value::Ref`. Used to skip iteration
-    /// in `collect_child_ids` and `py_dec_ref_ids` when no refs are present.
+    /// in `collect_child_ids` and `drop_into` when no refs are present.
     /// Only transitions from false to true (never back) since tracking removals would be O(n).
     contains_refs: bool,
 }
@@ -94,7 +94,7 @@ impl Dict {
     /// Returns whether this dict contains any heap references (`Value::Ref`).
     ///
     /// Used during allocation to determine if this container could create cycles,
-    /// and in `collect_child_ids` and `py_dec_ref_ids` to skip iteration when no refs
+    /// and in `collect_child_ids` and `drop_into` to skip iteration when no refs
     /// are present.
     ///
     /// Note: This flag only transitions from false to true (never back). When a ref is
@@ -164,7 +164,7 @@ impl Dict {
                 match entry_key {
                     Value::InternString(id) => interns.get_str(*id) == key_str,
                     Value::Ref(id) => {
-                        if let HeapData::Str(s) = heap.get(*id) {
+                        if let HeapData::Str(s) = heap.get(id) {
                             s.as_str() == key_str
                         } else {
                             false
@@ -344,7 +344,7 @@ impl Dict {
                 };
 
                 // Check if it's a dict and get key-value pairs
-                let HeapData::Dict(dict) = heap.get(*id) else {
+                let HeapData::Dict(dict) = heap.get(id) else {
                     return Err(ExcType::type_error_not_iterable(v.py_type(heap)));
                 };
 
@@ -472,22 +472,14 @@ impl PyTrait for Dict {
         Ok(true)
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+    fn drop_into(self, stack: &mut Vec<HeapRef>) {
         // Skip iteration if no refs - major GC optimization for dicts of primitives
         if !self.contains_refs {
             return;
         }
-        for entry in &mut self.entries {
-            if let Value::Ref(id) = &entry.key {
-                stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
-                entry.key.dec_ref_forget();
-            }
-            if let Value::Ref(id) = &entry.value {
-                stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
-                entry.value.dec_ref_forget();
-            }
+        for entry in self.entries {
+            entry.key.drop_into(stack);
+            entry.value.drop_into(stack);
         }
     }
 
@@ -717,7 +709,7 @@ fn dict_update(
 
     // Check if it's a dict first
     if let Value::Ref(id) = other_value
-        && let HeapData::Dict(src_dict) = heap.get(*id)
+        && let HeapData::Dict(src_dict) = heap.get(id)
     {
         // Clone key-value pairs from the source dict
         let pairs: Vec<(Value, Value)> = src_dict

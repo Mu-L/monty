@@ -414,7 +414,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         // Increment refcounts for captured cells
         for &cell_id in &cells {
-            self.heap.inc_ref(cell_id);
+            self.heap.inc_ref_raw(cell_id);
         }
 
         self.call_def_function(func_id, &cells, defaults, args)
@@ -483,7 +483,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let Value::Ref(id) = args_tuple else {
             unreachable!("CallFunctionExtended: args_tuple must be a Ref")
         };
-        let HeapData::Tuple(tuple) = self.heap.get(*id) else {
+        let HeapData::Tuple(tuple) = self.heap.get(id) else {
             unreachable!("CallFunctionExtended: args_tuple must be a Tuple")
         };
         tuple.as_slice().iter().map(|v| v.clone_with_heap(self.heap)).collect()
@@ -502,7 +502,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let Value::Ref(id) = kwargs_ref else {
             unreachable!("CallFunctionExtended: kwargs must be a Ref")
         };
-        let HeapData::Dict(dict) = this.heap.get(*id) else {
+        let HeapData::Dict(dict) = this.heap.get(id) else {
             unreachable!("CallFunctionExtended: kwargs must be a Dict")
         };
         let copied_kwargs: Vec<(Value, Value)> = dict
@@ -556,7 +556,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let Value::Ref(id) = args_tuple else {
             unreachable!("CallAttrExtended: args_tuple must be a Ref")
         };
-        let HeapData::Tuple(tuple) = self.heap.get(*id) else {
+        let HeapData::Tuple(tuple) = self.heap.get(id) else {
             unreachable!("CallAttrExtended: args_tuple must be a Tuple")
         };
         tuple.as_slice().iter().map(|v| v.clone_with_heap(self.heap)).collect()
@@ -579,7 +579,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         let Value::Ref(id) = kwargs_ref else {
             unreachable!("CallAttrExtended: kwargs must be a Ref")
         };
-        let HeapData::Dict(dict) = this.heap.get(*id) else {
+        let HeapData::Dict(dict) = this.heap.get(id) else {
             unreachable!("CallAttrExtended: kwargs must be a Dict")
         };
         let copied_kwargs: Vec<(Value, Value)> = dict
@@ -686,7 +686,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             // 4. Copy captured cells (free vars) into namespace
             let free_var_start = param_count + func.cell_var_count;
             for (i, &cell_id) in cells.iter().enumerate() {
-                this.heap.inc_ref(cell_id);
+                this.heap.inc_ref_raw(cell_id);
                 frame_cells.push(cell_id);
                 let slot = free_var_start + i;
                 namespace.resize_with(slot, || Value::Undefined);
@@ -768,7 +768,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             // 4. Copy captured cells (free vars) into namespace
             let free_var_start = param_count + func.cell_var_count;
             for (i, &cell_id) in cells.iter().enumerate() {
-                self.heap.inc_ref(cell_id);
+                self.heap.inc_ref_raw(cell_id);
                 frame_cells.push(cell_id);
                 let slot = free_var_start + i;
                 namespace.resize_with(slot, || Value::Undefined);
