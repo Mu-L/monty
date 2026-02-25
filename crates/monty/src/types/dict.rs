@@ -1,7 +1,9 @@
 use std::{
+    cell::{RefCell, RefMut},
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
+    rc::Rc,
 };
 
 use ahash::AHashSet;
@@ -12,8 +14,8 @@ use super::{List, MontyIter, PyTrait, allocate_tuple};
 use crate::{
     args::{ArgValues, KwargsValues},
     defer_drop, defer_drop_mut,
-    exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    exception_private::{ExcType, RunResult, SimpleException},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRead, HeapReader},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
     types::Type,
@@ -59,7 +61,10 @@ use crate::{
 #[derive(Debug, Default)]
 pub(crate) struct Dict {
     /// indices mapping from the entry hash to its index.
-    indices: HashTable<usize>,
+    ///
+    /// Protected in `RefCell` to avoid the possibility of dictionary index changing size
+    /// during iteration.
+    indices: Rc<RefCell<HashTable<usize>>>,
     /// entries is a dense vec maintaining entry order.
     entries: Vec<DictEntry>,
     /// True if any key or value in the dict is a `Value::Ref`. Used to skip iteration
@@ -85,7 +90,7 @@ impl Dict {
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            indices: HashTable::with_capacity(capacity),
+            indices: Rc::new(RefCell::new(HashTable::with_capacity(capacity))),
             entries: Vec::with_capacity(capacity),
             contains_refs: false,
         }
@@ -159,6 +164,7 @@ impl Dict {
 
         // Find entry with matching hash and key
         self.indices
+            .borrow()
             .find(hash, |&idx| {
                 let entry_key = &self.entries[idx].key;
                 match entry_key {
@@ -221,8 +227,66 @@ impl Dict {
             // Key doesn't exist, add new pair to indices and entries
             let index = self.entries.len();
             self.entries.push(entry);
-            self.indices
-                .insert_unique(hash, index, |index| self.entries[*index].hash);
+            borrow_indices_mut(&self.indices)?.insert_unique(hash, index, |index| self.entries[*index].hash);
+            Ok(None)
+        }
+    }
+
+    /// Sets a key-value pair in the dict.
+    ///
+    /// The caller transfers ownership of `key` and `value` to the dict. Their refcounts
+    /// are NOT incremented here - the caller is responsible for ensuring the refcounts
+    /// were already incremented (e.g., via `clone_with_heap` or `evaluate_use`).
+    ///
+    /// If the key already exists, replaces the old value and returns it (caller now
+    /// owns the old value and is responsible for its refcount).
+    /// Returns Err if key is unhashable.
+    pub fn set_via_reader<'a>(
+        mut this: HeapRead<'a, Self>,
+        key: Value,
+        value: Value,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
+        interns: &Interns,
+    ) -> RunResult<Option<Value>> {
+        // Track if we're adding a reference for GC optimization
+        if matches!(key, Value::Ref(_)) || matches!(value, Value::Ref(_)) {
+            this.get_mut(reader).contains_refs = true;
+        }
+
+        // Handle hash computation errors explicitly so we can drop key/value properly
+        let (opt_index, hash) = match Self::find_index_hash_via_reader(&mut this, &key, reader, interns) {
+            Ok(result) => result,
+            Err(e) => {
+                // Drop the key and value before returning the error
+                key.drop_with_heap(reader.heap);
+                value.drop_with_heap(reader.heap);
+                return Err(e);
+            }
+        };
+
+        let entry = DictEntry { key, value, hash };
+        if let Some(index) = opt_index {
+            // Key exists, replace in place to preserve insertion order
+            let old_entry = std::mem::replace(&mut this.get_mut(reader).entries[index], entry);
+
+            // Decrement refcount for old key (we're discarding it)
+            old_entry.key.drop_with_heap(reader.heap);
+            // Transfer ownership of the old value to caller (no clone needed)
+            Ok(Some(old_entry.value))
+        } else {
+            // Key doesn't exist, add new pair to indices and entries
+            let this = this.get_mut(reader);
+            let index = this.entries.len();
+            this.entries.push(entry);
+            this.indices
+                .try_borrow_mut()
+                .map_err(|_| {
+                    SimpleException::new(
+                        ExcType::ValueError,
+                        Some("dictionary indices cannot change during iteration".into()),
+                    )
+                })?
+                .insert_unique(hash, index, |index| this.entries[*index].hash);
             Ok(None)
         }
     }
@@ -244,7 +308,8 @@ impl Dict {
             .py_hash(heap, interns)?
             .ok_or_else(|| ExcType::type_error_unhashable_dict_key(key.py_type(heap)))?;
 
-        let entry = self.indices.entry(
+        let mut indices = borrow_indices_mut(&self.indices)?;
+        let entry = indices.entry(
             hash,
             |v| key.py_eq(&self.entries[*v].key, heap, interns).unwrap_or(false),
             |index| self.entries[*index].hash,
@@ -370,12 +435,48 @@ impl Dict {
         // the key lookup fails but doesn't crash.
         let opt_index = self
             .indices
+            .borrow()
             .find(hash, |v| {
                 key.py_eq(&self.entries[*v].key, heap, interns).unwrap_or(false)
             })
             .copied();
         Ok((opt_index, hash))
     }
+
+    fn find_index_hash_via_reader<'a>(
+        this: &mut HeapRead<'a, Self>,
+        key: &Value,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
+        interns: &Interns,
+    ) -> RunResult<(Option<usize>, u64)> {
+        let hash = key
+            .py_hash(reader.heap, interns)?
+            .ok_or_else(|| ExcType::type_error_unhashable_dict_key(key.py_type(reader.heap)))?;
+
+        // Dict keys are typically shallow (strings, ints, tuples of primitives),
+        // so recursion errors are unlikely. If one occurs, treat it as "not equal" -
+        // the key lookup fails but doesn't crash.
+        let indices = Rc::clone(&this.get(reader).indices);
+        let opt_index = indices
+            .borrow()
+            .find(hash, |v| {
+                let key = this.get(reader).entries[*v].key.clone_with_heap(reader.heap);
+                defer_drop!(key, reader);
+                key.py_eq(key, reader.heap, interns).unwrap_or(false)
+            })
+            .copied();
+        Ok((opt_index, hash))
+    }
+}
+
+fn borrow_indices_mut(indices: &RefCell<HashTable<usize>>) -> RunResult<RefMut<'_, HashTable<usize>>> {
+    indices.try_borrow_mut().map_err(|_| {
+        SimpleException::new(
+            ExcType::ValueError,
+            Some("dictionary indices cannot change during iteration".into()),
+        )
+        .into()
+    })
 }
 
 /// Iterator over borrowed (key, value) pairs in a dict.
@@ -655,7 +756,7 @@ fn dict_clear(dict: &mut Dict, heap: &mut Heap<impl ResourceTracker>) {
         entry.key.drop_with_heap(heap);
         entry.value.drop_with_heap(heap);
     }
-    dict.indices.clear();
+    dict.indices.borrow_mut().clear();
     // Note: contains_refs stays true even if all refs removed, per conservative GC strategy
 }
 
@@ -848,9 +949,10 @@ fn dict_popitem(dict: &mut Dict, heap: &mut Heap<impl ResourceTracker>) -> RunRe
     // (This is simpler than trying to find and remove the specific hash entry)
     // TODO: This O(n) rebuild could be optimized by finding and removing the
     // specific hash entry directly from the hashbrown table.
-    dict.indices.clear();
+    let mut indices = borrow_indices_mut(&dict.indices)?;
+    indices.clear();
     for (idx, e) in dict.entries.iter().enumerate() {
-        dict.indices.insert_unique(e.hash, idx, |&i| dict.entries[i].hash);
+        indices.insert_unique(e.hash, idx, |&i| dict.entries[i].hash);
     }
 
     // Create tuple (key, value)
@@ -883,7 +985,7 @@ impl<'de> serde::Deserialize<'de> for Dict {
             indices.insert_unique(entry.hash, idx, |&i| fields.entries[i].hash);
         }
         Ok(Self {
-            indices,
+            indices: Rc::new(RefCell::new(indices)),
             entries: fields.entries,
             contains_refs: fields.contains_refs,
         })

@@ -6,7 +6,7 @@ use super::VM;
 use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunError, SimpleException},
-    heap::{HeapData, HeapGuard},
+    heap::{HeapData, HeapGuard, HeapReadOutput, HeapReader},
     heap_data::HeapDataMut,
     intern::StringId,
     resource::ResourceTracker,
@@ -358,15 +358,14 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             return Err(RunError::internal("DictSetItem: expected dict ref on stack"));
         };
 
-        // Set item in the dict using with_entry_mut to avoid borrow conflicts
-        let old_value = self.heap.with_entry_mut(dict_id, |heap, data| {
-            if let HeapDataMut::Dict(dict) = data {
-                dict.set(key, value, heap, self.interns)
-            } else {
-                key.drop_with_heap(heap);
-                value.drop_with_heap(heap);
-                Err(RunError::internal("DictSetItem: expected dict on heap"))
-            }
+        let old_value = HeapReader::with(self.heap, |reader| {
+            let HeapReadOutput::Dict(dict) = reader.read(dict_id) else {
+                key.drop_with_heap(reader.heap);
+                value.drop_with_heap(reader.heap);
+                return Err(RunError::internal("DictSetItem: expected dict on heap"));
+            };
+
+            Dict::set_via_reader(dict, key, value, reader, self.interns)
         })?;
 
         // Drop old value if key already existed
