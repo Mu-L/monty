@@ -2354,3 +2354,142 @@ macro_rules! defer_drop_immutable_heap {
         let ($value, $heap) = _guard.as_parts();
     };
 }
+
+// Needs to live inside the crate so that internal APIs can be tested
+#[cfg(heap_reader_compile_fail_tests)]
+#[path = "../tests/heap_reader_compile_fail_cases/cases.rs"]
+mod heap_reader_compile_fail_tests;
+
+/// A lot of these tests are intended to be run under miri to validate soundness of the `HeapReader` design.
+#[cfg(test)]
+mod heap_reader_tests {
+    use super::*;
+    use crate::resource::NoLimitTracker;
+
+    /// Helper: creates a heap and allocates a list with the given integer values.
+    fn heap_with_list(values: &[i64]) -> (Heap<NoLimitTracker>, HeapId) {
+        let mut heap = Heap::new(16, NoLimitTracker);
+        let items: Vec<Value> = values.iter().map(|&v| Value::Int(v)).collect();
+        let id = heap.allocate(HeapData::List(List::new(items))).unwrap();
+        (heap, id)
+    }
+
+    /// Exercises the stacked borrows violation: `read()` two different entries, then
+    /// dereference the first. The second `read()` call creates `&mut Vec<...>` internally,
+    /// which under stacked borrows invalidates the `NonNull` pointer stored by the first
+    /// `HeapRead`.
+    ///
+    /// This test is expected to FAIL under `cargo +nightly miri test` (stacked borrows
+    /// violation), demonstrating that the current `read()` implementation is unsound when
+    /// multiple `HeapRead` handles coexist.
+    #[test]
+    fn read_two_entries_then_deref_first() {
+        let (mut heap, list_a) = heap_with_list(&[1, 2, 3]);
+        let list_b = heap.allocate(HeapData::List(List::new(vec![Value::Int(4)]))).unwrap();
+
+        HeapReader::with(&mut heap, |reader| {
+            // First read: stores NonNull into entries[list_a]
+            let a = match reader.read(list_a) {
+                HeapReadOutput::List(list) => list,
+                _ => panic!("Expected List"),
+            };
+
+            // Second read: internally calls entries.get_mut(list_b),
+            // creating &mut Vec<Option<HeapValue>> which invalidates a's pointer
+            // under stacked borrows.
+            let b = match reader.read(list_b) {
+                HeapReadOutput::List(list) => list,
+                _ => panic!("Expected List"),
+            };
+
+            // Dereference both — 'a' uses an invalidated pointer under stacked borrows
+            let a_slice = a.get(reader).as_slice();
+            let b_slice = b.get(reader).as_slice();
+            assert_eq!(a_slice.len(), 3);
+            assert_eq!(b_slice.len(), 1);
+        });
+    }
+
+    /// Same as above but reads the same HeapId twice, producing two `HeapRead` handles
+    /// to the same memory location. The second `read()` still creates `&mut Vec<...>`
+    /// which invalidates the first pointer under stacked borrows.
+    #[test]
+    fn read_same_entry_twice_then_deref_both() {
+        let (mut heap, list_id) = heap_with_list(&[10, 20]);
+
+        HeapReader::with(&mut heap, |reader| {
+            let a = match reader.read(list_id) {
+                HeapReadOutput::List(list) => list,
+                _ => panic!("Expected List"),
+            };
+            let b = match reader.read(list_id) {
+                HeapReadOutput::List(list) => list,
+                _ => panic!("Expected List"),
+            };
+
+            // Both point to the same List — valid as shared refs, but the pointer
+            // in 'a' was invalidated by the second read() under stacked borrows.
+            let a_slice = a.get(reader).as_slice();
+            let b_slice = b.get(reader).as_slice();
+            assert_eq!(a_slice.len(), 2);
+            assert_eq!(b_slice.len(), 2);
+        });
+    }
+
+    /// A single read followed by get — no stacked borrows issue since there's only one
+    /// `read()` call. This should pass under miri as a positive control.
+    #[test]
+    fn single_read_then_deref() {
+        let (mut heap, list_id) = heap_with_list(&[5, 6, 7]);
+
+        HeapReader::with(&mut heap, |reader| {
+            let a = match reader.read(list_id) {
+                HeapReadOutput::List(list) => list,
+                _ => panic!("Expected List"),
+            };
+            let slice = a.get(reader).as_slice();
+            assert_eq!(slice.len(), 3);
+        });
+    }
+
+    /// Exercises the `list_inplace_add` example pattern: read two entries, use shared
+    /// access to iterate both, then get_mut to replace. This is the intended usage
+    /// pattern but still triggers the stacked borrows violation from double `read()`.
+    #[test]
+    fn list_inplace_add_pattern() {
+        let (mut heap, src_id) = heap_with_list(&[4, 5]);
+        let dest_id = heap
+            .allocate(HeapData::List(List::new(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+            ])))
+            .unwrap();
+
+        HeapReader::with(&mut heap, |reader| {
+            let HeapReadOutput::List(src) = reader.read(src_id) else {
+                panic!("Expected List");
+            };
+            let HeapReadOutput::List(mut dest) = reader.read(dest_id) else {
+                panic!("Expected List");
+            };
+
+            let combined: Vec<Value> = dest
+                .get(reader)
+                .as_slice()
+                .iter()
+                .chain(src.get(reader).as_slice())
+                .map(|v| v.clone_immediate())
+                .collect();
+
+            *dest.get_mut(reader).as_vec_mut() = combined;
+        });
+
+        // Verify the result
+        let data = heap.get(dest_id);
+        let HeapData::List(list) = data else {
+            panic!("Expected List");
+        };
+        assert_eq!(list.as_slice().len(), 5);
+    }
+}
