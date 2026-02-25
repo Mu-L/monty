@@ -1039,8 +1039,7 @@ impl<'a, T> HeapReadMut<'a, T> {
 
     /// Mutably accesses the value contained in this reference.
     pub fn get_mut<'r>(&mut self, _: &'r mut HeapReader<'a, impl ContainsHeap>) -> &'r mut T {
-        // SAFETY: The HeapReader has an invariant lifetime 'a which guarantees that this HeapRead
-        // came from the heap
+        // SAFETY: see same constraints as in get() above.
         unsafe { self.value.as_mut() }
     }
 
