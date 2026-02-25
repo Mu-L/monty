@@ -15,7 +15,7 @@ use crate::{
     args::{ArgValues, KwargsValues},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult, SimpleException},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRead, HeapReadMut, HeapReader},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapReadMut, HeapReader},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
     types::Type,

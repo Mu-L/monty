@@ -796,7 +796,7 @@ impl<'a, H: ContainsHeap> HeapReader<'a, H> {
         #[inline]
         fn heap_read<'a, T>(base: *mut HeapData, field: &T) -> HeapRead<'a, T> {
             let base_addr = base as usize;
-            let field_addr = (field as *const T) as usize;
+            let field_addr = std::ptr::from_ref(field) as usize;
             let offset = field_addr - base_addr;
             HeapRead {
                 // SAFETY: The pointer is derived from the UnsafeCell's `*mut` via byte
@@ -861,7 +861,7 @@ impl<'a, H: ContainsHeap> HeapReader<'a, H> {
         #[inline]
         fn heap_read_mut<'a, T>(base: *mut HeapData, field: &T) -> HeapReadMut<'a, T> {
             let base_addr = base as usize;
-            let field_addr = (field as *const T) as usize;
+            let field_addr = std::ptr::from_ref(field) as usize;
             let offset = field_addr - base_addr;
             HeapReadMut {
                 // SAFETY: The pointer is derived from the UnsafeCell's `*mut` via byte
@@ -1008,6 +1008,10 @@ impl<'a, T> HeapRead<'a, T> {
     }
 
     /// Maps this value into some derived inner
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "FIXME, need to implement drop on `HeapRead`"
+    )]
     pub fn map<'r, U>(
         orig: Self,
         reader: &'r HeapReader<'a, impl ContainsHeap>,

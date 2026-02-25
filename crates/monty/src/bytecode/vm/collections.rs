@@ -327,12 +327,12 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         };
 
         HeapReader::with(self.heap, |reader| {
-            if let HeapReadOutputMut::Set(set) = data {
-                Set::add_via_reader(set, reader, self.interns)
-            } else {
-                value.drop_with_heap(heap);
-                Err(RunError::internal("SetAdd: expected set on heap"))
-            }
+            let HeapReadOutputMut::Set(set) = reader.read_mut(set_id) else {
+                value.drop_with_heap(reader.heap);
+                return Err(RunError::internal("SetAdd: expected set on heap"));
+            };
+
+            Set::add_via_reader(set, value, reader, self.interns)
         })?;
 
         Ok(())

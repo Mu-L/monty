@@ -43,7 +43,7 @@ fn double_get_mut(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
             HeapReadOutput::List(list) => list,
             _ => unreachable!(),
         };
-        let mut b = match reader.read(list_id) {
+        let mut b = match reader.read_mut(list_id) {
             HeapReadOutput::List(list) => list,
             _ => unreachable!(),
         };

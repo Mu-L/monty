@@ -1,4 +1,4 @@
-use std::fmt::Write;
+use std::{cell::RefCell, fmt::Write, rc::Rc};
 
 use ahash::AHashSet;
 use hashbrown::HashTable;
@@ -7,7 +7,7 @@ use super::{MontyIter, PyTrait};
 use crate::{
     args::ArgValues,
     defer_drop, defer_drop_mut,
-    exception_private::{ExcType, RunResult},
+    exception_private::{ExcType, RunResult, SimpleException},
     heap::{DropWithHeap, Heap, HeapData, HeapId, HeapReadMut, HeapReader},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
@@ -31,7 +31,11 @@ struct SetEntry {
 #[derive(Debug, Default)]
 pub(crate) struct SetStorage {
     /// Maps hash to index in entries vector.
-    indices: HashTable<usize>,
+    ///
+    /// Protected in `Rc<RefCell>` to allow cloning the `Rc` during `add_via_reader`,
+    /// which avoids borrow conflicts between the `HeapReadMut` and the closure that
+    /// needs to read entries for equality checks.
+    indices: Rc<RefCell<HashTable<usize>>>,
     /// Dense vector of entries maintaining insertion order.
     entries: Vec<SetEntry>,
 }
@@ -45,7 +49,7 @@ impl SetStorage {
     /// Creates a new set storage with pre-allocated capacity.
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            indices: HashTable::with_capacity(capacity),
+            indices: Rc::new(RefCell::new(HashTable::with_capacity(capacity))),
             entries: Vec::with_capacity(capacity),
         }
     }
@@ -59,7 +63,10 @@ impl SetStorage {
         let mut storage = Self::with_capacity(entries.len());
         for (idx, (value, hash)) in entries.into_iter().enumerate() {
             storage.entries.push(SetEntry { value, hash });
-            storage.indices.insert_unique(hash, idx, |&i| storage.entries[i].hash);
+            storage
+                .indices
+                .borrow_mut()
+                .insert_unique(hash, idx, |&i| storage.entries[i].hash);
         }
         storage
     }
@@ -120,11 +127,15 @@ impl SetStorage {
         };
 
         // Check if value already exists.
-        let existing = self.indices.find(hash, |&idx| {
-            value.py_eq(&self.entries[idx].value, heap, interns).unwrap_or(false)
-        });
+        let existing = self
+            .indices
+            .borrow()
+            .find(hash, |&idx| {
+                value.py_eq(&self.entries[idx].value, heap, interns).unwrap_or(false)
+            })
+            .is_some();
 
-        if existing.is_some() {
+        if existing {
             // Value already in set, drop the new value
             value.drop_with_heap(heap);
             Ok(false)
@@ -132,7 +143,9 @@ impl SetStorage {
             // Add new entry
             let index = self.entries.len();
             self.entries.push(SetEntry { value, hash });
-            self.indices.insert_unique(hash, index, |&idx| self.entries[idx].hash);
+            self.indices
+                .borrow_mut()
+                .insert_unique(hash, index, |&idx| self.entries[idx].hash);
             Ok(true)
         }
     }
@@ -164,24 +177,36 @@ impl SetStorage {
             }
         };
 
-        // Check if value already exists.
-        let existing = this.get(reader).indices.find(hash, |&idx| {
-            let item = this.get(reader).entries[idx].value.clone_with_heap(reader.heap);
-            defer_drop!(item, reader);
-            value.py_eq(&item, reader.heap, interns).unwrap_or(false)
-        });
+        // Clone the Rc to avoid borrow conflicts between the HeapReadMut and the
+        // closure that needs to read entries for equality checks.
+        let indices = Rc::clone(&this.get(reader).indices);
+        let existing = indices
+            .borrow()
+            .find(hash, |&idx| {
+                let item = this.get(reader).entries[idx].value.clone_with_heap(reader.heap);
+                defer_drop!(item, reader);
+                value.py_eq(item, reader.heap, interns).unwrap_or(false)
+            })
+            .is_some();
 
-        if existing.is_some() {
+        if existing {
             // Value already in set, drop the new value
             value.drop_with_heap(reader.heap);
             Ok(false)
         } else {
             // Add new entry
-            let index = this.get(reader).entries.len();
-            this.get_mut(reader).entries.push(SetEntry { value, hash });
-            this.get_mut(reader)
-                .indices
-                .insert_unique(hash, index, |&idx| this.get(reader).entries[idx].hash);
+            let this = this.get_mut(reader);
+            let index = this.entries.len();
+            this.entries.push(SetEntry { value, hash });
+            this.indices
+                .try_borrow_mut()
+                .map_err(|_| {
+                    SimpleException::new(
+                        ExcType::ValueError,
+                        Some("set indices cannot change during iteration".into()),
+                    )
+                })?
+                .insert_unique(hash, index, |&idx| this.entries[idx].hash);
             Ok(true)
         }
     }
@@ -195,7 +220,8 @@ impl SetStorage {
             .py_hash(heap, interns)?
             .ok_or_else(|| ExcType::type_error_unhashable_set_element(value.py_type(heap)))?;
 
-        let entry = self.indices.entry(
+        let mut indices = self.indices.borrow_mut();
+        let entry = indices.entry(
             hash,
             |&idx| value.py_eq(&self.entries[idx].value, heap, interns).unwrap_or(false),
             |&idx| self.entries[idx].hash,
@@ -207,7 +233,7 @@ impl SetStorage {
             occ.remove();
 
             // Update indices for entries that shifted down
-            for idx in &mut self.indices {
+            for idx in &mut *indices {
                 if *idx > index {
                     *idx -= 1;
                 }
@@ -242,6 +268,7 @@ impl SetStorage {
 
         // Remove from hash table
         self.indices
+            .borrow_mut()
             .find_entry(entry.hash, |&idx| idx == self.entries.len())
             .expect("entry must exist")
             .remove();
@@ -254,13 +281,13 @@ impl SetStorage {
         for entry in self.entries.drain(..) {
             entry.value.drop_with_heap(heap);
         }
-        self.indices.clear();
+        self.indices.borrow_mut().clear();
     }
 
     /// Creates a deep clone with proper reference counting.
     fn clone_with_heap(&self, heap: &Heap<impl ResourceTracker>) -> Self {
         Self {
-            indices: self.indices.clone(),
+            indices: Rc::new(RefCell::new(self.indices.borrow().clone())),
             entries: self
                 .entries
                 .iter()
@@ -282,6 +309,7 @@ impl SetStorage {
         // so recursion errors are unlikely. If one occurs, treat it as "not equal".
         Ok(self
             .indices
+            .borrow()
             .find(hash, |&idx| {
                 value.py_eq(&self.entries[idx].value, heap, interns).unwrap_or(false)
             })
@@ -557,12 +585,12 @@ impl Set {
     ///
     /// Returns `Ok(true)` if added, `Ok(false)` if already present.
     pub fn add_via_reader<'a>(
-        mut this: HeapReadMut<'a, Self>,
+        this: HeapReadMut<'a, Self>,
         value: Value,
         reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
         interns: &Interns,
     ) -> RunResult<bool> {
-        SetStorage::add_via_reader(HeapReadMut::map(this, reader, |s| &mut s.0), reader, interns)
+        SetStorage::add_via_reader(HeapReadMut::map(this, reader, |s| &mut s.0), value, reader, interns)
     }
 
     /// Removes an element from the set.
@@ -1398,7 +1426,10 @@ impl<'de> serde::Deserialize<'de> for SetStorage {
         for (idx, entry) in entries.iter().enumerate() {
             indices.insert_unique(entry.hash, idx, |&i| entries[i].hash);
         }
-        Ok(Self { indices, entries })
+        Ok(Self {
+            indices: Rc::new(RefCell::new(indices)),
+            entries,
+        })
     }
 }
 
