@@ -850,6 +850,75 @@ impl<'a, H: ContainsHeap> HeapReader<'a, H> {
             HeapData::Path(path) => HeapReadOutput::Path(heap_read(base, path)),
         }
     }
+
+    /// Indexes into the heap
+    pub fn read_mut(&mut self, id: HeapId) -> HeapReadOutputMut<'a> {
+        /// Computes a `HeapRead` from the raw `UnsafeCell` pointer and a shared reference
+        /// to the variant field. The `&T` is only used to compute the field's byte offset
+        /// within the `HeapData` enum; the returned `NonNull` is derived from the original
+        /// `*mut HeapData` pointer so it inherits the `SharedReadWrite` permission from
+        /// the `UnsafeCell`, allowing both reads and writes.
+        #[inline]
+        fn heap_read_mut<'a, T>(base: *mut HeapData, field: &T) -> HeapReadMut<'a, T> {
+            let base_addr = base as usize;
+            let field_addr = (field as *const T) as usize;
+            let offset = field_addr - base_addr;
+            HeapReadMut {
+                // SAFETY: The pointer is derived from the UnsafeCell's `*mut` via byte
+                // offset, preserving the `SharedReadWrite` permission. No reference retag
+                // occurs — we only use the `&T` for its address, not to derive the pointer.
+                value: unsafe { NonNull::new_unchecked(base.byte_add(offset).cast::<T>()) },
+                borrow: PhantomData,
+            }
+        }
+
+        let heap = self.heap.heap_mut();
+        let entry = heap
+            .entries
+            .get(id.index())
+            .expect("HeapReader::read: slot missing")
+            .as_ref()
+            .expect("HeapReader::read: object already freed");
+        let data = entry.data.as_ref().expect("HeapReader::read: data currently borrowed");
+
+        // Get the raw pointer from the UnsafeCell — this has SharedReadWrite permission.
+        let base: *mut HeapData = data.0.get();
+
+        // SAFETY: Match on a shared reference (`&*base`) to read the discriminant without
+        // creating a Unique retag. The shared retag is compatible with existing
+        // SharedReadWrite permissions from prior `read()` calls into the same UnsafeCell.
+        // The `heap_read` helper then derives the NonNull from `base` (not from `&T`),
+        // so the returned pointer retains full SharedReadWrite permission.
+        match unsafe { &*base } {
+            HeapData::Str(s) => HeapReadOutputMut::Str(heap_read_mut(base, s)),
+            HeapData::Bytes(bytes) => HeapReadOutputMut::Bytes(heap_read_mut(base, bytes)),
+            HeapData::List(list) => HeapReadOutputMut::List(heap_read_mut(base, list)),
+            HeapData::Tuple(tuple) => HeapReadOutputMut::Tuple(heap_read_mut(base, tuple)),
+            HeapData::NamedTuple(named_tuple) => HeapReadOutputMut::NamedTuple(heap_read_mut(base, named_tuple)),
+            HeapData::Dict(dict) => HeapReadOutputMut::Dict(heap_read_mut(base, dict)),
+            HeapData::Set(set) => HeapReadOutputMut::Set(heap_read_mut(base, set)),
+            HeapData::FrozenSet(frozen_set) => HeapReadOutputMut::FrozenSet(heap_read_mut(base, frozen_set)),
+            HeapData::Closure(closure) => HeapReadOutputMut::Closure(heap_read_mut(base, closure)),
+            HeapData::FunctionDefaults(function_defaults) => {
+                HeapReadOutputMut::FunctionDefaults(heap_read_mut(base, function_defaults))
+            }
+            HeapData::Cell(cell_value) => HeapReadOutputMut::Cell(heap_read_mut(base, cell_value)),
+            HeapData::Range(range) => HeapReadOutputMut::Range(heap_read_mut(base, range)),
+            HeapData::Slice(slice) => HeapReadOutputMut::Slice(heap_read_mut(base, slice)),
+            HeapData::Exception(simple_exception) => {
+                HeapReadOutputMut::Exception(heap_read_mut(base, simple_exception))
+            }
+            HeapData::Dataclass(dataclass) => HeapReadOutputMut::Dataclass(heap_read_mut(base, dataclass)),
+            HeapData::Iter(monty_iter) => HeapReadOutputMut::Iter(heap_read_mut(base, monty_iter)),
+            HeapData::LongInt(l) => HeapReadOutputMut::LongInt(heap_read_mut(base, l)),
+            HeapData::Module(module) => HeapReadOutputMut::Module(heap_read_mut(base, module)),
+            HeapData::Coroutine(coroutine) => HeapReadOutputMut::Coroutine(heap_read_mut(base, coroutine)),
+            HeapData::GatherFuture(gather_future) => {
+                HeapReadOutputMut::GatherFuture(heap_read_mut(base, gather_future))
+            }
+            HeapData::Path(path) => HeapReadOutputMut::Path(heap_read_mut(base, path)),
+        }
+    }
 }
 
 impl<H: ContainsHeap> ContainsHeap for HeapReader<'_, H> {
@@ -884,6 +953,30 @@ pub enum HeapReadOutput<'a> {
     Path(HeapRead<'a, Path>),
 }
 
+pub enum HeapReadOutputMut<'a> {
+    Str(HeapReadMut<'a, Str>),
+    Bytes(HeapReadMut<'a, Bytes>),
+    List(HeapReadMut<'a, List>),
+    Tuple(HeapReadMut<'a, Tuple>),
+    NamedTuple(HeapReadMut<'a, NamedTuple>),
+    Dict(HeapReadMut<'a, Dict>),
+    Set(HeapReadMut<'a, Set>),
+    FrozenSet(HeapReadMut<'a, FrozenSet>),
+    Closure(HeapReadMut<'a, Closure>),
+    FunctionDefaults(HeapReadMut<'a, FunctionDefaults>),
+    Cell(HeapReadMut<'a, CellValue>),
+    Range(HeapReadMut<'a, Range>),
+    Slice(HeapReadMut<'a, Slice>),
+    Exception(HeapReadMut<'a, SimpleException>),
+    Dataclass(HeapReadMut<'a, Dataclass>),
+    Iter(HeapReadMut<'a, MontyIter>),
+    LongInt(HeapReadMut<'a, LongInt>),
+    Module(HeapReadMut<'a, Module>),
+    Coroutine(HeapReadMut<'a, Coroutine>),
+    GatherFuture(HeapReadMut<'a, GatherFuture>),
+    Path(HeapReadMut<'a, Path>),
+}
+
 pub struct HeapRead<'a, T> {
     value: NonNull<T>,
     /// Makes the lifetime `'a` invariant. In combination with the invariant lifetime
@@ -914,11 +1007,66 @@ impl<'a, T> HeapRead<'a, T> {
         unsafe { self.value.as_ref() }
     }
 
+    /// Maps this value into some derived inner
+    pub fn map<'r, U>(
+        orig: Self,
+        reader: &'r HeapReader<'a, impl ContainsHeap>,
+        f: impl FnOnce(&'r T) -> &'r U,
+    ) -> HeapRead<'a, U> {
+        HeapRead {
+            value: NonNull::from(f(orig.get(reader))),
+            borrow: PhantomData,
+        }
+    }
+}
+
+pub struct HeapReadMut<'a, T> {
+    value: NonNull<T>,
+    /// Makes the lifetime `'a` invariant. In combination with the invariant lifetime
+    /// on `HeapReader` and the `HeapReader::with` API, this guarantees that this
+    /// `HeapRead` originated from that matching `HeapReader` (there is no way to
+    /// construct another `HeapReader` with the same lifetime).
+    borrow: PhantomData<fn(&'a T) -> &'a T>,
+}
+
+impl<'a, T> HeapReadMut<'a, T> {
+    /// Accesses the value contained in this reference.
+    pub fn get<'r>(&self, _: &'r HeapReader<'a, impl ContainsHeap>) -> &'r T {
+        // SAFETY: (DH)
+        //  - The HeapReader has an invariant lifetime 'a which guarantees that this HeapRead
+        //    came from the heap borrowed by this HeapReader.
+        //  - (FIXME) The address of the `HeapValue` never changes.
+        //    (This will require `Heap` entries to be stored in `Box<[Option<HeapValue>]>` pages so that
+        //     they are never dropped if the `Vec` extends, the entries vec is never shrunk.)
+        //    (This will also necessitate making `HeapData` non-optional inside `HeapValue`, removing the
+        //     `take_data!` technique, which this `HeapReader` API should fully supersede anyway.)
+        //  - (FIXME) The HeapRead contains a strong reference to the underlying value, which
+        //    guarantees that it will never be decref'd while the `HeapRead` exists.
+        //    (Probably will fix this by having a `.readers` field in `HeapValue`)
+        //  - The type of the `HeapValue` can never change once allocated. This is
+        //    guaranteed by never exposing `&mut HeapData` outside of this module.
+        //  - The borrow on `HeapReader` guarantees that there are no mutable borrows on any heap
+        //    data while the return value of this function is alive.
+        unsafe { self.value.as_ref() }
+    }
+
     /// Mutably accesses the value contained in this reference.
     pub fn get_mut<'r>(&mut self, _: &'r mut HeapReader<'a, impl ContainsHeap>) -> &'r mut T {
         // SAFETY: The HeapReader has an invariant lifetime 'a which guarantees that this HeapRead
         // came from the heap
         unsafe { self.value.as_mut() }
+    }
+
+    /// Maps this value into some derived inner
+    pub fn map<'r, U>(
+        mut orig: Self,
+        reader: &'r mut HeapReader<'a, impl ContainsHeap>,
+        f: impl FnOnce(&'r mut T) -> &'r mut U,
+    ) -> HeapReadMut<'a, U> {
+        HeapReadMut {
+            value: NonNull::from(f(orig.get_mut(reader))),
+            borrow: PhantomData,
+        }
     }
 }
 
@@ -2370,7 +2518,7 @@ mod heap_reader_tests {
             let HeapReadOutput::List(src) = reader.read(src_id) else {
                 panic!("Expected List");
             };
-            let HeapReadOutput::List(mut dest) = reader.read(dest_id) else {
+            let HeapReadOutputMut::List(mut dest) = reader.read_mut(dest_id) else {
                 panic!("Expected List");
             };
 

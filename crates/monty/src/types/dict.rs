@@ -15,7 +15,7 @@ use crate::{
     args::{ArgValues, KwargsValues},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult, SimpleException},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRead, HeapReader},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapRead, HeapReadMut, HeapReader},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
     types::Type,
@@ -242,7 +242,7 @@ impl Dict {
     /// owns the old value and is responsible for its refcount).
     /// Returns Err if key is unhashable.
     pub fn set_via_reader<'a>(
-        mut this: HeapRead<'a, Self>,
+        mut this: HeapReadMut<'a, Self>,
         key: Value,
         value: Value,
         reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
@@ -444,7 +444,7 @@ impl Dict {
     }
 
     fn find_index_hash_via_reader<'a>(
-        this: &mut HeapRead<'a, Self>,
+        this: &mut HeapReadMut<'a, Self>,
         key: &Value,
         reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
         interns: &Interns,

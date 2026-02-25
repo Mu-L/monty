@@ -10,7 +10,7 @@ use crate::{
     bytecode::VM,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunError, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapReadMut, HeapReader},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
     sorting::{apply_permutation, sort_indices},
@@ -133,6 +133,27 @@ impl List {
         }
         // Ownership transfer - refcount was already handled by caller
         self.items.push(item);
+    }
+
+    /// Appends an element to the end of the list.
+    ///
+    /// The caller transfers ownership of `item` to the list. The item's refcount
+    /// is NOT incremented here - the caller is responsible for ensuring the refcount
+    /// was already incremented (e.g., via `clone_with_heap` or `evaluate_use`).
+    ///
+    /// Returns `Value::None`, matching Python's behavior where `list.append()` returns None.
+    pub fn append_via_reader<'a>(
+        mut this: HeapReadMut<'a, Self>,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
+        item: Value,
+    ) {
+        // Track if we're adding a reference and mark potential cycle
+        if matches!(item, Value::Ref(_)) {
+            this.get_mut(reader).contains_refs = true;
+            reader.heap.mark_potential_cycle();
+        }
+        // Ownership transfer - refcount was already handled by caller
+        this.get_mut(reader).items.push(item);
     }
 
     /// Inserts an element at the specified index.

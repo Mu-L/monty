@@ -8,7 +8,7 @@ use crate::{
     args::ArgValues,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapId},
+    heap::{DropWithHeap, Heap, HeapData, HeapId, HeapReadMut, HeapReader},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
     types::Type,
@@ -133,6 +133,55 @@ impl SetStorage {
             let index = self.entries.len();
             self.entries.push(SetEntry { value, hash });
             self.indices.insert_unique(hash, index, |&idx| self.entries[idx].hash);
+            Ok(true)
+        }
+    }
+
+    /// Adds an element to the set, transferring ownership.
+    ///
+    /// Returns `Ok(true)` if the element was added (not already present),
+    /// `Ok(false)` if the element was already in the set.
+    /// Returns `Err` if the element is unhashable.
+    ///
+    /// The caller transfers ownership of `value`. If the value is already in
+    /// the set, it will be dropped.
+    fn add_via_reader<'a>(
+        mut this: HeapReadMut<'a, Self>,
+        value: Value,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
+        interns: &Interns,
+    ) -> RunResult<bool> {
+        let hash = match value.py_hash(reader.heap, interns) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                let err = ExcType::type_error_unhashable_set_element(value.py_type(reader.heap));
+                value.drop_with_heap(reader.heap);
+                return Err(err);
+            }
+            Err(e) => {
+                value.drop_with_heap(reader.heap);
+                return Err(e.into());
+            }
+        };
+
+        // Check if value already exists.
+        let existing = this.get(reader).indices.find(hash, |&idx| {
+            let item = this.get(reader).entries[idx].value.clone_with_heap(reader.heap);
+            defer_drop!(item, reader);
+            value.py_eq(&item, reader.heap, interns).unwrap_or(false)
+        });
+
+        if existing.is_some() {
+            // Value already in set, drop the new value
+            value.drop_with_heap(reader.heap);
+            Ok(false)
+        } else {
+            // Add new entry
+            let index = this.get(reader).entries.len();
+            this.get_mut(reader).entries.push(SetEntry { value, hash });
+            this.get_mut(reader)
+                .indices
+                .insert_unique(hash, index, |&idx| this.get(reader).entries[idx].hash);
             Ok(true)
         }
     }
@@ -502,6 +551,18 @@ impl Set {
     /// Returns `Ok(true)` if added, `Ok(false)` if already present.
     pub fn add(&mut self, value: Value, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<bool> {
         self.0.add(value, heap, interns)
+    }
+
+    /// Adds an element to the set, transferring ownership.
+    ///
+    /// Returns `Ok(true)` if added, `Ok(false)` if already present.
+    pub fn add_via_reader<'a>(
+        mut this: HeapReadMut<'a, Self>,
+        value: Value,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
+        interns: &Interns,
+    ) -> RunResult<bool> {
+        SetStorage::add_via_reader(HeapReadMut::map(this, reader, |s| &mut s.0), reader, interns)
     }
 
     /// Removes an element from the set.

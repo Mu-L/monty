@@ -6,7 +6,7 @@ use super::VM;
 use crate::{
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunError, SimpleException},
-    heap::{HeapData, HeapGuard, HeapReadOutput, HeapReader},
+    heap::{HeapData, HeapGuard, HeapReadOutputMut, HeapReader},
     heap_data::HeapDataMut,
     intern::StringId,
     resource::ResourceTracker,
@@ -299,13 +299,12 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             return Err(RunError::internal("ListAppend: expected list ref on stack"));
         };
 
-        // Append to the list using with_entry_mut to handle proper contains_refs tracking
-        self.heap.with_entry_mut(list_id, |heap, data| {
-            if let HeapDataMut::List(list) = data {
-                list.append(heap, value);
+        HeapReader::with(self.heap, |reader| {
+            if let HeapReadOutputMut::List(list) = reader.read_mut(list_id) {
+                List::append_via_reader(list, reader, value);
                 Ok(())
             } else {
-                value.drop_with_heap(heap);
+                value.drop_with_heap(reader.heap);
                 Err(RunError::internal("ListAppend: expected list on heap"))
             }
         })
@@ -327,10 +326,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             return Err(RunError::internal("SetAdd: expected set ref on stack"));
         };
 
-        // Add to the set using with_entry_mut to avoid borrow conflicts
-        self.heap.with_entry_mut(set_id, |heap, data| {
-            if let HeapDataMut::Set(set) = data {
-                set.add(value, heap, self.interns)
+        HeapReader::with(self.heap, |reader| {
+            if let HeapReadOutputMut::Set(set) = data {
+                Set::add_via_reader(set, reader, self.interns)
             } else {
                 value.drop_with_heap(heap);
                 Err(RunError::internal("SetAdd: expected set on heap"))
@@ -359,7 +357,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         };
 
         let old_value = HeapReader::with(self.heap, |reader| {
-            let HeapReadOutput::Dict(dict) = reader.read(dict_id) else {
+            let HeapReadOutputMut::Dict(dict) = reader.read_mut(dict_id) else {
                 key.drop_with_heap(reader.heap);
                 value.drop_with_heap(reader.heap);
                 return Err(RunError::internal("DictSetItem: expected dict on heap"));
