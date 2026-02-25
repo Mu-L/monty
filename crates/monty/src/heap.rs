@@ -1531,23 +1531,16 @@ impl<T: ResourceTracker> Heap<T> {
             return Ok(Some(hash));
         }
 
-        // Compute hash lazily - need to temporarily take data to avoid borrow conflict.
-        // IMPORTANT: data must be restored to the entry on ALL paths (including errors)
-        // to avoid dropping HeapData containing Value::Ref without proper cleanup.
-        let mut data = entry.data.take().expect("Heap::get_or_compute_hash: data borrowed");
-        let hash = data.0.get_mut().to_mut().compute_hash_if_immutable(self, interns);
+        let hash = HeapReader::with(self, |reader| reader.read(id).py_hash(reader, interns))?;
 
-        // Restore data before handling the result
+        // TODO: should be able to avoid the repeat lookup by adjusting the HeapReader API.
         let entry = self
             .entries
             .get_mut(id.index())
-            .expect("Heap::get_or_compute_hash: slot missing after compute")
+            .expect("Heap::get_or_compute_hash: slot missing")
             .as_mut()
-            .expect("Heap::get_or_compute_hash: object freed during compute");
-        entry.data = Some(data);
+            .expect("Heap::get_or_compute_hash: object already freed");
 
-        // Now handle the result and cache if successful
-        let hash = hash?;
         entry.hash_state = match hash {
             Some(value) => HashState::Cached(value),
             None => HashState::Unhashable,

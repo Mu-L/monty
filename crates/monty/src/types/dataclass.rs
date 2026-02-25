@@ -8,7 +8,7 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapId},
+    heap::{Heap, HeapId, HeapRead, HeapReader},
     intern::Interns,
     resource::{ResourceError, ResourceTracker},
     types::{AttrCallResult, Type},
@@ -150,9 +150,9 @@ impl Dataclass {
     /// Returns `Ok(Some(hash))` for frozen (immutable) dataclasses, `Ok(None)` for mutable ones.
     /// Returns `Err(ResourceError::Recursion)` if the recursion limit is exceeded.
     /// The hash is computed from the class name and declared field values only.
-    pub fn compute_hash(
-        &self,
-        heap: &mut Heap<impl ResourceTracker>,
+    pub fn py_hash<'a>(
+        this: &HeapRead<'a, Self>,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
         interns: &Interns,
     ) -> Result<Option<u64>, ResourceError> {
         use std::{
@@ -161,20 +161,24 @@ impl Dataclass {
         };
 
         // Only frozen (immutable) dataclasses are hashable
-        if !self.frozen {
+        if !this.get(reader).frozen {
             return Ok(None);
         }
 
-        let token = heap.incr_recursion_depth()?;
-        defer_drop!(token, heap);
+        let token = reader.heap.incr_recursion_depth()?;
+        defer_drop!(token, reader);
         let mut hasher = DefaultHasher::new();
         // Hash the class name
-        self.name.hash(&mut hasher);
+        this.get(reader).name.hash(&mut hasher);
         // Hash each declared field (name, value) pair in order
-        for field_name in &self.field_names {
+        let field_count = this.get(reader).field_names.len();
+        for i in 0..field_count {
+            let field_name = &this.get(reader).field_names[i];
             field_name.hash(&mut hasher);
-            if let Some(value) = self.attrs.get_by_str(field_name, heap, interns) {
-                match value.py_hash(heap, interns)? {
+            if let Some(value) = this.get(reader).attrs.get_by_str(field_name, reader.heap, interns) {
+                let value = value.clone_with_heap(reader.heap);
+                defer_drop!(value, reader);
+                match value.py_hash(reader.heap, interns)? {
                     Some(h) => h.hash(&mut hasher),
                     None => return Ok(None),
                 }

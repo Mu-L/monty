@@ -8,7 +8,7 @@ use crate::{
     args::ArgValues,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult, SimpleException},
-    heap::{DropWithHeap, Heap, HeapData, HeapId, HeapReadMut, HeapReader},
+    heap::{DropWithHeap, Heap, HeapData, HeapId, HeapRead, HeapReadMut, HeapReader},
     intern::{Interns, StaticStrings},
     resource::{ResourceError, ResourceTracker},
     types::Type,
@@ -1103,17 +1103,19 @@ impl FrozenSet {
     ///
     /// The hash is the XOR of all element hashes, making it order-independent.
     /// Checks recursion depth before recursing into element hashes.
-    pub fn compute_hash(
-        &self,
-        heap: &mut Heap<impl ResourceTracker>,
+    pub fn compute_hash<'a>(
+        this: &HeapRead<'a, Self>,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
         interns: &Interns,
     ) -> Result<Option<u64>, ResourceError> {
-        let token = heap.incr_recursion_depth()?;
-        defer_drop!(token, heap);
+        let token = reader.heap.incr_recursion_depth()?;
+        defer_drop!(token, reader);
         let mut hash: u64 = 0;
-        for entry in &self.0.entries {
-            // All elements must be hashable (enforced at construction)
-            match entry.value.py_hash(heap, interns)? {
+        let len = this.get(reader).0.entries.len();
+        for i in 0..len {
+            let entry = this.get(reader).0.entries[i].value.clone_with_heap(reader.heap);
+            defer_drop!(entry, reader);
+            match entry.py_hash(reader.heap, interns)? {
                 Some(h) => hash ^= h,
                 None => return Ok(None),
             }

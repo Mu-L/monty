@@ -13,8 +13,9 @@ use crate::{
     args::ArgValues,
     asyncio::{Coroutine, GatherFuture, GatherItem},
     bytecode::VM,
+    defer_drop,
     exception_private::{RunResult, SimpleException},
-    heap::{Heap, HeapId, HeapReadOutputMut, HeapReader},
+    heap::{Heap, HeapId, HeapReadOutput, HeapReadOutputMut, HeapReader},
     intern::{FunctionId, Interns},
     types::{
         AttrCallResult, Bytes, Dataclass, Dict, FrozenSet, List, LongInt, Module, MontyIter, NamedTuple, Path, PyTrait,
@@ -142,7 +143,7 @@ pub(crate) struct FunctionDefaults {
     pub defaults: Vec<Value>,
 }
 
-impl HeapDataMut<'_> {
+impl<'a> HeapReadOutput<'a> {
     /// Computes hash for immutable heap types that can be used as dict keys.
     ///
     /// Returns `Ok(Some(hash))` for immutable types (Str, Bytes, Tuple of hashables).
@@ -152,9 +153,9 @@ impl HeapDataMut<'_> {
     ///
     /// This is called lazily when the value is first used as a dict key,
     /// avoiding unnecessary hash computation for values that are never used as keys.
-    pub fn compute_hash_if_immutable(
+    pub fn py_hash(
         &self,
-        heap: &mut Heap<impl ResourceTracker>,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
         interns: &Interns,
     ) -> Result<Option<u64>, ResourceError> {
         match self {
@@ -162,27 +163,30 @@ impl HeapDataMut<'_> {
             // hence we don't include the discriminant
             Self::Str(s) => {
                 let mut hasher = DefaultHasher::new();
-                s.as_str().hash(&mut hasher);
+                s.get(reader).as_str().hash(&mut hasher);
                 Ok(Some(hasher.finish()))
             }
             Self::Bytes(b) => {
                 let mut hasher = DefaultHasher::new();
-                b.as_slice().hash(&mut hasher);
+                b.get(reader).as_slice().hash(&mut hasher);
                 Ok(Some(hasher.finish()))
             }
             Self::FrozenSet(fs) => {
                 // FrozenSet hash is XOR of element hashes (order-independent)
                 // Recursion depth is checked inside compute_hash
-                fs.compute_hash(heap, interns)
+                FrozenSet::compute_hash(fs, reader, interns)
             }
             Self::Tuple(t) => {
-                let token = heap.incr_recursion_depth()?;
-                crate::defer_drop!(token, heap);
+                let token = reader.heap.incr_recursion_depth()?;
+                crate::defer_drop!(token, reader);
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
                 // Tuple is hashable only if all elements are hashable
-                for obj in t.as_slice() {
-                    match obj.py_hash(heap, interns)? {
+                let len = t.get(reader).as_slice().len();
+                for i in 0..len {
+                    let obj = t.get(reader).as_slice()[i].clone_with_heap(reader.heap);
+                    defer_drop!(obj, reader);
+                    match obj.py_hash(reader.heap, interns)? {
                         Some(h) => h.hash(&mut hasher),
                         None => return Ok(None),
                     }
@@ -190,13 +194,16 @@ impl HeapDataMut<'_> {
                 Ok(Some(hasher.finish()))
             }
             Self::NamedTuple(nt) => {
-                let token = heap.incr_recursion_depth()?;
-                crate::defer_drop!(token, heap);
+                let token = reader.heap.incr_recursion_depth()?;
+                crate::defer_drop!(token, reader);
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
                 // Hash only by elements (not type_name) to match equality semantics
-                for obj in nt.as_vec() {
-                    match obj.py_hash(heap, interns)? {
+                let len = nt.get(reader).as_vec().len();
+                for i in 0..len {
+                    let obj = nt.get(reader).as_vec()[i].clone_with_heap(reader.heap);
+                    defer_drop!(obj, reader);
+                    match obj.py_hash(reader.heap, interns)? {
                         Some(h) => h.hash(&mut hasher),
                         None => return Ok(None),
                     }
@@ -207,41 +214,41 @@ impl HeapDataMut<'_> {
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
                 // TODO, this is NOT proper hashing, we should somehow hash the function properly
-                closure.func_id.hash(&mut hasher);
+                closure.get(reader).func_id.hash(&mut hasher);
                 Ok(Some(hasher.finish()))
             }
             Self::FunctionDefaults(fd) => {
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
                 // TODO, this is NOT proper hashing, we should somehow hash the function properly
-                fd.func_id.hash(&mut hasher);
+                fd.get(reader).func_id.hash(&mut hasher);
                 Ok(Some(hasher.finish()))
             }
             Self::Range(range) => {
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
-                range.start.hash(&mut hasher);
-                range.stop.hash(&mut hasher);
-                range.step.hash(&mut hasher);
+                range.get(reader).start.hash(&mut hasher);
+                range.get(reader).stop.hash(&mut hasher);
+                range.get(reader).step.hash(&mut hasher);
                 Ok(Some(hasher.finish()))
             }
             // Dataclass hashability depends on the mutable flag
             // Recursion depth is checked inside compute_hash
-            Self::Dataclass(dc) => dc.compute_hash(heap, interns),
+            Self::Dataclass(dc) => Dataclass::py_hash(dc, reader, interns),
             // Slices are immutable and hashable (like in CPython)
             Self::Slice(slice) => {
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
-                slice.start.hash(&mut hasher);
-                slice.stop.hash(&mut hasher);
-                slice.step.hash(&mut hasher);
+                slice.get(reader).start.hash(&mut hasher);
+                slice.get(reader).stop.hash(&mut hasher);
+                slice.get(reader).step.hash(&mut hasher);
                 Ok(Some(hasher.finish()))
             }
             // Path is immutable and hashable
             Self::Path(path) => {
                 let mut hasher = DefaultHasher::new();
                 discriminant(self).hash(&mut hasher);
-                path.as_str().hash(&mut hasher);
+                path.get(reader).as_str().hash(&mut hasher);
                 Ok(Some(hasher.finish()))
             }
             // Mutable types, exceptions, iterators, modules, and async types cannot be hashed
@@ -256,7 +263,7 @@ impl HeapDataMut<'_> {
             | Self::Coroutine(_)
             | Self::GatherFuture(_) => Ok(None),
             // LongInt is immutable and hashable
-            Self::LongInt(li) => Ok(Some(li.hash())),
+            Self::LongInt(li) => Ok(Some(li.get(reader).hash())),
         }
     }
 }
