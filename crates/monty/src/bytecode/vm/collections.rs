@@ -257,17 +257,18 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 _ => "<unknown>".to_string(),
             };
 
-            // Use with_entry_mut to avoid borrow conflict: takes data out temporarily
-            let result = this.heap.with_entry_mut(dict_id, |heap, data| {
-                if let HeapDataMut::Dict(dict) = data {
-                    dict.set(key, value, heap, this.interns)
-                } else {
-                    Err(RunError::internal("DictMerge: entry is not a Dict"))
-                }
-            });
+            let old_value = HeapReader::with(this.heap, |reader| {
+                let HeapReadOutputMut::Dict(mut dict) = reader.read_mut(dict_id) else {
+                    key.drop_with_heap(reader.heap);
+                    value.drop_with_heap(reader.heap);
+                    return Err(RunError::internal("DictSetItem: expected dict on heap"));
+                };
+
+                Dict::set_via_reader(&mut dict, key, value, reader, this.interns)
+            })?;
 
             // If set returned Some, the key already existed (duplicate kwarg)
-            if let Some(old_value) = result? {
+            if let Some(old_value) = old_value {
                 old_value.drop_with_heap(this.heap);
                 return Err(ExcType::type_error_multiple_values(&func_name, &key_str));
             }
@@ -357,13 +358,13 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         };
 
         let old_value = HeapReader::with(self.heap, |reader| {
-            let HeapReadOutputMut::Dict(dict) = reader.read_mut(dict_id) else {
+            let HeapReadOutputMut::Dict(mut dict) = reader.read_mut(dict_id) else {
                 key.drop_with_heap(reader.heap);
                 value.drop_with_heap(reader.heap);
                 return Err(RunError::internal("DictSetItem: expected dict on heap"));
             };
 
-            Dict::set_via_reader(dict, key, value, reader, self.interns)
+            Dict::set_via_reader(&mut dict, key, value, reader, self.interns)
         })?;
 
         // Drop old value if key already existed

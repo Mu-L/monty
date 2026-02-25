@@ -242,7 +242,7 @@ impl Dict {
     /// owns the old value and is responsible for its refcount).
     /// Returns Err if key is unhashable.
     pub fn set_via_reader<'a>(
-        mut this: HeapReadMut<'a, Self>,
+        this: &mut HeapReadMut<'a, Self>,
         key: Value,
         value: Value,
         reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
@@ -254,7 +254,7 @@ impl Dict {
         }
 
         // Handle hash computation errors explicitly so we can drop key/value properly
-        let (opt_index, hash) = match Self::find_index_hash_via_reader(&mut this, &key, reader, interns) {
+        let (opt_index, hash) = match Self::find_index_hash_via_reader(this, &key, reader, interns) {
             Ok(result) => result,
             Err(e) => {
                 // Drop the key and value before returning the error
@@ -629,16 +629,16 @@ impl PyTrait for Dict {
         }
     }
 
-    fn py_setitem(
-        &mut self,
+    fn py_setitem<'a>(
+        this: &mut HeapReadMut<'a, Self>,
         key: Value,
         value: Value,
-        heap: &mut Heap<impl ResourceTracker>,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
         interns: &Interns,
     ) -> RunResult<()> {
         // Drop the old value if one was replaced
-        if let Some(old_value) = self.set(key, value, heap, interns)? {
-            old_value.drop_with_heap(heap);
+        if let Some(old_value) = Self::set_via_reader(this, key, value, reader, interns)? {
+            old_value.drop_with_heap(reader.heap);
         }
         Ok(())
     }

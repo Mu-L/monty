@@ -17,7 +17,7 @@ use crate::{
     asyncio::CallId,
     builtins::Builtins,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{Heap, HeapData, HeapId},
+    heap::{Heap, HeapData, HeapId, HeapReader},
     heap_data::HeapDataMut,
     intern::{BytesId, ExtFunctionId, FunctionId, Interns, LongIntId, StaticStrings, StringId},
     modules::ModuleFunctions,
@@ -113,8 +113,8 @@ impl From<bool> for Value {
     }
 }
 
-impl PyTrait for Value {
-    fn py_type(&self, heap: &Heap<impl ResourceTracker>) -> Type {
+impl Value {
+    pub fn py_type(&self, heap: &Heap<impl ResourceTracker>) -> Type {
         match self {
             Self::Undefined => panic!("Cannot get type of undefined value"),
             Self::Ellipsis => Type::Ellipsis,
@@ -136,16 +136,7 @@ impl PyTrait for Value {
         }
     }
 
-    /// Returns 0 for Value since immediate values are stack-allocated.
-    ///
-    /// Heap-allocated values (Ref variants) have their size tracked when
-    /// the HeapData is allocated, not here.
-    fn py_estimate_size(&self) -> usize {
-        // Value is stack-allocated; heap data is sized separately when allocated
-        0
-    }
-
-    fn py_len(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Option<usize> {
+    pub fn py_len(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Option<usize> {
         match self {
             // Count Unicode characters, not bytes, to match Python semantics
             Self::InternString(string_id) => Some(interns.get_str(*string_id).chars().count()),
@@ -155,7 +146,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_eq(
+    pub fn py_eq(
         &self,
         other: &Self,
         heap: &mut Heap<impl ResourceTracker>,
@@ -253,7 +244,18 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_cmp(
+    /// Python comparison (`<`, `>`, etc.).
+    ///
+    /// For containers, this performs element-wise comparison using the heap
+    /// to resolve nested references. Takes `&mut Heap` to allow lazy hash
+    /// computation for dict key lookups.
+    ///
+    /// The `interns` parameter provides access to interned string content.
+    /// Recursion depth is tracked via `heap.incr_recursion_depth()`.
+    ///
+    /// Returns `Ok(Some(Ordering))` for comparable values, `Ok(None)` if not comparable,
+    /// or `Err(ResourceError::Recursion)` if maximum depth is exceeded.
+    pub fn py_cmp(
         &self,
         other: &Self,
         heap: &mut Heap<impl ResourceTracker>,
@@ -318,7 +320,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+    pub fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         if let Self::Ref(id) = self {
             stack.push(*id);
             // Mark as Dereferenced to prevent Drop panic
@@ -327,7 +329,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_bool(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> bool {
+    pub fn py_bool(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> bool {
         match self {
             Self::Undefined => false,
             Self::Ellipsis => true,
@@ -350,7 +352,18 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_repr_fmt(
+    /// Returns the Python `repr()` string for this value.
+    ///
+    /// Convenience wrapper around `py_repr_fmt` that returns an owned string.
+    pub fn py_repr(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Cow<'static, str> {
+        let mut s = String::new();
+        let mut heap_ids = AHashSet::new();
+        // Unwrap is safe: writing to String never fails
+        self.py_repr_fmt(&mut s, heap, &mut heap_ids, interns).unwrap();
+        Cow::Owned(s)
+    }
+
+    pub fn py_repr_fmt(
         &self,
         f: &mut impl Write,
         heap: &Heap<impl ResourceTracker>,
@@ -406,7 +419,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Cow<'static, str> {
+    pub fn py_str(&self, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> Cow<'static, str> {
         match self {
             Self::InternString(string_id) => interns.get_str(*string_id).to_owned().into(),
             Self::Ref(id) => heap.get(*id).py_str(heap, interns),
@@ -414,12 +427,12 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_add(
+    pub fn py_add(
         &self,
         other: &Self,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> Result<Option<Value>, crate::resource::ResourceError> {
+    ) -> Result<Option<Self>, crate::resource::ResourceError> {
         match (self, other) {
             // Int + Int with overflow detection
             (Self::Int(a), Self::Int(b)) => {
@@ -503,7 +516,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_sub(
+    pub fn py_sub(
         &self,
         other: &Self,
         heap: &mut Heap<impl ResourceTracker>,
@@ -548,7 +561,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_mod(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Self>> {
+    pub fn py_mod(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Self>> {
         match (self, other) {
             (Self::Int(a), Self::Int(b)) => {
                 if *b == 0 {
@@ -617,7 +630,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_mod_eq(&self, other: &Self, right_value: i64) -> Option<bool> {
+    pub fn py_mod_eq(&self, other: &Self, right_value: i64) -> Option<bool> {
         match (self, other) {
             (Self::Int(v1), Self::Int(v2)) => {
                 if let Some(r) = v1.checked_rem(*v2) {
@@ -636,7 +649,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_iadd(
+    pub fn py_iadd(
         &mut self,
         other: Self,
         heap: &mut Heap<impl ResourceTracker>,
@@ -727,12 +740,12 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_mult(
+    pub fn py_mult(
         &self,
         other: &Self,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> RunResult<Option<Value>> {
+    ) -> RunResult<Option<Self>> {
         match (self, other) {
             // Numeric multiplication with overflow promotion to LongInt
             (Self::Int(a), Self::Int(b)) => {
@@ -824,12 +837,12 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_div(
+    pub fn py_div(
         &self,
         other: &Self,
         heap: &mut Heap<impl ResourceTracker>,
         interns: &Interns,
-    ) -> RunResult<Option<Value>> {
+    ) -> RunResult<Option<Self>> {
         match (self, other) {
             // True division always returns float
             (Self::Int(a), Self::Int(b)) => {
@@ -977,7 +990,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_floordiv(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Value>> {
+    pub fn py_floordiv(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Self>> {
         match (self, other) {
             // Floor division: int // int returns int
             (Self::Int(a), Self::Int(b)) => {
@@ -1097,7 +1110,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_pow(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Value>> {
+    pub fn py_pow(&self, other: &Self, heap: &mut Heap<impl ResourceTracker>) -> RunResult<Option<Self>> {
         match (self, other) {
             (Self::Int(base), Self::Int(exp)) => {
                 if *base == 0 && *exp < 0 {
@@ -1305,7 +1318,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_getitem(&self, key: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Self> {
+    pub fn py_getitem(&self, key: &Self, heap: &mut Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Self> {
         match self {
             Self::Ref(id) => {
                 // Need to take entry out to allow mutable heap access
@@ -1367,7 +1380,7 @@ impl PyTrait for Value {
         }
     }
 
-    fn py_setitem(
+    pub fn py_setitem(
         &mut self,
         key: Self,
         value: Self,
@@ -1375,10 +1388,9 @@ impl PyTrait for Value {
         interns: &Interns,
     ) -> RunResult<()> {
         match self {
-            Self::Ref(id) => {
-                let id = *id;
-                heap.with_entry_mut(id, |heap, mut data| data.py_setitem(key, value, heap, interns))
-            }
+            Self::Ref(id) => HeapReader::with(heap, |reader| {
+                reader.read_mut(*id).py_setitem(key, value, reader, interns)
+            }),
             _ => Err(ExcType::type_error(format!(
                 "'{}' object does not support item assignment",
                 self.py_type(heap)

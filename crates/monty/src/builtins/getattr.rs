@@ -8,7 +8,7 @@ use crate::{
     heap::Heap,
     intern::Interns,
     resource::ResourceTracker,
-    types::{AttrCallResult, PyTrait},
+    types::AttrCallResult,
     value::Value,
 };
 

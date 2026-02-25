@@ -282,7 +282,7 @@ impl PyTrait for HeapData {
             Self::FrozenSet(fs) => fs.py_estimate_size(),
             // TODO: should include size of captured cells and defaults
             Self::Closure(_) | Self::FunctionDefaults(_) => 0,
-            Self::Cell(cell) => std::mem::size_of::<Value>() + cell.0.py_estimate_size(),
+            Self::Cell(_) => std::mem::size_of::<CellValue>(),
             Self::Range(_) => std::mem::size_of::<Range>(),
             Self::Slice(s) => s.py_estimate_size(),
             Self::Exception(e) => std::mem::size_of::<SimpleException>() + e.arg().map_or(0, String::len),
@@ -668,23 +668,6 @@ impl PyTrait for HeapData {
             Self::Dict(d) => d.py_getitem(key, heap, interns),
             Self::Range(r) => r.py_getitem(key, heap, interns),
             _ => Err(ExcType::type_error_not_sub(self.py_type(heap))),
-        }
-    }
-
-    fn py_setitem(
-        &mut self,
-        key: Value,
-        value: Value,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
-    ) -> RunResult<()> {
-        match self {
-            Self::Str(s) => s.py_setitem(key, value, heap, interns),
-            Self::Bytes(b) => b.py_setitem(key, value, heap, interns),
-            Self::List(l) => l.py_setitem(key, value, heap, interns),
-            Self::Tuple(t) => t.py_setitem(key, value, heap, interns),
-            Self::Dict(d) => d.py_setitem(key, value, heap, interns),
-            _ => Err(ExcType::type_error_not_sub_assignment(self.py_type(heap))),
         }
     }
 

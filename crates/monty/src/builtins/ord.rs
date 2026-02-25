@@ -7,7 +7,6 @@ use crate::{
     heap::{Heap, HeapData},
     intern::Interns,
     resource::ResourceTracker,
-    types::PyTrait,
     value::Value,
 };
 

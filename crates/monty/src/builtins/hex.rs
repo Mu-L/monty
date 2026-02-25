@@ -9,7 +9,7 @@ use crate::{
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapData},
     resource::ResourceTracker,
-    types::{PyTrait, Str},
+    types::Str,
     value::Value,
 };
 

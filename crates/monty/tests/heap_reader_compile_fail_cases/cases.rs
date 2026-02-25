@@ -39,12 +39,12 @@ fn heap_mutation_while_reading(list_id: HeapId, heap: &mut Heap<impl ResourceTra
 #[cfg(heap_reader_compile_fail_test_double_get_mut)]
 fn double_get_mut(list_id: HeapId, heap: &mut Heap<impl ResourceTracker>) {
     HeapReader::with(heap, |reader| {
-        let mut a = match reader.read(list_id) {
-            HeapReadOutput::List(list) => list,
+        let mut a = match reader.read_mut(list_id) {
+            HeapReadOutputMut::List(list) => list,
             _ => unreachable!(),
         };
         let mut b = match reader.read_mut(list_id) {
-            HeapReadOutput::List(list) => list,
+            HeapReadOutputMut::List(list) => list,
             _ => unreachable!(),
         };
         let ref_a = a.get_mut(reader);

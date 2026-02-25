@@ -8,7 +8,6 @@ use crate::{
     intern::Interns,
     io::PrintWriter,
     resource::ResourceTracker,
-    types::PyTrait,
     value::Value,
 };
 

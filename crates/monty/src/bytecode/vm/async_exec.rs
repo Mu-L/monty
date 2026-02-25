@@ -18,7 +18,7 @@ use crate::{
     heap_data::HeapDataMut,
     intern::FunctionId,
     resource::ResourceTracker,
-    types::{List, PyTrait},
+    types::List,
     value::Value,
 };
 

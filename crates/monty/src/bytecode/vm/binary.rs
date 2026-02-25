@@ -6,7 +6,6 @@ use crate::{
     exception_private::{ExcType, RunError},
     heap::HeapGuard,
     resource::ResourceTracker,
-    types::PyTrait,
     value::BitwiseOp,
 };
 

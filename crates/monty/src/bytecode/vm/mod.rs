@@ -33,7 +33,7 @@ use crate::{
     os::OsFunction,
     parse::CodeRange,
     resource::ResourceTracker,
-    types::{LongInt, MontyIter, PyTrait, iter::advance_on_heap},
+    types::{LongInt, MontyIter, iter::advance_on_heap},
     value::{BitwiseOp, EitherStr, Value},
 };
 

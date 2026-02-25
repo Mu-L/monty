@@ -17,7 +17,7 @@ use crate::{
     parse::CodeRange,
     resource::ResourceTracker,
     types::{
-        AttrCallResult, PyTrait, Str, Type, allocate_tuple,
+        AttrCallResult, Str, Type, allocate_tuple,
         str::{StringRepr, string_repr_fmt},
     },
     value::{EitherStr, Value},

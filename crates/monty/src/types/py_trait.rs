@@ -7,7 +7,7 @@
 /// The trait is designed to work with `enum_dispatch` for efficient virtual
 /// dispatch on `HeapData` without boxing overhead.
 use std::borrow::Cow;
-use std::{cmp::Ordering, fmt::Write};
+use std::fmt::Write;
 
 use ahash::AHashSet;
 
@@ -17,7 +17,7 @@ use crate::{
     args::ArgValues,
     bytecode::VM,
     exception_private::{ExcType, RunResult, SimpleException},
-    heap::{Heap, HeapId},
+    heap::{Heap, HeapId, HeapReadMut, HeapReader},
     intern::{ExtFunctionId, Interns},
     os::OsFunction,
     resource::ResourceTracker,
@@ -117,26 +117,6 @@ pub trait PyTrait {
         interns: &Interns,
     ) -> Result<bool, ResourceError>;
 
-    /// Python comparison (`<`, `>`, etc.).
-    ///
-    /// For containers, this performs element-wise comparison using the heap
-    /// to resolve nested references. Takes `&mut Heap` to allow lazy hash
-    /// computation for dict key lookups.
-    ///
-    /// The `interns` parameter provides access to interned string content.
-    /// Recursion depth is tracked via `heap.incr_recursion_depth()`.
-    ///
-    /// Returns `Ok(Some(Ordering))` for comparable values, `Ok(None)` if not comparable,
-    /// or `Err(ResourceError::Recursion)` if maximum depth is exceeded.
-    fn py_cmp(
-        &self,
-        _other: &Self,
-        _heap: &mut Heap<impl ResourceTracker>,
-        _interns: &Interns,
-    ) -> Result<Option<Ordering>, ResourceError> {
-        Ok(None)
-    }
-
     /// Pushes any contained `HeapId`s onto the stack for reference counting.
     ///
     /// This is called during `dec_ref` to find nested heap references that
@@ -226,7 +206,6 @@ pub trait PyTrait {
         Ok(None)
     }
 
-    /// Optimized helper for `(a % b) == c` comparisons.
     fn py_mod_eq(&self, _other: &Self, _right_value: i64) -> Option<bool> {
         None
     }
@@ -375,16 +354,22 @@ pub trait PyTrait {
     /// The `interns` parameter provides access to interned string content.
     ///
     /// Default implementation returns TypeError.
-    fn py_setitem(
-        &mut self,
+    fn py_setitem<'a>(
+        this: &mut HeapReadMut<'a, Self>,
         _key: Value,
         _value: Value,
-        heap: &mut Heap<impl ResourceTracker>,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
         _interns: &Interns,
-    ) -> RunResult<()> {
+    ) -> RunResult<()>
+    where
+        Self: Sized,
+    {
         Err(SimpleException::new_msg(
             ExcType::TypeError,
-            format!("'{}' object does not support item assignment", self.py_type(heap)),
+            format!(
+                "'{}' object does not support item assignment",
+                this.get(reader).py_type(reader.heap)
+            ),
         )
         .into())
     }

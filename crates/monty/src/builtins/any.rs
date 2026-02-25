@@ -1,14 +1,8 @@
 //! Implementation of the any() builtin function.
 
 use crate::{
-    args::ArgValues,
-    defer_drop, defer_drop_mut,
-    exception_private::RunResult,
-    heap::Heap,
-    intern::Interns,
-    resource::ResourceTracker,
-    types::{MontyIter, PyTrait},
-    value::Value,
+    args::ArgValues, defer_drop, defer_drop_mut, exception_private::RunResult, heap::Heap, intern::Interns,
+    resource::ResourceTracker, types::MontyIter, value::Value,
 };
 
 /// Implementation of the any() builtin function.

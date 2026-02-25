@@ -18,7 +18,7 @@ use crate::{
     os::OsFunction,
     resource::ResourceTracker,
     types::{
-        AttrCallResult, Dict, PyTrait, Type,
+        AttrCallResult, Dict, Type,
         bytes::{bytes_fromhex, call_bytes_method},
         dict::dict_fromkeys,
         str::call_str_method,

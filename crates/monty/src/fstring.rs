@@ -14,7 +14,7 @@ use crate::{
     heap::Heap,
     intern::{Interns, StringId},
     resource::ResourceTracker,
-    types::{PyTrait, Type},
+    types::Type,
     value::Value,
 };
 

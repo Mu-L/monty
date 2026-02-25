@@ -14,7 +14,7 @@ use crate::{
     exception_private::RunResult,
     heap::{HeapData, HeapGuard},
     resource::ResourceTracker,
-    types::{List, MontyIter, PyTrait},
+    types::{List, MontyIter},
     value::Value,
 };
 

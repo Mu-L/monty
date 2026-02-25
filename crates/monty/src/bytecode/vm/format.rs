@@ -6,7 +6,7 @@ use crate::{
     exception_private::{ExcType, RunError, SimpleException},
     fstring::{ParsedFormatSpec, ascii_escape, decode_format_spec, format_string, format_with_spec},
     resource::ResourceTracker,
-    types::{PyTrait, str::allocate_string},
+    types::str::allocate_string,
     value::Value,
 };
 

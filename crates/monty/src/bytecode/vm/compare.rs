@@ -5,7 +5,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, RunError},
     resource::ResourceTracker,
-    types::{LongInt, PyTrait},
+    types::LongInt,
     value::Value,
 };
 

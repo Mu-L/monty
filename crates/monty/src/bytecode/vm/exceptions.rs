@@ -8,7 +8,7 @@ use crate::{
     heap::{HeapData, HeapGuard},
     intern::{StaticStrings, StringId},
     resource::ResourceTracker,
-    types::{PyTrait, Type},
+    types::Type,
     value::Value,
 };
 

@@ -6,7 +6,7 @@ use crate::{
     exception_private::{ExcType, RunResult, SimpleException},
     heap::Heap,
     resource::ResourceTracker,
-    types::{PyTrait, str::allocate_char},
+    types::str::allocate_char,
     value::Value,
 };
 

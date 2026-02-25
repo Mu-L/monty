@@ -11,7 +11,7 @@ use crate::{
     intern::Interns,
     resource::ResourceTracker,
     sorting::{apply_permutation, sort_indices},
-    types::{List, MontyIter, PyTrait},
+    types::{List, MontyIter},
     value::Value,
 };
 

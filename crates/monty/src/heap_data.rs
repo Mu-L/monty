@@ -14,7 +14,7 @@ use crate::{
     asyncio::{Coroutine, GatherFuture, GatherItem},
     bytecode::VM,
     exception_private::{RunResult, SimpleException},
-    heap::{Heap, HeapId},
+    heap::{Heap, HeapId, HeapReadOutputMut, HeapReader},
     intern::{FunctionId, Interns},
     types::{
         AttrCallResult, Bytes, Dataclass, Dict, FrozenSet, List, LongInt, Module, MontyIter, NamedTuple, Path, PyTrait,
@@ -261,10 +261,7 @@ impl HeapDataMut<'_> {
     }
 }
 
-/// Manual implementation of AbstractValue dispatch for HeapData.
-///
-/// This provides efficient dispatch without boxing overhead by matching on
-/// the enum variant and delegating to the inner type's implementation.
+/// FIXME: need to remove this implementation
 impl PyTrait for HeapDataMut<'_> {
     fn py_type(&self, heap: &Heap<impl ResourceTracker>) -> Type {
         match self {
@@ -303,7 +300,7 @@ impl PyTrait for HeapDataMut<'_> {
             Self::FrozenSet(fs) => fs.py_estimate_size(),
             // TODO: should include size of captured cells and defaults
             Self::Closure(_) | Self::FunctionDefaults(_) => 0,
-            Self::Cell(cell) => std::mem::size_of::<Value>() + cell.0.py_estimate_size(),
+            Self::Cell(_) => std::mem::size_of::<CellValue>(),
             Self::Range(_) => std::mem::size_of::<Range>(),
             Self::Slice(s) => s.py_estimate_size(),
             Self::Exception(e) => std::mem::size_of::<SimpleException>() + e.arg().map_or(0, String::len),
@@ -692,23 +689,6 @@ impl PyTrait for HeapDataMut<'_> {
         }
     }
 
-    fn py_setitem(
-        &mut self,
-        key: Value,
-        value: Value,
-        heap: &mut Heap<impl ResourceTracker>,
-        interns: &Interns,
-    ) -> RunResult<()> {
-        match self {
-            Self::Str(s) => s.py_setitem(key, value, heap, interns),
-            Self::Bytes(b) => b.py_setitem(key, value, heap, interns),
-            Self::List(l) => l.py_setitem(key, value, heap, interns),
-            Self::Tuple(t) => t.py_setitem(key, value, heap, interns),
-            Self::Dict(d) => d.py_setitem(key, value, heap, interns),
-            _ => Err(ExcType::type_error_not_sub_assignment(self.py_type(heap))),
-        }
-    }
-
     fn py_getattr(
         &self,
         attr: &EitherStr,
@@ -724,6 +704,49 @@ impl PyTrait for HeapDataMut<'_> {
             Self::Path(p) => p.py_getattr(attr, heap, interns),
             // All other types don't support attribute access via py_getattr
             _ => Ok(None),
+        }
+    }
+}
+
+impl<'a> HeapReadOutputMut<'a> {
+    pub fn py_setitem(
+        &mut self,
+        key: Value,
+        value: Value,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
+        interns: &Interns,
+    ) -> RunResult<()> {
+        match self {
+            Self::Str(s) => Str::py_setitem(s, key, value, reader, interns),
+            Self::Bytes(b) => Bytes::py_setitem(b, key, value, reader, interns),
+            Self::List(l) => List::py_setitem(l, key, value, reader, interns),
+            Self::Tuple(t) => Tuple::py_setitem(t, key, value, reader, interns),
+            Self::Dict(d) => Dict::py_setitem(d, key, value, reader, interns),
+            _ => Err(ExcType::type_error_not_sub_assignment(self.py_type(reader))),
+        }
+    }
+
+    pub fn py_type(&self, reader: &HeapReader<'a, Heap<impl ResourceTracker>>) -> Type {
+        match self {
+            HeapReadOutputMut::Str(_) => Type::Str,
+            HeapReadOutputMut::Bytes(_) => Type::Bytes,
+            HeapReadOutputMut::List(_) => Type::List,
+            HeapReadOutputMut::Tuple(_) => Type::Tuple,
+            HeapReadOutputMut::NamedTuple(_) => Type::NamedTuple,
+            HeapReadOutputMut::Dict(_) => Type::Dict,
+            HeapReadOutputMut::Set(_) => Type::Set,
+            HeapReadOutputMut::FrozenSet(_) => Type::FrozenSet,
+            HeapReadOutputMut::Closure(_) | HeapReadOutputMut::FunctionDefaults(_) => Type::Function,
+            HeapReadOutputMut::Cell(_) => Type::Cell,
+            HeapReadOutputMut::Range(_) => Type::Range,
+            HeapReadOutputMut::Slice(_) => Type::Slice,
+            HeapReadOutputMut::Exception(e) => e.get(reader).py_type(),
+            HeapReadOutputMut::Dataclass(_) => Type::Dataclass,
+            HeapReadOutputMut::Iter(_) => Type::Iterator,
+            HeapReadOutputMut::LongInt(_) => Type::Int,
+            HeapReadOutputMut::Module(_) => Type::Module,
+            HeapReadOutputMut::Coroutine(_) | HeapReadOutputMut::GatherFuture(_) => Type::Coroutine,
+            HeapReadOutputMut::Path(_) => Type::Path,
         }
     }
 }

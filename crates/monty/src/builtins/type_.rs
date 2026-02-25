@@ -2,8 +2,7 @@
 
 use super::Builtins;
 use crate::{
-    args::ArgValues, defer_drop, exception_private::RunResult, heap::Heap, resource::ResourceTracker, types::PyTrait,
-    value::Value,
+    args::ArgValues, defer_drop, exception_private::RunResult, heap::Heap, resource::ResourceTracker, value::Value,
 };
 
 /// Implementation of the type() builtin function.

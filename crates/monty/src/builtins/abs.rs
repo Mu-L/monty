@@ -9,7 +9,7 @@ use crate::{
     exception_private::{ExcType, RunResult, SimpleException},
     heap::{Heap, HeapData},
     resource::ResourceTracker,
-    types::{LongInt, PyTrait},
+    types::LongInt,
     value::Value,
 };
 

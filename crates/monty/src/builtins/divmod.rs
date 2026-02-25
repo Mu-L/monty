@@ -10,7 +10,7 @@ use crate::{
     exception_private::{ExcType, RunResult, SimpleException},
     heap::{Heap, HeapData},
     resource::{ResourceTracker, check_div_size},
-    types::{LongInt, PyTrait, allocate_tuple},
+    types::{LongInt, allocate_tuple},
     value::{Value, floor_divmod},
 };
 

@@ -9,9 +9,7 @@ use crate::{
     heap::{Heap, HeapData},
     intern::Interns,
     resource::ResourceTracker,
-    types::{
-        Bytes, Dict, FrozenSet, List, LongInt, MontyIter, Path, PyTrait, Range, Set, Slice, Str, Tuple, str::StringRepr,
-    },
+    types::{Bytes, Dict, FrozenSet, List, LongInt, MontyIter, Path, Range, Set, Slice, Str, Tuple, str::StringRepr},
     value::Value,
 };
 

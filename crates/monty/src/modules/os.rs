@@ -16,7 +16,7 @@ use crate::{
     modules::ModuleFunctions,
     os::OsFunction,
     resource::{ResourceError, ResourceTracker},
-    types::{AttrCallResult, Module, Property, PyTrait},
+    types::{AttrCallResult, Module, Property},
     value::Value,
 };
 

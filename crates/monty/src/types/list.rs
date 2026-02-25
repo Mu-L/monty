@@ -262,15 +262,15 @@ impl PyTrait for List {
         Ok(self.items[idx].clone_with_heap(heap))
     }
 
-    fn py_setitem(
-        &mut self,
+    fn py_setitem<'a>(
+        this: &mut HeapReadMut<'a, Self>,
         key: Value,
         value: Value,
-        heap: &mut Heap<impl ResourceTracker>,
+        reader: &mut HeapReader<'a, Heap<impl ResourceTracker>>,
         _interns: &Interns,
     ) -> RunResult<()> {
-        defer_drop!(key, heap);
-        defer_drop_mut!(value, heap);
+        defer_drop!(key, reader);
+        defer_drop_mut!(value, reader);
 
         // Extract integer index, accepting Int, Bool (True=1, False=0), and LongInt.
         // Note: The LongInt-to-i64 conversion is defensive code. In normal execution,
@@ -281,25 +281,25 @@ impl PyTrait for List {
             Value::Int(i) => *i,
             Value::Bool(b) => i64::from(*b),
             Value::Ref(heap_id) => {
-                if let HeapData::LongInt(li) = heap.get(*heap_id) {
+                if let HeapData::LongInt(li) = reader.heap.get(*heap_id) {
                     if let Some(i) = li.to_i64() {
                         i
                     } else {
                         return Err(ExcType::index_error_int_too_large());
                     }
                 } else {
-                    let key_type = key.py_type(heap);
+                    let key_type = key.py_type(reader.heap);
                     return Err(ExcType::type_error_list_assignment_indices(key_type));
                 }
             }
             _ => {
-                let key_type = key.py_type(heap);
+                let key_type = key.py_type(reader.heap);
                 return Err(ExcType::type_error_list_assignment_indices(key_type));
             }
         };
 
         // Normalize negative indices (Python-style: -1 = last element)
-        let len = i64::try_from(self.items.len()).expect("list length exceeds i64::MAX");
+        let len = i64::try_from(this.get(reader).items.len()).expect("list length exceeds i64::MAX");
         let normalized_index = if index < 0 { index + len } else { index };
 
         // Bounds check
@@ -312,12 +312,12 @@ impl PyTrait for List {
         // Update contains_refs if storing a Ref (must check before swap,
         // since after swap `value` holds the old item)
         if matches!(*value, Value::Ref(_)) {
-            self.contains_refs = true;
-            heap.mark_potential_cycle();
+            this.get_mut(reader).contains_refs = true;
+            reader.heap.mark_potential_cycle();
         }
 
         // Replace value (old one dropped by defer_drop_mut guard)
-        std::mem::swap(&mut self.items[idx], value);
+        std::mem::swap(&mut this.get_mut(reader).items[idx], value);
 
         Ok(())
     }
@@ -929,8 +929,8 @@ mod tests {
         let new_value = Value::Int(99);
         heap.inc_ref(index_id);
 
-        let result = heap.with_entry_mut(list_id, |heap, mut data| {
-            data.py_setitem(key, new_value, heap, &interns)
+        let result = HeapReader::with(&mut heap, |reader| {
+            reader.read_mut(list_id).py_setitem(key, new_value, reader, &interns)
         });
 
         assert!(result.is_ok());
@@ -958,8 +958,8 @@ mod tests {
         let new_value = Value::Int(99);
         heap.inc_ref(index_id);
 
-        let result = heap.with_entry_mut(list_id, |heap, mut data| {
-            data.py_setitem(key, new_value, heap, &interns)
+        let result = HeapReader::with(&mut heap, |reader| {
+            reader.read_mut(list_id).py_setitem(key, new_value, reader, &interns)
         });
 
         assert!(result.is_ok());
@@ -985,8 +985,8 @@ mod tests {
         heap.inc_ref(index_id);
 
         // This should fail with IndexError because i64::MAX is out of bounds for a 1-element list
-        let result = heap.with_entry_mut(list_id, |heap, mut data| {
-            data.py_setitem(key, new_value, heap, &interns)
+        let result = HeapReader::with(&mut heap, |reader| {
+            reader.read_mut(list_id).py_setitem(key, new_value, reader, &interns)
         });
 
         assert!(result.is_err());

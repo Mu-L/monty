@@ -7,7 +7,7 @@ use crate::{
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapData},
     resource::ResourceTracker,
-    types::{PyTrait, Type},
+    types::Type,
     value::Value,
 };
 

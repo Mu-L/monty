@@ -7,7 +7,7 @@ use crate::{
     heap::{Heap, HeapGuard},
     intern::Interns,
     resource::ResourceTracker,
-    types::{MontyIter, PyTrait, Type},
+    types::{MontyIter, Type},
     value::Value,
 };
 
