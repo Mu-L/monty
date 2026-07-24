@@ -8,7 +8,7 @@
 //! Loops stay at ~256 KiB — safe, not a real OOM.
 
 use monty::MontyRun;
-use monty_types::{CompileOptions, ExcType, LimitedTracker, NoLimitTracker, PrintStream, PrintWriter, ResourceLimits};
+use monty_types::{CompileOptions, ExcType, PrintStream, PrintWriter, ResourceLimits, ResourceTracker};
 
 /// One KiB payload reused across prints so heap growth stays small.
 const CHUNK: &str = "A";
@@ -35,7 +35,7 @@ fn collect_string_respects_max_bytes() {
     let err = ex
         .run(
             vec![],
-            NoLimitTracker,
+            ResourceTracker::default(),
             PrintWriter::CollectString(&mut output, Some(LIMIT_BYTES)),
         )
         .expect_err("expected MemoryError when collect buffer exceeds max_bytes");
@@ -65,7 +65,7 @@ fn collect_streams_respects_max_bytes() {
     let err = ex
         .run(
             vec![],
-            NoLimitTracker,
+            ResourceTracker::default(),
             PrintWriter::CollectStreams(&mut streams, Some(LIMIT_BYTES)),
         )
         .expect_err("expected MemoryError when collect buffer exceeds max_bytes");
@@ -87,9 +87,9 @@ fn collect_streams_respects_max_bytes() {
 #[test]
 fn disabled_print_stays_under_max_memory() {
     let ex = monty_run(print_loop_code());
-    let limits = ResourceLimits::new().max_memory(LIMIT_BYTES);
+    let limits = ResourceLimits::default().max_memory(LIMIT_BYTES);
 
-    let result = ex.run(vec![], LimitedTracker::new(limits), PrintWriter::Disabled);
+    let result = ex.run(vec![], ResourceTracker::new(limits), PrintWriter::Disabled);
     assert!(result.is_ok(), "control failed: {result:?}");
 }
 
@@ -99,8 +99,12 @@ fn collect_string_unlimited_allows_growth_past_64kib() {
     let ex = monty_run(print_loop_code());
     let mut output = String::new();
 
-    ex.run(vec![], NoLimitTracker, PrintWriter::CollectString(&mut output, None))
-        .expect("unlimited collect should succeed");
+    ex.run(
+        vec![],
+        ResourceTracker::default(),
+        PrintWriter::CollectString(&mut output, None),
+    )
+    .expect("unlimited collect should succeed");
 
     assert!(
         output.len() >= EXPECTED_MIN_BYTES,
@@ -121,8 +125,12 @@ fn collect_streams_helper_merges_newline_push() {
     let ex = monty_run("print('hi')");
     let mut streams: Vec<(PrintStream, String)> = Vec::new();
 
-    ex.run(vec![], NoLimitTracker, PrintWriter::collect_streams(&mut streams))
-        .expect("default-capped collect_streams should accept a short print");
+    ex.run(
+        vec![],
+        ResourceTracker::default(),
+        PrintWriter::collect_streams(&mut streams),
+    )
+    .expect("default-capped collect_streams should accept a short print");
 
     assert_eq!(streams, vec![(PrintStream::Stdout, "hi\n".to_owned())]);
 }
@@ -134,8 +142,12 @@ fn collect_streams_empty_print_pushes_newline_entry() {
     let ex = monty_run("print()");
     let mut streams: Vec<(PrintStream, String)> = Vec::new();
 
-    ex.run(vec![], NoLimitTracker, PrintWriter::collect_streams(&mut streams))
-        .expect("empty print should succeed");
+    ex.run(
+        vec![],
+        ResourceTracker::default(),
+        PrintWriter::collect_streams(&mut streams),
+    )
+    .expect("empty print should succeed");
 
     assert_eq!(streams, vec![(PrintStream::Stdout, "\n".to_owned())]);
 }
@@ -147,7 +159,11 @@ fn collect_string_max_bytes_rejects_newline_push() {
     let mut output = String::new();
 
     let err = ex
-        .run(vec![], NoLimitTracker, PrintWriter::CollectString(&mut output, Some(1)))
+        .run(
+            vec![],
+            ResourceTracker::default(),
+            PrintWriter::CollectString(&mut output, Some(1)),
+        )
         .expect_err("expected MemoryError on newline push past max_bytes");
 
     assert_eq!(err.exc_type(), ExcType::MemoryError);
@@ -164,7 +180,7 @@ fn collect_streams_max_bytes_rejects_newline_push() {
     let err = ex
         .run(
             vec![],
-            NoLimitTracker,
+            ResourceTracker::default(),
             PrintWriter::CollectStreams(&mut streams, Some(1)),
         )
         .expect_err("expected MemoryError on newline push past max_bytes");

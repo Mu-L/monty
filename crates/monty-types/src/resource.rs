@@ -1,6 +1,5 @@
-//! Resource limits: the [`ResourceTracker`] trait the interpreter heap/VM
-//! are generic over, plus the stock [`NoLimitTracker`]/[`LimitedTracker`]
-//! implementations and their [`ResourceLimits`] configuration.
+//! Resource limits: the [`ResourceTracker`] used by the interpreter heap/VM
+//! and its [`ResourceLimits`] configuration.
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::Instant;
@@ -56,174 +55,16 @@ impl fmt::Display for ResourceError {
 }
 
 impl Error for ResourceError {}
-/// Trait for tracking resource usage and scheduling garbage collection.
-///
-/// Implementations can enforce limits on time and memory, as well as
-/// schedule periodic garbage collection.
-///
-/// All implementations should eventually trigger garbage collection to handle
-/// reference cycles. [`gc_interval`](Self::gc_interval) controls *frequency*,
-/// not whether GC runs at all.
-pub trait ResourceTracker: fmt::Debug {
-    /// Called when memory is freed (during dec_ref or garbage collection).
-    ///
-    /// # Arguments
-    /// * `size` - Size in bytes of the freed allocation
-    fn on_free(&self, get_size: impl FnOnce() -> usize);
-
-    /// Called periodically (at statement boundaries) to check time limits.
-    ///
-    /// Returns `Ok(())` if within time limit, or `Err(ResourceError::Time)`
-    /// if the limit is exceeded.
-    ///
-    /// Takes `&self` rather than `&mut self` because checking elapsed time is a
-    /// read-only operation. This allows time checks in contexts that only have
-    /// an immutable heap reference, such as `py_repr_fmt`.
-    fn check_time(&self) -> Result<(), ResourceError>;
-
-    /// Called before pushing a new call frame to check recursion depth.
-    ///
-    /// Returns `Ok(())` if within recursion limit, or `Err(ResourceError::Recursion)`
-    /// if the limit would be exceeded.
-    ///
-    /// # Arguments
-    /// * `current_depth` - Current call stack depth (before the new frame is pushed)
-    fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError>;
-
-    /// Called before operations that may produce large results (>100KB).
-    ///
-    /// This allows pre-emptive rejection of operations like `2 ** 10_000_000`
-    /// before the memory is actually allocated. The check only happens for
-    /// estimated result sizes above `LARGE_RESULT_THRESHOLD` to avoid overhead
-    /// on small operations.
-    ///
-    /// # Arguments
-    /// * `estimated_bytes` - Approximate size of the result in bytes
-    ///
-    /// Returns `Ok(())` to allow the operation, or `Err(ResourceError)` to reject.
-    fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError>;
-
-    /// Called before tracked memory grows: a new heap allocation, in-place
-    /// container growth (`list.append`, `dict[k] = v`), or a `StringBuilder`
-    /// reservation.
-    ///
-    /// Returns `Ok(())` if the growth should proceed, or `Err(ResourceError)`
-    /// if a limit would be exceeded. Balanced by [`on_free`](Self::on_free):
-    /// entry release reads `py_estimate_size()`, which includes in-place growth.
-    ///
-    /// # Arguments
-    /// * `get_additional` - Lazily computes the approximate growth in bytes;
-    ///   implementations that ignore size (`NoLimitTracker`, or `LimitedTracker`
-    ///   with no memory limit) never pay for it
-    fn on_grow(&self, get_additional: impl FnOnce() -> usize) -> Result<(), ResourceError>;
-
-    /// Returns the configured garbage collection interval, in GC-tracked
-    /// allocations.
-    ///
-    /// The cycle collector runs at most once per `gc_interval` GC-tracked
-    /// allocations, and additionally short-circuits when no cycle candidates
-    /// are pending — so programs that never form cycles pay no collector
-    /// cost regardless of their allocation rate.
-    ///
-    /// Implementations that do not expose a configurable GC interval should
-    /// return `None`, which tells the heap to use its built-in default
-    /// scheduling threshold.
-    fn gc_interval(&self) -> Option<usize>;
-
-    /// Called when the VM enters its execution loop from a host boundary
-    /// (`VM::run_external`), starting one execution window.
-    ///
-    /// Paired with [`on_execution_stop`](Self::on_execution_stop) and never
-    /// nested — VM-internal re-entry (task switches, host-initiated function
-    /// evaluation) uses the raw run loop, so its time falls inside the
-    /// enclosing window. Trackers that measure execution time run their
-    /// clock between the pair; the clock is *not* running while execution is
-    /// suspended waiting on the host (external function calls) or between
-    /// feeds. Default is a no-op.
-    fn on_execution_start(&self) {}
-
-    /// Called when the VM leaves its execution loop — on completion, error,
-    /// or suspension at an external call. See [`on_execution_start`](Self::on_execution_start).
-    fn on_execution_stop(&self) {}
-
-    /// Lowers the active recursion-depth limit to `new_limit`.
-    ///
-    /// Exposed under the `test-hooks` feature so `sys.setrecursionlimit` can
-    /// tighten the depth ceiling from inside fixture code. Implementations
-    /// MUST refuse to *raise* the limit above whatever ceiling the host
-    /// configured at construction time — that would let sandboxed code
-    /// escape the host-imposed safety bound.
-    ///
-    /// Returns `Ok(())` when the requested limit was applied (including the
-    /// no-op case `new_limit == current`). Returns `Err(current)` when the
-    /// request would raise the limit, where `current` is the active limit
-    /// (or `None` if the tracker has no settable limit at all). Callers
-    /// surface this as a `ValueError` in the Python layer.
-    ///
-    /// The default implementation rejects all requests, so wrapper trackers
-    /// that should expose this capability must explicitly delegate to their
-    /// inner tracker.
-    #[cfg(feature = "test-hooks")]
-    fn lower_recursion_limit(&self, _new_limit: usize) -> Result<(), Option<usize>> {
-        Err(None)
-    }
-}
-
-/// A resource tracker that imposes no limits except default recursion limit.
-///
-/// Recursion limit is set to the cpython default of 1000.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct NoLimitTracker;
-
-impl ResourceTracker for NoLimitTracker {
-    #[inline]
-    fn on_free(&self, _: impl FnOnce() -> usize) {}
-
-    #[inline]
-    fn check_time(&self) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    #[inline]
-    fn on_grow(&self, _: impl FnOnce() -> usize) -> Result<(), ResourceError> {
-        Ok(())
-    }
-
-    /// Set the recursion limit to 1000.
-    ///
-    /// The high limit here may cause stack overflow errors in debug mode, but do not those errors should
-    /// not occur with release builds.
-    #[inline]
-    fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError> {
-        const DEFAULT_RECURSION_LIMIT: usize = 1000;
-        if current_depth >= DEFAULT_RECURSION_LIMIT {
-            Err(ResourceError::Recursion {
-                limit: DEFAULT_RECURSION_LIMIT,
-                depth: current_depth + 1,
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    #[inline]
-    fn check_large_result(&self, _estimated_bytes: usize) -> Result<(), ResourceError> {
-        // No limit - always allow operations regardless of result size
-        Ok(())
-    }
-
-    #[inline]
-    fn gc_interval(&self) -> Option<usize> {
-        None
-    }
-}
 
 /// Configuration for resource limits.
 ///
-/// All limits are optional - set to `None` to disable a specific limit.
-/// Use `ResourceLimits::default()` for no limits, or build custom limits
-/// with the builder pattern.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+/// The time/memory/GC limits are optional — set to `None` to disable — but
+/// recursion depth is always bounded (default
+/// [`DEFAULT_MAX_RECURSION_DEPTH`]): unbounded recursion would let sandboxed
+/// code overflow the native stack and abort the process. Use
+/// `ResourceLimits::default()` for the recursion-only defaults, or build
+/// custom limits with the builder pattern.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResourceLimits {
     /// Maximum execution time.
     pub max_duration: Option<Duration>,
@@ -232,22 +73,25 @@ pub struct ResourceLimits {
     /// Run garbage collection every N GC-tracked allocations.
     pub gc_interval: Option<usize>,
     /// Maximum recursion depth (function call stack depth).
-    pub max_recursion_depth: Option<usize>,
+    pub max_recursion_depth: usize,
 }
 
 /// Recommended maximum recursion depth if not otherwise specified.
 pub const DEFAULT_MAX_RECURSION_DEPTH: usize = 1000;
 
-impl ResourceLimits {
-    /// Creates a new ResourceLimits with all limits disabled, except max recursion which is set to 1000.
-    #[must_use]
-    pub fn new() -> Self {
+/// Creates a new ResourceLimits with all limits disabled, except max recursion which is set to 1000.
+impl Default for ResourceLimits {
+    fn default() -> Self {
         Self {
-            max_recursion_depth: Some(1000),
-            ..Default::default()
+            max_duration: None,
+            max_memory: None,
+            gc_interval: None,
+            max_recursion_depth: DEFAULT_MAX_RECURSION_DEPTH,
         }
     }
+}
 
+impl ResourceLimits {
     /// Sets the maximum execution duration.
     #[must_use]
     pub fn max_duration(mut self, limit: Duration) -> Self {
@@ -271,7 +115,7 @@ impl ResourceLimits {
 
     /// Sets the maximum recursion depth (function call stack depth).
     #[must_use]
-    pub fn max_recursion_depth(mut self, limit: Option<usize>) -> Self {
+    pub fn max_recursion_depth(mut self, limit: usize) -> Self {
         self.max_recursion_depth = limit;
         self
     }
@@ -302,7 +146,7 @@ const TIME_CHECK_INTERVAL: u16 = 10;
 /// serialized, so a deserialized session resumes its budget where it left
 /// off rather than restarting from zero.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct LimitedTracker {
+pub struct ResourceTracker {
     limits: ResourceLimits,
     /// Execution time accumulated by completed `on_execution_start`/`stop`
     /// windows. Serialized so time budgets survive dump/load. The serde
@@ -325,7 +169,7 @@ pub struct LimitedTracker {
     /// deserializes to) means "no override, use the configured ceiling".
     /// `Some(N)` means "use `N` as the live recursion ceiling instead", and
     /// is only ever populated by
-    /// [`lower_recursion_limit`](ResourceTracker::lower_recursion_limit)
+    /// [`lower_recursion_limit`](Self::lower_recursion_limit)
     /// under the `test-hooks` feature — `sys.setrecursionlimit` uses it to
     /// tighten the bound from Python code without escaping the
     /// host-configured ceiling.
@@ -337,8 +181,14 @@ pub struct LimitedTracker {
     recursion_limit_override: Cell<Option<usize>>,
 }
 
-impl LimitedTracker {
-    /// Creates a new LimitedTracker with the given limits.
+impl Default for ResourceTracker {
+    fn default() -> Self {
+        Self::new(ResourceLimits::default())
+    }
+}
+
+impl ResourceTracker {
+    /// Creates a new ResourceTracker with the given limits.
     ///
     /// The execution-time clock starts at zero and only runs while the VM
     /// executes, so the tracker can be created any amount of time before
@@ -357,8 +207,11 @@ impl LimitedTracker {
 
     /// Returns the live recursion ceiling: the override if one is in effect,
     /// otherwise the configured `max_recursion_depth`.
-    fn active_recursion_limit(&self) -> Option<usize> {
-        self.recursion_limit_override.get().or(self.limits.max_recursion_depth)
+    #[inline]
+    fn active_recursion_limit(&self) -> usize {
+        self.recursion_limit_override
+            .get()
+            .unwrap_or(self.limits.max_recursion_depth)
     }
 
     /// Returns the current approximate memory usage.
@@ -397,10 +250,13 @@ impl LimitedTracker {
         self.limits.max_duration = Some(duration);
         self.total_execution_time.set(Duration::ZERO);
     }
-}
 
-impl ResourceTracker for LimitedTracker {
-    fn on_free(&self, get_size: impl FnOnce() -> usize) {
+    /// Called when memory is freed (during dec_ref or garbage collection).
+    ///
+    /// `get_size` lazily computes the size in bytes of the freed allocation;
+    /// it is never called when no memory limit is configured.
+    #[inline]
+    pub fn on_free(&self, get_size: impl FnOnce() -> usize) {
         // Memory is only tracked when a limit is configured (`on_grow` skips
         // the size computation otherwise), so skip symmetrically here.
         if self.limits.max_memory.is_some() {
@@ -409,7 +265,17 @@ impl ResourceTracker for LimitedTracker {
         }
     }
 
-    fn on_grow(&self, get_additional: impl FnOnce() -> usize) -> Result<(), ResourceError> {
+    /// Called before tracked memory grows: a new heap allocation, in-place
+    /// container growth (`list.append`, `dict[k] = v`), or a `StringBuilder`
+    /// reservation.
+    ///
+    /// Returns `Ok(())` if the growth should proceed, or `Err(ResourceError)`
+    /// if a limit would be exceeded. Balanced by [`on_free`](Self::on_free):
+    /// entry release reads `py_estimate_size()`, which includes in-place growth.
+    /// `get_additional` lazily computes the approximate growth in bytes and is
+    /// never called when no memory limit is configured.
+    #[inline]
+    pub fn on_grow(&self, get_additional: impl FnOnce() -> usize) -> Result<(), ResourceError> {
         if let Some(max) = self.limits.max_memory {
             // Saturating: a wrapping add on 32-bit targets must not slip past
             // the limit.
@@ -427,7 +293,16 @@ impl ResourceTracker for LimitedTracker {
         Ok(())
     }
 
-    fn check_time(&self) -> Result<(), ResourceError> {
+    /// Called periodically (at statement boundaries) to check time limits.
+    ///
+    /// Returns `Ok(())` if within time limit, or `Err(ResourceError::Time)`
+    /// if the limit is exceeded.
+    ///
+    /// Takes `&self` rather than `&mut self` because checking elapsed time is a
+    /// read-only operation. This allows time checks in contexts that only have
+    /// an immutable heap reference, such as `py_repr_fmt`.
+    #[inline]
+    pub fn check_time(&self) -> Result<(), ResourceError> {
         if let Some(max) = self.limits.max_duration {
             self.check_counter.update(|c| c.wrapping_add(1));
             if self.check_counter.get().is_multiple_of(TIME_CHECK_INTERVAL) {
@@ -446,20 +321,32 @@ impl ResourceTracker for LimitedTracker {
         Ok(())
     }
 
-    fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError> {
-        if let Some(max) = self.active_recursion_limit() {
-            // current_depth is before push, so new depth would be current_depth + 1
-            if current_depth >= max {
-                return Err(ResourceError::Recursion {
-                    limit: max,
-                    depth: current_depth + 1,
-                });
-            }
+    /// Called before pushing a new call frame to check recursion depth.
+    ///
+    /// Returns `Ok(())` if within recursion limit, or `Err(ResourceError::Recursion)`
+    /// if the limit would be exceeded. `current_depth` is the call stack depth
+    /// before the new frame is pushed.
+    #[inline]
+    pub fn check_recursion_depth(&self, current_depth: usize) -> Result<(), ResourceError> {
+        let limit = self.active_recursion_limit();
+        // current_depth is before push, so new depth would be current_depth + 1
+        if current_depth >= limit {
+            return Err(ResourceError::Recursion {
+                limit,
+                depth: current_depth + 1,
+            });
         }
         Ok(())
     }
 
-    fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError> {
+    /// Called before operations that may produce large results (>100KB).
+    ///
+    /// This allows pre-emptive rejection of operations like `2 ** 10_000_000`
+    /// before the memory is actually allocated. The check only happens for
+    /// estimated result sizes above `LARGE_RESULT_THRESHOLD` to avoid overhead
+    /// on small operations.
+    #[inline]
+    pub fn check_large_result(&self, estimated_bytes: usize) -> Result<(), ResourceError> {
         if let Some(max) = self.limits.max_memory {
             let new_memory = self.current_memory.get().saturating_add(estimated_bytes);
             if new_memory > max {
@@ -472,11 +359,30 @@ impl ResourceTracker for LimitedTracker {
         Ok(())
     }
 
-    fn gc_interval(&self) -> Option<usize> {
+    /// Returns the configured garbage collection interval, in GC-tracked
+    /// allocations.
+    ///
+    /// The cycle collector runs at most once per `gc_interval` GC-tracked
+    /// allocations, and additionally short-circuits when no cycle candidates
+    /// are pending — so programs that never form cycles pay no collector
+    /// cost regardless of their allocation rate. `None` tells the heap to use
+    /// its built-in default scheduling threshold.
+    #[must_use]
+    #[inline]
+    pub fn gc_interval(&self) -> Option<usize> {
         self.limits.gc_interval
     }
 
-    fn on_execution_start(&self) {
+    /// Called when the VM enters its execution loop from a host boundary
+    /// (`VM::run_external`), starting one execution window.
+    ///
+    /// Paired with [`on_execution_stop`](Self::on_execution_stop) and never
+    /// nested — VM-internal re-entry (task switches, host-initiated function
+    /// evaluation) uses the raw run loop, so its time falls inside the
+    /// enclosing window. The execution-time clock runs between the pair; it is
+    /// *not* running while execution is suspended waiting on the host
+    /// (external function calls) or between feeds.
+    pub fn on_execution_start(&self) {
         debug_assert!(
             self.running_since.get().is_none(),
             "nested on_execution_start: VM-internal re-entry must use the raw run loop, not run_external"
@@ -484,7 +390,9 @@ impl ResourceTracker for LimitedTracker {
         self.running_since.set(Some(Instant::now()));
     }
 
-    fn on_execution_stop(&self) {
+    /// Called when the VM leaves its execution loop — on completion, error,
+    /// or suspension at an external call. See [`on_execution_start`](Self::on_execution_start).
+    pub fn on_execution_stop(&self) {
         if let Some(started) = self.running_since.take() {
             self.total_execution_time
                 .set(self.total_execution_time.get() + started.elapsed());
@@ -493,17 +401,18 @@ impl ResourceTracker for LimitedTracker {
 
     /// Lowers the live recursion ceiling to `new_limit`, refusing to raise it.
     ///
-    /// The constructed limit (`limits.max_recursion_depth`) acts as the hard
-    /// upper bound — `sys.setrecursionlimit` may only tighten it, never relax
-    /// it. Crossing from "no limit configured" to a concrete value counts as
-    /// lowering (infinity → finite); going from `Some(N)` to `Some(K)` with
-    /// `K > N` is rejected.
+    /// Exposed under the `test-hooks` feature so `sys.setrecursionlimit` can
+    /// tighten the depth ceiling from inside fixture code. The constructed
+    /// limit (`limits.max_recursion_depth`) acts as the hard upper bound —
+    /// raising it would let sandboxed code escape the host-imposed safety
+    /// bound. A `new_limit` above the active ceiling is rejected with
+    /// `Err(current)`, which callers surface as a `ValueError` in the
+    /// Python layer.
     #[cfg(feature = "test-hooks")]
-    fn lower_recursion_limit(&self, new_limit: usize) -> Result<(), Option<usize>> {
-        if let Some(current) = self.active_recursion_limit()
-            && new_limit > current
-        {
-            return Err(Some(current));
+    pub fn lower_recursion_limit(&self, new_limit: usize) -> Result<(), usize> {
+        let limit = self.active_recursion_limit();
+        if new_limit > limit {
+            return Err(limit);
         }
         self.recursion_limit_override.set(Some(new_limit));
         Ok(())
