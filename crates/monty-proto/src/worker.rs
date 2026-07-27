@@ -43,8 +43,9 @@ use super::{
 ///   `str` is a `u32 LE` byte length followed by UTF-8 bytes.
 ///
 /// The payload is monty's postcard format — only a monty child of the same
-/// version can restore it. Public so tests (and hosts that need to inspect an
-/// envelope) can reference the current version instead of hardcoding it.
+/// version can restore it. Bumped to 6 because concrete built-in iterator
+/// variants replaced the generic serialized iterator representation. Public so
+/// tests and hosts inspecting an envelope can reference the current version.
 pub const DUMP_VERSION: u16 = 6;
 
 /// A sink for framed [`pb::ChildEvent`]s, decoupling the child from its

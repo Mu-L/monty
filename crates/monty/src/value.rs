@@ -23,7 +23,7 @@ use crate::{
     modules::ModuleFunctions,
     resource_checks::check_pow_size,
     types::{
-        Bytes, CmpOrder, LazyHeapSet, LongInt, MontyIter, Property, PyTrait, Type,
+        Bytes, BytesIterator, CmpOrder, LazyHeapSet, LongInt, Property, PyTrait, StringIterator, Type,
         bytes::{bytes_repr_fmt, concat_bytes, get_byte_at_index, repeat_bytes},
         instance::{instance_getattr, instance_repr, instance_str},
         long_int::{
@@ -120,9 +120,37 @@ impl<'h> ValueRead<'h, '_> {
                 ..
             } => iter.get(vm.heap).size_hint(vm.heap),
             Self::Heap {
-                value: HeapReadOutput::Iter(iter),
+                value: HeapReadOutput::TupleIterator(iter),
                 ..
             } => iter.get(vm.heap).size_hint(vm.heap),
+            Self::Heap {
+                value: HeapReadOutput::StringIterator(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(vm),
+            Self::Heap {
+                value: HeapReadOutput::BytesIterator(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(vm),
+            Self::Heap {
+                value: HeapReadOutput::RangeIterator(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(),
+            Self::Heap {
+                value: HeapReadOutput::DictKeyIterator(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(),
+            Self::Heap {
+                value: HeapReadOutput::DictItemIterator(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(),
+            Self::Heap {
+                value: HeapReadOutput::DictValueIterator(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(),
+            Self::Heap {
+                value: HeapReadOutput::SetIterator(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(),
             _ => 0,
         }
     }
@@ -1200,9 +1228,11 @@ impl<'h> PyTrait<'h> for Value {
         if let Self::Ref(id) = self {
             vm.heap.read(*id).py_iter(Some(*id), vm)
         } else {
-            let iter = MontyIter::new(self.clone_with_heap(vm), vm)?;
-            let id = vm.heap.allocate(HeapData::Iter(iter))?;
-            Ok(Self::Ref(id))
+            match self {
+                Self::InternString(id) => StringIterator::from_intern(*id, vm),
+                Self::InternBytes(id) => BytesIterator::from_intern(*id, vm),
+                _ => Err(ExcType::type_error_not_iterable(&self.py_type_name(vm))),
+            }
         }
     }
 
@@ -1549,7 +1579,7 @@ impl Value {
                     }
                     // An iterator is consumed until the item is found, as
                     // CPython's `in` does for any iterable without `__contains__`.
-                    HeapReadOutput::Iter(_) | HeapReadOutput::ListIterator(_) => {
+                    value if value.py_type(vm).is_iterator() => {
                         let iter = self.py_iter(vm)?;
                         defer_drop!(iter, vm);
                         let mut iter = iter.read(vm);

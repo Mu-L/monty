@@ -989,6 +989,10 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Set> {
         Type::Set
     }
 
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
+        SetIterator::from_set(self_id.expect("heap values have an id"), self.get(vm.heap).len(), vm)
+    }
+
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
         Some(self.get(vm.heap).len())
     }
@@ -1300,6 +1304,10 @@ impl<'h> PyTrait<'h> for HeapRead<'h, FrozenSet> {
         Type::FrozenSet
     }
 
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
+        SetIterator::from_frozen_set(self_id.expect("heap values have an id"), self.get(vm.heap).len(), vm)
+    }
+
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
         Some(self.get(vm.heap).len())
     }
@@ -1513,6 +1521,120 @@ impl serde::Serialize for FrozenSet {
 impl<'de> serde::Deserialize<'de> for FrozenSet {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(Self::wrap(SetStorage::deserialize(deserializer)?))
+    }
+}
+
+/// Set-like source retained by a set iterator.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum SetIteratorSource {
+    Set(HeapId),
+    FrozenSet(HeapId),
+}
+
+/// Iterator over set or frozen-set storage.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SetIterator {
+    source: SetIteratorSource,
+    index: usize,
+    expected_len: usize,
+}
+
+impl SetIterator {
+    /// Allocates an iterator retaining a mutable set.
+    fn from_set(id: HeapId, expected_len: usize, vm: &mut VM<'_>) -> RunResult<Value> {
+        Self::allocate(SetIteratorSource::Set(id), expected_len, vm)
+    }
+
+    /// Allocates an iterator retaining a frozen set.
+    fn from_frozen_set(id: HeapId, expected_len: usize, vm: &mut VM<'_>) -> RunResult<Value> {
+        Self::allocate(SetIteratorSource::FrozenSet(id), expected_len, vm)
+    }
+
+    /// Returns the retained set-like source id for GC tracing.
+    pub(crate) fn source_id(&self) -> HeapId {
+        match self.source {
+            SetIteratorSource::Set(id) | SetIteratorSource::FrozenSet(id) => id,
+        }
+    }
+
+    /// Returns the captured number of values not yet yielded.
+    pub(crate) fn size_hint(&self) -> usize {
+        self.expected_len.saturating_sub(self.index)
+    }
+
+    /// Allocates an iterator and retains its source.
+    fn allocate(source: SetIteratorSource, expected_len: usize, vm: &mut VM<'_>) -> RunResult<Value> {
+        let source_id = match source {
+            SetIteratorSource::Set(id) | SetIteratorSource::FrozenSet(id) => id,
+        };
+        let id = vm.heap.allocate(HeapData::SetIterator(Self {
+            source,
+            index: 0,
+            expected_len,
+        }))?;
+        vm.heap.inc_ref(source_id);
+        Ok(Value::Ref(id))
+    }
+}
+
+impl HeapItem for SetIterator {
+    fn py_estimate_size(&self) -> usize {
+        mem::size_of::<Self>()
+    }
+
+    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+        stack.push(self.source_id());
+    }
+}
+
+impl<'h> PyTrait<'h> for HeapRead<'h, SetIterator> {
+    fn py_is_iterable(&self, _: &VM<'h>) -> bool {
+        true
+    }
+
+    fn py_type(&self, _: &VM<'h>) -> Type {
+        Type::SetIterator
+    }
+
+    fn py_len(&self, _: &VM<'h>) -> Option<usize> {
+        None
+    }
+
+    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
+        Ok(None)
+    }
+
+    fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
+        let self_id = self_id.expect("heap values have an id");
+        vm.heap.inc_ref(self_id);
+        Ok(Value::Ref(self_id))
+    }
+
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        let (source_id, index, expected_len, mutable) = {
+            let iter = self.get(vm.heap);
+            (
+                iter.source_id(),
+                iter.index,
+                iter.expected_len,
+                matches!(iter.source, SetIteratorSource::Set(_)),
+            )
+        };
+        let item = match vm.heap.get(source_id) {
+            HeapData::Set(set) => {
+                if mutable && set.len() != expected_len {
+                    return Err(ExcType::runtime_error_set_changed_size());
+                }
+                set.storage().value_at(index)
+            }
+            HeapData::FrozenSet(set) => set.storage().value_at(index),
+            _ => unreachable!("set iterator must retain set-like storage"),
+        }
+        .map(|value| value.clone_with_heap(vm.heap));
+        if item.is_some() {
+            self.get_mut(vm.heap).index += 1;
+        }
+        Ok(item)
     }
 }
 
