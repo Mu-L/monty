@@ -157,6 +157,10 @@ impl<'h> ValueRead<'h, '_> {
                 value: HeapReadOutput::SetIterator(iter),
                 ..
             } => iter.get(vm.heap).size_hint(),
+            Self::Heap {
+                value: HeapReadOutput::Itertools(iter),
+                ..
+            } => iter.get(vm.heap).size_hint(),
             _ => 0,
         }
     }

@@ -20,6 +20,7 @@ pub(crate) mod asyncio;
 pub(crate) mod datetime;
 #[cfg(feature = "test-hooks")]
 pub(crate) mod gc;
+pub(crate) mod itertools;
 pub(crate) mod json;
 pub(crate) mod math;
 pub(crate) mod os;
@@ -53,13 +54,16 @@ pub(crate) enum StandardLib {
     Datetime,
     /// The `unicodedata` module providing Unicode Character Database access.
     Unicodedata,
+    /// The `itertools` module providing lazy iterators (only `count` and
+    /// `repeat` implemented).
+    Itertools,
     /// The `gc` module exposing a single `collect()` for tests. Only present
     /// under the `test-hooks` feature so production sandboxes never see it.
     ///
-    /// The variant is gated rather than left as a permanent unused entry so the
-    /// `from_repr` <-> discriminant mapping doesn't carry a hole on production
-    /// builds. Because it's the last variant, gating it has no effect on the
-    /// numeric discriminants of any other module.
+    /// Gated variants go last because theirs are the only ids allowed to move:
+    /// ungated ids are baked into dumps as the `LoadModule` operand, while a
+    /// `test-hooks` dump never leaves the build that wrote it. Append new
+    /// modules ahead of this block; appending after ties their id to the feature.
     #[cfg(feature = "test-hooks")]
     Gc,
 }
@@ -78,6 +82,7 @@ impl StandardLib {
             StaticStrings::Re => Some(Self::Re),
             StaticStrings::Datetime => Some(Self::Datetime),
             StaticStrings::Unicodedata => Some(Self::Unicodedata),
+            StaticStrings::Itertools => Some(Self::Itertools),
             #[cfg(feature = "test-hooks")]
             StaticStrings::Gc => Some(Self::Gc),
             _ => None,
@@ -103,6 +108,7 @@ impl StandardLib {
             Self::Re => re::create_module(vm),
             Self::Datetime => datetime::create_module(vm),
             Self::Unicodedata => unicodedata::create_module(vm),
+            Self::Itertools => itertools::create_module(vm),
             #[cfg(feature = "test-hooks")]
             Self::Gc => gc::create_module(vm),
         }
@@ -118,8 +124,10 @@ pub(crate) enum ModuleFunctions {
     Os(os::OsFunctions),
     Re(re::ReFunctions),
     Unicodedata(unicodedata::UnicodedataFunctions),
+    Itertools(itertools::ItertoolsFunctions),
     /// `gc` module functions — only present under the `test-hooks` feature.
-    /// See [`gc`] for why we keep this gated rather than always-on.
+    /// See [`gc`] for why it is gated; as in [`StandardLib`], the gated block
+    /// goes last and new variants are appended ahead of it.
     #[cfg(feature = "test-hooks")]
     Gc(gc::GcFunctions),
     /// `sys` module functions — only present under the `test-hooks` feature.
@@ -139,6 +147,7 @@ impl fmt::Display for ModuleFunctions {
             Self::Os(func) => write!(f, "{func}"),
             Self::Re(func) => write!(f, "{func}"),
             Self::Unicodedata(func) => write!(f, "{func}"),
+            Self::Itertools(func) => write!(f, "{func}"),
             #[cfg(feature = "test-hooks")]
             Self::Gc(func) => write!(f, "{func}"),
             #[cfg(feature = "test-hooks")]
@@ -160,6 +169,7 @@ impl ModuleFunctions {
             Self::Os(functions) => os::call(vm, functions, args),
             Self::Re(functions) => re::call(vm, functions, args),
             Self::Unicodedata(functions) => unicodedata::call(vm, functions, args).map(CallResult::Value),
+            Self::Itertools(functions) => itertools::call(vm, functions, args).map(CallResult::Value),
             #[cfg(feature = "test-hooks")]
             Self::Gc(functions) => gc::call(vm, functions, args).map(CallResult::Value),
             #[cfg(feature = "test-hooks")]

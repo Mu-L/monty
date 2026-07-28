@@ -156,6 +156,10 @@ pub enum Type {
     DictValueIterator,
     #[strum(serialize = "set_iterator")]
     SetIterator,
+    #[strum(serialize = "itertools.count")]
+    ItertoolsCount,
+    #[strum(serialize = "itertools.repeat")]
+    ItertoolsRepeat,
 }
 
 /// Writes the canonical static name of every non-[`Instance`](Type::Instance)
@@ -286,6 +290,8 @@ impl Type {
                 | Self::DictValueIterator
                 | Self::SetIterator
                 | Self::CallableIterator
+                | Self::ItertoolsCount
+                | Self::ItertoolsRepeat
         )
     }
 

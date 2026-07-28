@@ -800,6 +800,10 @@ pub enum MontyType {
     DictValueIterator,
     #[strum(serialize = "set_iterator")]
     SetIterator,
+    #[strum(serialize = "itertools.count")]
+    ItertoolsCount,
+    #[strum(serialize = "itertools.repeat")]
+    ItertoolsRepeat,
 }
 
 impl fmt::Display for MontyType {
