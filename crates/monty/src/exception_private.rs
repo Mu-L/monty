@@ -816,7 +816,8 @@ pub(crate) trait ExcTypeExt: Sized {
 
     /// Creates a TypeError for **kwargs with non-string keys.
     ///
-    /// Matches CPython's format: `{name}() keywords must be strings`
+    /// Matches CPython exactly: `keywords must be strings`, unqualified — the
+    /// call machinery raises before the callee is entered, so no name is shown.
     #[must_use]
     fn type_error_kwargs_nonstring_key() -> RunError {
         SimpleException::new_msg(ExcType::TypeError, "keywords must be strings").into()
@@ -1227,8 +1228,10 @@ pub(crate) trait ExcTypeExt: Sized {
 
     /// Creates a NotImplementedError for an unimplemented Python feature.
     ///
-    /// Used during parsing when encountering Python syntax that Monty doesn't yet support.
-    /// The message format is: "The monty syntax parser does not yet support {feature}"
+    /// For syntax Monty cannot parse ("The monty syntax parser does not yet support
+    /// {feature}") and for runtime features it refuses rather than approximates (a
+    /// `@dataclass` body it cannot honour). Reserve it for "Monty has not built this
+    /// yet" — a call CPython would also reject belongs in the matching CPython type.
     #[must_use]
     fn not_implemented(msg: impl fmt::Display) -> SimpleException {
         SimpleException::new_msg(ExcType::NotImplementedError, msg)

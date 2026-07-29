@@ -820,6 +820,20 @@ pub enum StaticStrings {
     Repeat,
     /// `times` keyword argument of `itertools.repeat()`.
     Times,
+
+    // ==========================
+    // dataclasses module strings. Appended at the enum end: discriminants are
+    // serialized `StringId`s, so mid-enum insertion would shift every later id.
+    /// Module name for `import dataclasses`.
+    Dataclasses,
+    /// `dataclasses.dataclass` decorator.
+    Dataclass,
+    /// `dataclasses.is_dataclass()` function.
+    IsDataclass,
+    /// The `__dataclass_fields__` class attribute `@dataclass` writes: the
+    /// name -> `Field` mapping that drives every synthesized dunder.
+    #[strum(serialize = "__dataclass_fields__")]
+    DataclassFields,
 }
 
 /// Computes an FNV-1a hash over static-string identities and serialization.

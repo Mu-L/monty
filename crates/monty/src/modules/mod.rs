@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub(crate) mod asyncio;
+pub(crate) mod dataclasses;
 pub(crate) mod datetime;
 #[cfg(feature = "test-hooks")]
 pub(crate) mod gc;
@@ -57,6 +58,8 @@ pub(crate) enum StandardLib {
     /// The `itertools` module providing lazy iterators (only `count` and
     /// `repeat` implemented).
     Itertools,
+    /// The `dataclasses` module providing `@dataclass` and helpers.
+    Dataclasses,
     /// The `gc` module exposing a single `collect()` for tests. Only present
     /// under the `test-hooks` feature so production sandboxes never see it.
     ///
@@ -83,6 +86,7 @@ impl StandardLib {
             StaticStrings::Datetime => Some(Self::Datetime),
             StaticStrings::Unicodedata => Some(Self::Unicodedata),
             StaticStrings::Itertools => Some(Self::Itertools),
+            StaticStrings::Dataclasses => Some(Self::Dataclasses),
             #[cfg(feature = "test-hooks")]
             StaticStrings::Gc => Some(Self::Gc),
             _ => None,
@@ -109,6 +113,7 @@ impl StandardLib {
             Self::Datetime => datetime::create_module(vm),
             Self::Unicodedata => unicodedata::create_module(vm),
             Self::Itertools => itertools::create_module(vm),
+            Self::Dataclasses => dataclasses::create_module(vm),
             #[cfg(feature = "test-hooks")]
             Self::Gc => gc::create_module(vm),
         }
@@ -125,6 +130,7 @@ pub(crate) enum ModuleFunctions {
     Re(re::ReFunctions),
     Unicodedata(unicodedata::UnicodedataFunctions),
     Itertools(itertools::ItertoolsFunctions),
+    Dataclasses(dataclasses::DataclassesFunctions),
     /// `gc` module functions — only present under the `test-hooks` feature.
     /// See [`gc`] for why it is gated; as in [`StandardLib`], the gated block
     /// goes last and new variants are appended ahead of it.
@@ -148,6 +154,7 @@ impl fmt::Display for ModuleFunctions {
             Self::Re(func) => write!(f, "{func}"),
             Self::Unicodedata(func) => write!(f, "{func}"),
             Self::Itertools(func) => write!(f, "{func}"),
+            Self::Dataclasses(func) => write!(f, "{func}"),
             #[cfg(feature = "test-hooks")]
             Self::Gc(func) => write!(f, "{func}"),
             #[cfg(feature = "test-hooks")]
@@ -170,6 +177,7 @@ impl ModuleFunctions {
             Self::Re(functions) => re::call(vm, functions, args),
             Self::Unicodedata(functions) => unicodedata::call(vm, functions, args).map(CallResult::Value),
             Self::Itertools(functions) => itertools::call(vm, functions, args).map(CallResult::Value),
+            Self::Dataclasses(functions) => dataclasses::call(vm, functions, args).map(CallResult::Value),
             #[cfg(feature = "test-hooks")]
             Self::Gc(functions) => gc::call(vm, functions, args).map(CallResult::Value),
             #[cfg(feature = "test-hooks")]

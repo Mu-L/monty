@@ -804,6 +804,10 @@ pub enum MontyType {
     ItertoolsCount,
     #[strum(serialize = "itertools.repeat")]
     ItertoolsRepeat,
+    /// A `dataclasses.Field` describing one field of a sandbox `@dataclass`,
+    /// as found in a class's `__dataclass_fields__`.
+    #[strum(serialize = "Field")]
+    Field,
 }
 
 impl fmt::Display for MontyType {

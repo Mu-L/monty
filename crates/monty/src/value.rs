@@ -25,7 +25,7 @@ use crate::{
     types::{
         Bytes, BytesIterator, CmpOrder, LazyHeapSet, LongInt, Property, PyTrait, StringIterator, Type,
         bytes::{bytes_contains, bytes_repr_fmt, concat_bytes, get_byte_at_index, repeat_bytes},
-        instance::{instance_getattr, instance_repr, instance_str},
+        instance::{instance_dataclass_eq, instance_getattr, instance_repr_fmt, instance_str, instance_user_eq},
         long_int::{
             bigint_cmp_f64, bigint_cmp_i64, bigint_eq_f64, bigint_eq_i64, check_bits_str_digits_limit, i64_cmp_f64,
             repeat_count, wide_i128_into_value,
@@ -299,11 +299,19 @@ impl<'h> PyTrait<'h> for Value {
                 _ => None,
             }),
             Self::Ref(id) => {
-                // Identity short-circuit: a heap object always equals itself.
-                if let Self::Ref(other_id) = other
+                // Both instance dispatches happen here, not in
+                // `HeapRead<Instance>`, because they need the `HeapId` for `self`.
+                // A user `__eq__` precedes the identity check (CPython lets it
+                // decide `x == x` too); the dataclass one follows it, as
+                // CPython's synthesized `__eq__` opens with `if self is other`.
+                if let Some(result) = instance_user_eq(*id, other, vm)? {
+                    Ok(Some(result))
+                } else if let Self::Ref(other_id) = other
                     && id == other_id
                 {
                     Ok(Some(true))
+                } else if let Some(result) = instance_dataclass_eq(*id, other, vm)? {
+                    Ok(Some(result))
                 } else {
                     vm.heap.read(*id).py_eq_impl(other, vm)
                 }
@@ -474,15 +482,12 @@ impl<'h> PyTrait<'h> for Value {
                         _ => Ok(f.write_str("...")?),
                     }
                 } else if matches!(vm.heap.get(*id), HeapData::Instance(_)) {
-                    // Instances dispatch to a user `__repr__` (or the default), which
-                    // needs the heap id to pass `self` — handled here, not at the heap
-                    // level, so no `heap_ids` insertion happens. Recursion here
-                    // re-enters the VM on the *Rust* stack, bounded by
-                    // `evaluate_function`'s re-entry guard (see the "Recursive/deep
-                    // `__repr__`/`__str__`" divergence in limitations/classes.md).
-                    let str_value = instance_repr(*id, vm)?;
-                    defer_drop!(str_value, vm);
-                    Ok(f.write_str(str_value.to_str(vm)?)?)
+                    // Handled here, not at the heap level, because dispatch needs
+                    // the heap id for `self`. A user `__repr__` recurses on the
+                    // *Rust* stack (see limitations/classes.md); the synthesized
+                    // dataclass form carries `heap_ids`, so a cycle in one hits
+                    // the branch above.
+                    instance_repr_fmt(*id, f, vm, heap_ids)
                 } else {
                     heap_ids.insert(*id);
                     let result = vm.heap.read(*id).py_repr_fmt(f, vm, heap_ids);
@@ -1389,15 +1394,31 @@ impl Value {
         self.id() == other.id()
     }
 
-    /// Python `==`, resolved to a definite boolean.
+    /// Equality **as containers perform it** — CPython's `PyObject_RichCompareBool`.
+    ///
+    /// Identical objects are equal without consulting `__eq__`, which is why
+    /// `c in [c]` holds even when `c.__eq__` always returns `False`. Every
+    /// container membership/comparison/lookup uses this; the bare `==` operator
+    /// uses [`py_eq_operator`](Self::py_eq_operator), which has no shortcut.
+    pub fn py_eq(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
+        if let (Self::Ref(id), Self::Ref(other_id)) = (self, other)
+            && id == other_id
+        {
+            Ok(true)
+        } else {
+            self.py_eq_operator(other, vm)
+        }
+    }
+
+    /// Python's `==` operator, resolved to a definite boolean.
     ///
     /// Implements CPython's reflected comparison protocol on top of the
     /// one-sided [`PyTrait::py_eq_impl`]: tries `self == other`, and if that is
     /// `NotImplemented` (`None`) tries the reflected `other == self`. If neither
-    /// operand's type recognises the other, the values are unequal. This is the
-    /// entry point the VM `==`/`!=`/`in` operators and all container element
-    /// comparisons use; per-type `py_eq_impl` impls never drive reflection themselves.
-    pub fn py_eq(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
+    /// operand's type recognises the other, the values are unequal; per-type
+    /// `py_eq_impl` impls never drive reflection themselves. Unlike
+    /// [`py_eq`](Self::py_eq) there is no identity shortcut.
+    pub fn py_eq_operator(&self, other: &Self, vm: &mut VM<'_>) -> RunResult<bool> {
         if let Some(result) = self.py_eq_impl(other, vm)? {
             Ok(result)
         } else if let Some(result) = other.py_eq_impl(self, vm)? {
