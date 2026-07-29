@@ -42,7 +42,6 @@ use crate::{
     types::{
         Dict, LongInt, PyTrait,
         file::{apply_buffer_store, apply_write_position},
-        timedelta,
     },
     value::{EitherStr, Value},
 };
@@ -1153,81 +1152,8 @@ impl<'h> VM<'h> {
                     value.drop_with(self);
                     self.push(Value::Bool(result));
                 }
-                Opcode::UnaryNeg => {
-                    // Unary minus - negate numeric value
-                    let value = self.pop();
-                    match value {
-                        Value::Int(n) => {
-                            // Use checked_neg to handle i64::MIN overflow
-                            if let Some(negated) = n.checked_neg() {
-                                self.push(Value::Int(negated));
-                            } else {
-                                // i64::MIN negated overflows to LongInt
-                                let li = -LongInt::from(n);
-                                match li.into_value(self.heap) {
-                                    Ok(v) => self.push(v),
-                                    Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
-                                }
-                            }
-                        }
-                        Value::Float(f) => self.push(Value::Float(-f)),
-                        Value::Bool(b) => self.push(Value::Int(if b { -1 } else { 0 })),
-                        Value::Ref(id) => match self.heap.get(id) {
-                            HeapData::LongInt(li) => {
-                                let negated = -LongInt::new(li.inner().clone());
-                                value.drop_with(self);
-                                match negated.into_value(self.heap) {
-                                    Ok(v) => self.push(v),
-                                    Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
-                                }
-                            }
-                            HeapData::TimeDelta(td) => {
-                                let negated = timedelta::from_total_microseconds(-timedelta::total_microseconds(td));
-                                value.drop_with(self);
-                                match negated {
-                                    Ok(delta) => match self.heap.allocate(HeapData::TimeDelta(delta)) {
-                                        Ok(id) => self.push(Value::Ref(id)),
-                                        Err(e) => catch_sync!(self, cached_frame, RunError::from(e)),
-                                    },
-                                    Err(e) => catch_sync!(self, cached_frame, e),
-                                }
-                            }
-                            _ => {
-                                let value_type = value.py_type_name(self);
-                                value.drop_with(self);
-                                catch_sync!(self, cached_frame, ExcType::unary_type_error("-", &value_type));
-                            }
-                        },
-                        _ => {
-                            let value_type = value.py_type_name(self);
-                            value.drop_with(self);
-                            catch_sync!(self, cached_frame, ExcType::unary_type_error("-", &value_type));
-                        }
-                    }
-                }
-                Opcode::UnaryPos => {
-                    // Unary plus - converts bools to int, no-op for other numbers
-                    let value = self.pop();
-                    match value {
-                        Value::Int(_) | Value::Float(_) => self.push(value),
-                        Value::Bool(b) => self.push(Value::Int(i64::from(b))),
-                        Value::Ref(id) => {
-                            if matches!(self.heap.get(id), HeapData::LongInt(_)) {
-                                // LongInt - return as-is (value already has correct refcount)
-                                self.push(value);
-                            } else {
-                                let value_type = value.py_type_name(self);
-                                value.drop_with(self);
-                                catch_sync!(self, cached_frame, ExcType::unary_type_error("+", &value_type));
-                            }
-                        }
-                        _ => {
-                            let value_type = value.py_type_name(self);
-                            value.drop_with(self);
-                            catch_sync!(self, cached_frame, ExcType::unary_type_error("+", &value_type));
-                        }
-                    }
-                }
+                Opcode::UnaryNeg => try_catch_sync!(self, cached_frame, self.unary_neg()),
+                Opcode::UnaryPos => try_catch_sync!(self, cached_frame, self.unary_pos()),
                 Opcode::UnaryInvert => {
                     // Bitwise NOT
                     let value = self.pop();
@@ -1256,19 +1182,22 @@ impl<'h> VM<'h> {
                         }
                     }
                 }
-                // In-place Operations - route through exception handling
+                // In-place Operations - route through exception handling.
+                // `+=`/`-=`/`&=`/`|=` first try a true in-place `Counter` op
+                // (mutating the left operand); everything else — and the
+                // non-Counter fallback — reuses the binary implementation, since
+                // Monty's other types have no distinct in-place form.
                 Opcode::InplaceAdd => try_catch_sync!(self, cached_frame, self.inplace_add()),
-                // Other in-place ops use the same logic as binary ops for now
-                Opcode::InplaceSub => try_catch_sync!(self, cached_frame, self.binary_sub()),
+                Opcode::InplaceSub => try_catch_sync!(self, cached_frame, self.inplace_sub()),
                 Opcode::InplaceMul => try_catch_sync!(self, cached_frame, self.binary_mult()),
                 Opcode::InplaceDiv => try_catch_sync!(self, cached_frame, self.binary_div()),
                 Opcode::InplaceFloorDiv => try_catch_sync!(self, cached_frame, self.binary_floordiv()),
                 Opcode::InplaceMod => try_catch_sync!(self, cached_frame, self.binary_mod()),
                 Opcode::InplacePow => try_catch_sync!(self, cached_frame, self.binary_pow()),
                 Opcode::InplaceAnd => {
-                    try_catch_sync!(self, cached_frame, self.binary_and());
+                    try_catch_sync!(self, cached_frame, self.inplace_and());
                 }
-                Opcode::InplaceOr => try_catch_sync!(self, cached_frame, self.binary_or()),
+                Opcode::InplaceOr => try_catch_sync!(self, cached_frame, self.inplace_or()),
                 Opcode::InplaceXor => {
                     try_catch_sync!(self, cached_frame, self.binary_xor());
                 }

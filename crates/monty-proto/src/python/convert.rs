@@ -225,6 +225,7 @@ fn round_trip_type_table(py: Python<'_>) -> PyResult<&'static Vec<(Py<PyAny>, Mo
             MontyType::Str,
             MontyType::Bytes,
             MontyType::List,
+            MontyType::Deque,
             MontyType::ListIterator,
             MontyType::CallableIterator,
             MontyType::ItertoolsCount,
@@ -438,6 +439,7 @@ fn type_object_to_py(py: Python<'_>, t: MontyType) -> PyResult<Py<PyAny>> {
     match t {
         MontyType::Date => cached!("datetime", "date"),
         MontyType::DateTime => cached!("datetime", "datetime"),
+        MontyType::Deque => cached!("collections", "deque"),
         MontyType::TimeDelta => cached!("datetime", "timedelta"),
         MontyType::TimeZone => cached!("datetime", "timezone"),
         MontyType::ListIterator => get_list_iterator_type(py).map(|b| b.clone().unbind()),

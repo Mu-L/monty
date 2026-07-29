@@ -498,7 +498,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, List> {
         repr_sequence_fmt('[', ']', len, |heap, i| &self.get(heap).as_slice()[i], f, vm, heap_ids)
     }
 
-    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
         let Some(HeapReadOutput::List(other)) = other.read_heap(vm) else {
             return Ok(None);
         };
@@ -526,7 +526,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, List> {
         self.py_mul_impl(other, vm)
     }
 
-    fn py_iadd_impl(&mut self, other: &Value, vm: &mut VM<'h>, self_id: Option<HeapId>) -> Result<bool, ResourceError> {
+    fn py_iadd_impl(&mut self, other: &Value, vm: &mut VM<'h>, self_id: Option<HeapId>) -> RunResult<bool> {
         let Value::Ref(other_id) = other else {
             return Ok(false);
         };
