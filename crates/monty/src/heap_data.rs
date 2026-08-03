@@ -31,6 +31,11 @@ use crate::{
 
 /// HeapData captures every runtime value that must live in the arena.
 ///
+/// The enum is moved by value on every heap allocate and free, so its inline
+/// size is a direct memcpy cost on those hot paths. Variants larger than
+/// [`Dict`] (the largest hot variant) are therefore `Box`ed — see the size
+/// assertion below the enum before adding or growing a variant.
+///
 /// Each variant wraps a type that implements `PyTrait`, providing
 /// Python-compatible operations. The trait is manually implemented to dispatch
 /// to the appropriate variant's implementation.
@@ -42,9 +47,9 @@ pub(crate) enum HeapData {
     /// `collections.deque` — a double-ended queue with an optional `maxlen`.
     Deque(Deque),
     Tuple(Tuple),
-    NamedTuple(NamedTuple),
+    NamedTuple(Box<NamedTuple>),
     /// A `collections.namedtuple` class object (the callable that builds instances).
-    NamedTupleClass(NamedTupleClass),
+    NamedTupleClass(Box<NamedTupleClass>),
     Dict(Dict),
     DictKeysView(DictKeysView),
     DictItemsView(DictItemsView),
@@ -79,16 +84,16 @@ pub(crate) enum HeapData {
     ///
     /// Contains a class name, a Dict of field name -> value mappings, and a set
     /// of method names that trigger external function calls when invoked.
-    Dataclass(Dataclass),
+    Dataclass(Box<Dataclass>),
     /// A user-defined class object created by `class Foo: ...`.
     ///
     /// Holds the class name and a namespace of methods + class variables. Its own
     /// `HeapId` is the type identity used by `type()`/`isinstance`.
-    Class(Class),
+    Class(Box<Class>),
     /// An instance of a user-defined class.
     ///
     /// Holds a reference to its `Class` and an `attrs` dict (the instance `__dict__`).
-    Instance(Instance),
+    Instance(Box<Instance>),
     /// A method bound to an instance, produced by `obj.method` without calling it.
     BoundMethod(BoundMethod),
     /// One `dataclasses.Field` of a `@dataclass`, held by the class's
@@ -127,7 +132,7 @@ pub(crate) enum HeapData {
     ///
     /// Modules have a name and a dictionary of attributes. They are created by
     /// import statements and can have refs to other heap values in their attributes.
-    Module(Module),
+    Module(Box<Module>),
     /// A coroutine object from an async function call.
     ///
     /// Contains pre-bound arguments and captured cells, ready to be awaited.
@@ -136,13 +141,13 @@ pub(crate) enum HeapData {
     /// A gather() result tracking multiple coroutines/tasks.
     ///
     /// Created by asyncio.gather() and spawns tasks when awaited.
-    GatherFuture(GatherFuture),
+    GatherFuture(Box<GatherFuture>),
     /// An external future driven by the host.
     ///
     /// Created when the host returns `ExtFunctionResult::Future(call_id)`.
     /// Holds its own state machine (`Pending`/`Resolved`/`Failed`) so
     /// re-await yields cached results, matching CPython's Future semantics.
-    ExternalFuture(ExternalFuture),
+    ExternalFuture(Box<ExternalFuture>),
     /// A filesystem path from `pathlib.Path`.
     ///
     /// Stored on the heap to provide Python-compatible path operations.
@@ -153,7 +158,7 @@ pub(crate) enum HeapData {
     ///
     /// The object stores only virtual path and mode state.  Reads and writes are
     /// full-file OS calls; no native file descriptor is kept while Monty runs.
-    OpenFile(OpenFile),
+    OpenFile(Box<OpenFile>),
     /// A compiled regex pattern from `re.compile()`.
     ///
     /// Contains the original pattern string, flags, and compiled regex engine.
@@ -163,7 +168,7 @@ pub(crate) enum HeapData {
     ///
     /// Contains the matched text, capture groups, positions, and input string.
     /// Leaf type: no heap references, not GC-tracked.
-    ReMatch(ReMatch),
+    ReMatch(Box<ReMatch>),
     /// Reference to an external function supplied by the host or synthesized for a call.
     ExtFunction(ExtFunction),
     /// A `datetime.date` value stored with `chrono::NaiveDate`.
@@ -182,6 +187,12 @@ pub(crate) enum HeapData {
     /// dispatches on which adaptor it is.
     Itertools(ItertoolsIter),
 }
+
+// `HeapData` is memcpy'd on every allocate and free, so its inline size is paid on
+// the hottest heap paths. `Dict` — far too hot to box — sets the 72-byte payload
+// ceiling (currently tag-free thanks to niche packing); if this assertion fails a
+// variant has outgrown it and should be boxed (or, for `Dict` itself, slimmed down).
+const _: () = assert!(mem::size_of::<HeapData>() <= 80);
 
 impl HeapData {
     /// Returns whether this heap data type can participate in reference cycles.

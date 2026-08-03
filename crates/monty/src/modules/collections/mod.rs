@@ -36,6 +36,7 @@ use crate::{
     intern::StaticStrings,
     types::{
         Dict, Module, NamedTupleClass, PyTrait, Type,
+        dict::DictKind,
         iter::collect_owned_iterable,
         str::{StringRepr, str_isidentifier},
     },
@@ -69,7 +70,7 @@ pub fn create_module(vm: &mut VM<'_>) -> Result<HeapId, ResourceError> {
         vm,
     );
 
-    vm.heap.allocate(HeapData::Module(module))
+    vm.heap.allocate(HeapData::Module(Box::new(module)))
 }
 
 /// The callable functions exposed by the `collections` module.
@@ -170,6 +171,17 @@ pub(crate) fn defaultdict_init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Va
         }
     };
 
+    // The dict is already on the heap, so its `py_estimate_size` was charged
+    // without the boxed kind state — charge that box before installing it,
+    // otherwise the refund at free time exceeds what was tracked.
+    if let Err(error) = vm.heap.track_growth(DictKind::SPECIAL_SIZE) {
+        if let Some(factory) = factory {
+            factory.drop_with(vm);
+        }
+        dict_value.drop_with(vm);
+        return Err(error.into());
+    }
+
     let Value::Ref(dict_id) = dict_value else {
         unreachable!("Dict::init returns a dict ref");
     };
@@ -257,7 +269,9 @@ fn namedtuple(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 
     let field_names: Vec<EitherStr> = names.into_iter().map(EitherStr::Heap).collect();
     let class = NamedTupleClass::new(type_name, field_names, default_values, module);
-    Ok(Value::Ref(vm.heap.allocate(HeapData::NamedTupleClass(class))?))
+    Ok(Value::Ref(
+        vm.heap.allocate(HeapData::NamedTupleClass(Box::new(class)))?,
+    ))
 }
 
 /// Parses the `field_names` argument into owned strings.
