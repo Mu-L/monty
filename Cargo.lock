@@ -2019,6 +2019,7 @@ dependencies = [
  "itoa",
  "jiter",
  "libm",
+ "memchr",
  "monty-macros",
  "monty-types",
  "num-bigint",
