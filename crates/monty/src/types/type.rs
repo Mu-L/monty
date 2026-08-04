@@ -49,6 +49,8 @@ use crate::{
 )]
 pub enum Type {
     Ellipsis,
+    #[strum(serialize = "NotImplementedType")]
+    NotImplementedType,
     Type,
     #[strum(serialize = "NoneType")]
     NoneType,
@@ -504,7 +506,7 @@ impl Type {
                     return Ok(Value::Bool(false));
                 };
                 defer_drop!(v, vm);
-                Ok(Value::Bool(v.py_bool(vm)))
+                Ok(Value::Bool(v.py_bool(vm)?))
             }
 
             // Non-callable types - raise TypeError

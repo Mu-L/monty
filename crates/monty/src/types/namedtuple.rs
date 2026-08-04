@@ -485,8 +485,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
         Ok(Some(hash))
     }
 
-    fn py_bool(&self, vm: &mut VM<'h>) -> bool {
-        self.get(vm.heap).len() > 0
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
+        Ok(self.get(vm.heap).len() > 0)
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, heap_ids: &mut LazyHeapSet) -> RunResult<()> {

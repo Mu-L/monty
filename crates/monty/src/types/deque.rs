@@ -383,8 +383,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Deque> {
         Some(self.get(vm.heap).len())
     }
 
-    fn py_bool(&self, vm: &mut VM<'h>) -> bool {
-        self.get(vm.heap).len() > 0
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
+        Ok(self.get(vm.heap).len() > 0)
     }
 
     fn py_getitem(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {

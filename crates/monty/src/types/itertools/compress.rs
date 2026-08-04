@@ -75,8 +75,10 @@ pub(super) fn next<'h>(iter: &mut HeapRead<'h, ItertoolsIter>, vm: &mut VM<'h>) 
         let Some(selector) = step(iter, selectors, vm)? else {
             return Ok(None);
         };
-        let keep = selector.py_bool(vm);
-        selector.drop_with(vm);
+        let keep = {
+            defer_drop!(selector, vm);
+            selector.py_bool(vm)?
+        };
         if keep {
             let (datum, _) = datum_guard.into_parts();
             return Ok(Some(datum));

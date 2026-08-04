@@ -78,6 +78,7 @@ impl MontyObjectExt for MontyObject {
     fn to_value(self, vm: &mut VM<'_>) -> Result<Value, InvalidInputError> {
         match self {
             Self::Ellipsis => Ok(Value::Ellipsis),
+            Self::NotImplemented => Ok(Value::NotImplemented),
             Self::None => Ok(Value::None),
             Self::Bool(b) => Ok(Value::Bool(b)),
             Self::Int(i) => Ok(Value::Int(i)),
@@ -249,6 +250,7 @@ impl MontyObjectExt for MontyObject {
         match object {
             Value::Undefined => panic!("Undefined found while converting to MontyObject"),
             Value::Ellipsis => Self::Ellipsis,
+            Value::NotImplemented => Self::NotImplemented,
             Value::None => Self::None,
             Value::Bool(b) => Self::Bool(*b),
             Value::Int(i) => Self::Int(*i),
@@ -537,6 +539,7 @@ impl MontyTypeExt for MontyType {
     fn to_internal(&self) -> Option<Type> {
         match self {
             Self::Ellipsis => Some(Type::Ellipsis),
+            Self::NotImplementedType => Some(Type::NotImplementedType),
             Self::Type => Some(Type::Type),
             Self::NoneType => Some(Type::NoneType),
             Self::Bool => Some(Type::Bool),
@@ -610,6 +613,7 @@ impl MontyTypeExt for MontyType {
     fn from_internal_static(ty: Type) -> Self {
         match ty {
             Type::Ellipsis => Self::Ellipsis,
+            Type::NotImplementedType => Self::NotImplementedType,
             Type::Type => Self::Type,
             Type::NoneType => Self::NoneType,
             Type::Bool => Self::Bool,

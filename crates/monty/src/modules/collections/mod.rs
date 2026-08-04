@@ -238,7 +238,7 @@ fn namedtuple(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     };
 
     // CPython tests `if rename:`, so any truthy value enables it — not just `True`.
-    let rename = rename.py_bool(vm);
+    let rename = rename.py_bool(vm)?;
     let mut names = parse_field_names(field_names, vm)?;
     if rename {
         apply_rename(&mut names);

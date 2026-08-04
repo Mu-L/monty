@@ -932,6 +932,9 @@ pub enum StaticStrings {
     Chain,
     /// `itertools.cycle()` function.
     Cycle,
+    /// Python's `NotImplemented` singleton representation.
+    #[strum(serialize = "NotImplemented")]
+    NotImplementedRepr,
 }
 
 /// Computes an FNV-1a hash over static-string identities and serialization.

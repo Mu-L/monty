@@ -654,7 +654,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
         heap_read_output_py_trait_forward!(self, |value| value.py_contains_impl(self_id, item, vm), else Ok(None))
     }
 
-    fn py_bool(&self, vm: &mut VM<'h>) -> bool {
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
         heap_read_output_py_trait_forward!(
             self,
             |value| value.py_bool(vm),
@@ -668,7 +668,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
                     | Self::Module(_)
                     | Self::Coroutine(_)
                     | Self::GatherFuture(_)
-                    | Self::ExternalFuture(_) => true,
+                    | Self::ExternalFuture(_) => Ok(true),
                     _ => unreachable!("py-trait variants handled by heap_read_output_py_trait_forward"),
                 }
             }

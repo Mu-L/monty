@@ -1191,8 +1191,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dict> {
         }
     }
 
-    fn py_bool(&self, vm: &mut VM<'h>) -> bool {
-        !self.get(vm.heap).is_empty()
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
+        Ok(!self.get(vm.heap).is_empty())
     }
 
     /// Two Counters compare as multisets; every other pairing defers to `py_cmp`,

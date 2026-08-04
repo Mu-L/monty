@@ -101,9 +101,8 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Instance> {
         Ok(())
     }
 
-    /// Always `NotImplemented` (`Ok(None)`), leaving the caller on identity: both
-    /// real comparisons (a user `__eq__`, the synthesized dataclass one) need the
-    /// `HeapId` this signature lacks, so they dispatch at the `Value` level.
+    /// Returns `NotImplemented`; comparisons dispatch at the `Value` level because
+    /// user and synthesized dataclass equality require the instance's `HeapId`.
     fn py_eq_impl(&self, _other: &Value, _vm: &mut VM<'h>) -> RunResult<Option<bool>> {
         Ok(None)
     }
@@ -501,7 +500,7 @@ pub(crate) fn instance_contains(self_id: HeapId, item: &Value, vm: &mut VM<'_>) 
     match instance_call_dunder_sync(self_id, "__contains__", Some(item), vm)? {
         Some(result) => {
             defer_drop!(result, vm);
-            Ok(Some(result.py_bool(vm)))
+            Ok(Some(result.py_bool(vm)?))
         }
         None => Ok(None),
     }
@@ -638,12 +637,11 @@ fn instance_class(self_id: HeapId, vm: &VM<'_>) -> HeapId {
     }
 }
 
-/// Dispatches a user-defined `__eq__`, or `Ok(None)` when there is none, which
-/// leaves the caller on field-wise dataclass equality or identity.
+/// Dispatches a user-defined `__eq__`, or `Ok(None)` when it is absent.
 ///
-/// The result is taken as a truth value: Monty has no `NotImplemented`, so a
-/// user `__eq__` cannot decline and the reflected operand is never tried.
-pub(crate) fn instance_user_eq(self_id: HeapId, other: &Value, vm: &mut VM<'_>) -> RunResult<Option<bool>> {
+/// The user's value is preserved so direct equality can return it unchanged;
+/// callers interpret `NotImplemented` according to their comparison mode.
+pub(crate) fn instance_user_eq(self_id: HeapId, other: &Value, vm: &mut VM<'_>) -> RunResult<Option<Value>> {
     if !matches!(vm.heap.get(self_id), HeapData::Instance(_)) {
         return Ok(None);
     }
@@ -651,15 +649,8 @@ pub(crate) fn instance_user_eq(self_id: HeapId, other: &Value, vm: &mut VM<'_>) 
     if !class_defines(class_id, "__eq__", vm) {
         return Ok(None);
     }
-    // `instance_call_dunder_sync` takes ownership of the argument.
     let other = other.clone_with_heap(vm.heap);
-    match instance_call_dunder_sync(self_id, "__eq__", Some(other), vm)? {
-        Some(result) => {
-            defer_drop!(result, vm);
-            Ok(Some(result.py_bool(vm)))
-        }
-        None => Ok(None),
-    }
+    instance_call_dunder_sync(self_id, "__eq__", Some(other), vm)
 }
 
 /// Dispatches the synthesized field-wise `__eq__` of a dataclass instance, or

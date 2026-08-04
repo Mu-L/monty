@@ -381,9 +381,9 @@ impl<'h> PyTrait<'h> for HeapRead<'h, RePattern> {
         Ok(Some(self.get(vm.heap) == other.get(vm.heap)))
     }
 
-    fn py_bool(&self, _vm: &mut VM<'h>) -> bool {
+    fn py_bool(&self, _vm: &mut VM<'h>) -> RunResult<bool> {
         // Pattern objects are always truthy (matching CPython).
-        true
+        Ok(true)
     }
 
     fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
