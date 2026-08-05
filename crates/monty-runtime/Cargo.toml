@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+# The standalone CLI owns process-level telemetry configuration.
+logfire = { version = "0.11", default-features = false, features = ["export-http-protobuf"] }
 monty = { workspace = true }
 monty-fs = { workspace = true }
 monty-alloc = { workspace = true, features = ["exit-code"] }
@@ -25,6 +27,7 @@ monty-proto = { workspace = true, features = ["worker"] }
 monty-type-checking = { workspace = true }
 monty-types = { workspace = true }
 rustyline = "15"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

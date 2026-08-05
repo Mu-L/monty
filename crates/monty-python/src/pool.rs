@@ -67,6 +67,7 @@ use crate::{
     mount::PyMountDir,
     print_target::PrintTarget,
     snapshot::{DriveContext, build_snapshot, feed_start_async, feed_start_sync},
+    telemetry::capture_telemetry_context,
 };
 
 /// The pool handle shared between a pool object and its sessions. `None`
@@ -223,9 +224,14 @@ impl PyMontySession {
         let pool = active_pool(&this.pool)?;
         let repl_config = this.repl_config.clone();
         let slot = Arc::clone(&this.checkout);
-        py.detach(|| {
-            block_on_sync(async {
-                let checkout = pool.checkout(&repl_config).await?;
+        let telemetry = capture_telemetry_context(py);
+        py.detach(move || {
+            block_on_sync(async move {
+                let checkout = if let Some(telemetry) = telemetry {
+                    pool.checkout_with_telemetry(&repl_config, telemetry).await?
+                } else {
+                    pool.checkout(&repl_config).await?
+                };
                 *slot.lock().await = Some(checkout);
                 Ok(())
             })
@@ -697,15 +703,18 @@ impl PyAsyncMontySession {
     /// the REPL session in it.
     fn __aenter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         let this = slf.get();
-        let pool = Arc::clone(&this.pool);
+        let pool_slot = Arc::clone(&this.pool);
         let repl_config = this.repl_config.clone();
         let slot = Arc::clone(&this.checkout);
+        let telemetry = capture_telemetry_context(py);
         future_into_py(py, async move {
-            let pool = active_pool(&pool)?;
-            let checkout = pool
-                .checkout(&repl_config)
-                .await
-                .map_err(|e| Python::attach(|py| pool_err_to_py(py, e)))?;
+            let pool = active_pool(&pool_slot)?;
+            let checkout = if let Some(telemetry) = telemetry {
+                pool.checkout_with_telemetry(&repl_config, telemetry).await
+            } else {
+                pool.checkout(&repl_config).await
+            }
+            .map_err(|e| Python::attach(|py| pool_err_to_py(py, e)))?;
             *slot.lock().await = Some(checkout);
             Ok(slf)
         })

@@ -30,8 +30,10 @@ use std::{
 };
 
 use monty_pool::{
-    exceeds_max_value_depth, Checkout, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError, PrintFuture,
-    ReplConfig, ResumeValue, TurnEvent,
+    exceeds_max_value_depth,
+    telemetry_adapter::{TelemetryAdapterHandle, TelemetryContext},
+    Checkout, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError, PrintFuture, ReplConfig, ResumeValue,
+    TurnEvent,
 };
 use monty_types::{AssertMessageAnnotations, ExcType, MontyException, MontyObject, PrintStream, StackFrame};
 use napi::{
@@ -45,6 +47,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::{
     convert::{js_to_monty, monty_to_js},
     limits::{extract_limits, JsResourceLimits},
+    telemetry::configured_adapter,
 };
 
 /// Deepest *list-like* value nesting the wire protocol accepts (dicts and
@@ -111,6 +114,7 @@ pub struct NativeCheckoutOptions {
     pub type_check: bool,
     /// Stub declarations made available to type checking.
     pub type_check_stubs: Option<String>,
+
     /// Give failed `assert` statements pytest-style introspected messages
     /// (see limitations/assert.md), wire-encoded: absent = on with the
     /// default 120-byte operand-repr truncation, `0` = off, `n` = truncate
@@ -215,6 +219,38 @@ impl NativePool {
     }
 }
 
+/// Distributed context captured synchronously before native session entry.
+#[napi(object, js_name = "NativeTelemetryContext")]
+pub struct NativeTelemetryContext {
+    /// W3C trace ID of the active host span.
+    pub trace_id: Option<String>,
+    /// W3C span ID of the active host span.
+    pub span_id: Option<String>,
+    /// W3C trace flags of the active host span.
+    pub trace_flags: Option<u8>,
+    /// Vendor trace state propagated with the active host span.
+    pub trace_state: Option<String>,
+}
+
+impl NativeTelemetryContext {
+    /// Converts valid distributed context while ignoring a malformed adapter value.
+    fn parse(self, adapter: &TelemetryAdapterHandle) -> TelemetryContext {
+        self.trace_id
+            .zip(self.span_id)
+            .and_then(|(trace_id, span_id)| {
+                adapter
+                    .context(
+                        &trace_id,
+                        &span_id,
+                        self.trace_flags.unwrap_or_default(),
+                        self.trace_state.as_deref().unwrap_or_default(),
+                    )
+                    .ok()
+            })
+            .unwrap_or_else(|| adapter.unparented_context())
+    }
+}
+
 /// One worker process dedicated to one REPL session. Wrapped by the
 /// TypeScript `MontySession` class — not part of the public API.
 #[napi(js_name = "NativeSession")]
@@ -230,16 +266,27 @@ impl NativeSession {
     /// the REPL session in it. Rejects with the pool error message on
     /// exhaustion or spawn failure.
     #[napi]
-    pub fn enter<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+    pub fn enter<'env>(
+        &self,
+        env: &'env Env,
+        telemetry_context: Option<NativeTelemetryContext>,
+    ) -> Result<PromiseRaw<'env, ()>> {
         let pool = Arc::clone(&self.pool);
         let repl_config = self.repl_config.clone();
         let slot = Arc::clone(&self.checkout);
+        let telemetry_context =
+            telemetry_context.and_then(|context| configured_adapter().map(|adapter| context.parse(adapter)));
         env.spawn_future(async move {
             let pool = lock(&pool)
                 .as_ref()
                 .map(Arc::clone)
                 .ok_or_else(|| invalid("the pool is not started — create it with Monty.create()"))?;
-            let checkout = pool.checkout(&repl_config).await.map_err(pool_error)?;
+            let checkout = if let Some(context) = telemetry_context {
+                pool.checkout_with_telemetry(&repl_config, context).await
+            } else {
+                pool.checkout(&repl_config).await
+            }
+            .map_err(pool_error)?;
             *slot.lock().await = Some(checkout);
             Ok(())
         })

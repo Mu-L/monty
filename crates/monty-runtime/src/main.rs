@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    fmt, fs,
+    env, fmt, fs,
     process::ExitCode,
     time::{Duration, Instant},
 };
@@ -15,6 +15,7 @@ use monty_types::{
     ResourceTracker,
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
+use tracing::field::Empty;
 
 mod subprocess;
 
@@ -171,6 +172,23 @@ fn main() -> ExitCode {
         return subprocess::run();
     }
 
+    let logfire = match configure_logfire() {
+        Ok(logfire) => logfire,
+        Err(err) => {
+            eprintln!("{BOLD_RED}error{RESET}: failed to configure telemetry: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let run_span = logfire.as_ref().map(|_| logfire::span!("run monty", success = Empty,));
+    let exit_code = run_cli(cli);
+    if let Some(run_span) = run_span {
+        run_span.record("success", exit_code == ExitCode::SUCCESS);
+    }
+    exit_code
+}
+
+/// Dispatches a parsed standalone CLI invocation.
+fn run_cli(cli: Cli) -> ExitCode {
     let type_check_enabled = cli.type_check;
 
     let limits = match cli.resource_limits() {
@@ -218,6 +236,23 @@ fn main() -> ExitCode {
     }
 
     dispatch_repl("repl.py", "", limits, mount_table)
+}
+
+/// Configures process-level telemetry for standalone CLI execution.
+///
+/// Worker subprocesses bypass this function so inherited credentials never
+/// create an exporter in each sandbox process.
+fn configure_logfire() -> Result<Option<logfire::ShutdownGuard>, logfire::ConfigureError> {
+    if env::var_os("LOGFIRE_TOKEN").is_some() {
+        logfire::configure()
+            .with_service_name("monty")
+            .with_service_version(env!("CARGO_PKG_VERSION"))
+            .finish()
+            .map(logfire::Logfire::shutdown_guard)
+            .map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Builds the tracker from the CLI resource limits and runs the script.

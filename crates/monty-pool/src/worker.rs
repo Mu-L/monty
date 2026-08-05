@@ -38,6 +38,8 @@ use tokio_tungstenite::{
 };
 
 use crate::{MontyTransport, PoolConfig, PoolError};
+#[cfg(feature = "telemetry-adapter")]
+use crate::{telemetry::Recorder, telemetry_adapter::TelemetryContext};
 
 /// The async WebSocket stream type for a remote worker.
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -49,6 +51,9 @@ pub(crate) struct Worker {
     kind: WorkerKind,
     /// Checkouts this worker has served, for `max_checkouts_per_worker`.
     pub(crate) checkouts_served: u32,
+    /// Records an adapter checkout's protocol turns, created only while needed.
+    #[cfg(feature = "telemetry-adapter")]
+    recorder: Option<Box<Recorder>>,
 }
 
 /// The two transports a worker can speak the protocol over. Both variants are
@@ -79,6 +84,7 @@ struct WebSocketWorker {
 }
 
 impl Worker {
+    /// Creates a worker for `config`'s transport.
     pub(crate) async fn new(config: &PoolConfig) -> Result<Self, PoolError> {
         match &config.transport {
             MontyTransport::Subprocess(binary_path) => Self::subprocess(binary_path),
@@ -128,6 +134,8 @@ impl Worker {
                 send_buf: Vec::with_capacity(SEND_BUF_CAPACITY),
             })),
             checkouts_served: 0,
+            #[cfg(feature = "telemetry-adapter")]
+            recorder: None,
         })
     }
 
@@ -152,6 +160,8 @@ impl Worker {
         Ok(Self {
             kind: WorkerKind::WebSocket(Box::new(WebSocketWorker { stream: Some(stream) })),
             checkouts_served: 0,
+            #[cfg(feature = "telemetry-adapter")]
+            recorder: None,
         })
     }
 
@@ -160,7 +170,7 @@ impl Worker {
     /// oversize frame is rejected *before* any I/O so the stream stays synced
     /// (see `Checkout::request_turn`).
     pub(crate) async fn send(&mut self, request: &pb::ParentRequest) -> Result<(), FrameError> {
-        match &mut self.kind {
+        let result = match &mut self.kind {
             WorkerKind::Subprocess(w) => {
                 // prefix + body in one reused buffer: a single write syscall
                 // per request, no per-frame allocation, and a pipe write needs
@@ -183,7 +193,31 @@ impl Worker {
                     None => Err(FrameError::Truncated),
                 }
             }
+        };
+        // record only requests that hit the wire: a rejected oversize frame
+        // leaves the turn (and any pending suspension) exactly where it was
+        #[cfg(feature = "telemetry-adapter")]
+        if result.is_ok() {
+            if let Some(recorder) = &mut self.recorder {
+                recorder.begin_turn(request);
+            }
+            if matches!(
+                request.kind,
+                Some(pb::parent_request::Kind::Reset(_) | pb::parent_request::Kind::Shutdown(_))
+            ) {
+                self.recorder = None;
+            }
         }
+        result
+    }
+
+    /// Assigns propagated host context before this worker starts a checkout.
+    #[cfg(feature = "telemetry-adapter")]
+    pub(crate) fn set_adapter_context(&mut self, context: TelemetryContext) {
+        let worker_pid = self.pid();
+        self.recorder
+            .get_or_insert_with(|| Box::new(Recorder::new(worker_pid)))
+            .set_adapter_context(context);
     }
 
     /// Receives one event. EOF/close is an error here because within a
@@ -193,7 +227,7 @@ impl Worker {
     /// module docs), which is what lets `Checkout` race a turn against its
     /// deadline.
     pub(crate) async fn recv(&mut self) -> Result<pb::ChildEvent, FrameError> {
-        match &mut self.kind {
+        let event = match &mut self.kind {
             WorkerKind::Subprocess(w) => match w.recv.recv().await? {
                 Some(event) => Ok(event),
                 None => Err(FrameError::Truncated), // clean EOF mid-checkout is still a vanished peer
@@ -221,7 +255,14 @@ impl Worker {
                 };
                 decode_event(&data)
             }
+        }?;
+        // only after a complete decode, so a `recv` future dropped mid-frame
+        // (deadline race) records nothing — cancel-safety intact
+        #[cfg(feature = "telemetry-adapter")]
+        if let Some(recorder) = &mut self.recorder {
+            recorder.event(&event);
         }
+        Ok(event)
     }
 
     /// The OS process id, when the worker is a local subprocess (`None` for a

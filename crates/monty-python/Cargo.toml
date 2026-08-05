@@ -21,7 +21,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ahash = { workspace = true }
-monty-pool = { workspace = true }
+monty-pool = { workspace = true, features = ["telemetry-adapter"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
 monty-proto = { workspace = true, features = ["python"] }
 monty-types = { workspace = true }
 monty-fs = { workspace = true }

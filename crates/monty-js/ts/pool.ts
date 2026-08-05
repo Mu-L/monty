@@ -9,6 +9,7 @@ import { NativePool } from '../native-addon.js'
 import { findMontyBinary } from './binary.js'
 import { type AssertMessageAnnotations, encodeAssertMessageAnnotations } from './options.js'
 import { MontySession } from './session.js'
+import { captureTelemetryContext } from './telemetry.js'
 
 /** Options for [`Monty`]. */
 export interface MontyOptions {
@@ -128,7 +129,8 @@ export class Monty {
       ...(options.typeCheckStubs !== undefined ? { typeCheckStubs: options.typeCheckStubs } : {}),
       ...(assertAnnotations !== undefined ? { assertMessageAnnotations: assertAnnotations } : {}),
     })
-    await native.enter()
+    const telemetryContext = captureTelemetryContext()
+    await native.enter(telemetryContext)
     return new MontySession(native)
   }
 
