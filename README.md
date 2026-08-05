@@ -239,10 +239,8 @@ assert_eq!(result, MontyObject::Int(42));
 ## Memory limits in workers
 
 A session's `max_memory` is enforced in the worker's own allocator as well as by
-the interpreter, so it covers every byte the process asks for. There is nothing
-to configure: set the limit, and a session that exceeds it fails. A worker that
-cannot honour the limit is killed with a `MemoryError` and replaced by the pool,
-rather than growing until the OS OOM killer picks a victim.
+the interpreter, so it bounds the bytes the worker holds at once rather than
+only what the interpreter can account for.
 
 See [`limitations/resource_limits.md`](limitations/resource_limits.md) for how
 exceeding a limit surfaces to a host, and `monty-alloc` for the allocator both
