@@ -72,6 +72,11 @@ The host enforces these invariants on every path operation:
 - Canonicalization happens *after* mapping virtual → host paths.
 - The canonical path must remain inside the mount; `..` traversal cannot
   escape (raises `PermissionError`).
+- Path segments a host parser reads as absolute are rejected
+  (`PermissionError`) on every OS and in every mount mode: any segment
+  containing a backslash or starting with `X:`. So names CPython allows on
+  Unix — `a\b.txt`, `a:b.txt` — are refused there too, since Windows would
+  read them as drive-relative. Colons elsewhere are fine (`note:2026.txt`).
 - Symlinks pointing outside the mount are rejected on resolution.
 - Null bytes in any path component are rejected (`ValueError`).
 - Resolved paths returned to the sandbox (e.g. via `Path.resolve()`) are

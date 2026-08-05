@@ -130,6 +130,7 @@ impl ResolutionRequest {
         let relative = strip_mount_prefix(&normalized_virtual, mount_virtual_path)
             .ok_or_else(|| MountError::NoMountPoint(virtual_path.to_owned()))?
             .to_owned();
+        reject_drive_or_unc_segments(&relative, &normalized_virtual)?;
 
         let candidate_host = if relative.is_empty() {
             mount_host_path.to_path_buf()
@@ -137,6 +138,10 @@ impl ResolutionRequest {
             mount_host_path.join(&relative)
         };
         reject_parent_components(&candidate_host, &normalized_virtual)?;
+        // A join that stayed inside the mount makes this a no-op; one whose
+        // segment clobbered the base is caught before any host I/O runs. It
+        // cannot catch a symlink escape — only canonicalization sees those.
+        check_boundary(&candidate_host, mount_host_path, &normalized_virtual)?;
 
         Ok(Self {
             normalized_virtual,
@@ -259,6 +264,9 @@ fn resolve_mkdir_parents(request: &ResolutionRequest, mount_host_path: &Path) ->
             for remaining in &components[index..] {
                 current = current.join(remaining);
             }
+            // The missing tail is appended lexically, so nothing else has
+            // checked it — no mode may return an unvalidated path.
+            check_boundary(&current, mount_host_path, &request.normalized_virtual)?;
             return Ok(current);
         }
     }
@@ -299,6 +307,33 @@ pub(super) fn reject_overlong_path(normalized: &str, original: &str) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Rejects segments a host parser treats as drive/UNC/root-absolute: on
+/// Windows `PathBuf::join` discards the mount base for `C:\x`, `C:`, or
+/// `\\host\share`, escaping before any boundary check. Runs on all hosts for
+/// consistent behavior, and must precede the `candidate_host` join.
+///
+/// `OverlayMemory` needs it too: it serves requests from memory via
+/// `overlay::relative_path`, where these segments would otherwise become valid
+/// keys that every other mode refuses.
+pub(super) fn reject_drive_or_unc_segments(relative: &str, normalized_virtual_path: &str) -> Result<(), MountError> {
+    // A backslash can only smuggle a Windows separator/UNC/root prefix; `X:` a drive.
+    let has_escape_prefix = relative.contains('\\') || relative.split('/').any(is_windows_drive_prefix);
+    if has_escape_prefix {
+        Err(MountError::PathEscape {
+            virtual_path: normalized_virtual_path.to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `segment` starts with a Windows drive prefix (`X:`), which
+/// `PathBuf::join` treats as base-clobbering.
+fn is_windows_drive_prefix(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Rejects `..` components in the joined host candidate as defense in depth.
@@ -408,9 +443,13 @@ pub(super) fn reject_escaping_symlink(
     check_boundary(&canonical, &canonical_mount, virtual_path)
 }
 
-/// Ensures a canonical host path stays within the canonical mount boundary.
-fn check_boundary(canonical_path: &Path, mount_host_path: &Path, virtual_path: &str) -> Result<(), MountError> {
-    if canonical_path.starts_with(mount_host_path) {
+/// Ensures a host path stays within the mount boundary, component-wise.
+///
+/// Applied to canonicalized paths as the authoritative check, and to lexically
+/// joined candidates as a backstop that traps a base-clobbering segment before
+/// any host I/O. `mount_host_path` is canonical: `Mount::new` resolves it.
+fn check_boundary(candidate_path: &Path, mount_host_path: &Path, virtual_path: &str) -> Result<(), MountError> {
+    if candidate_path.starts_with(mount_host_path) {
         Ok(())
     } else {
         Err(MountError::PathEscape {
