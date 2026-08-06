@@ -6,7 +6,6 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
-    mem,
 };
 
 use crate::{
@@ -83,11 +82,11 @@ impl TimeZone {
         };
 
         if offset_seconds == 0 && name_str.is_none() {
-            return vm.heap.get_timezone_utc().map_err(Into::into);
+            return Ok(vm.heap.get_timezone_utc());
         }
 
         let tz = Self::new(offset_seconds, name_str)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::TimeZone(tz))?))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::TimeZone(tz))))
     }
 
     /// Formats offset as `+HH:MM` / `-HH:MM` with optional `:SS`.
@@ -212,10 +211,6 @@ fn bad_name_arg(name_arg: &Value, heap: &Heap, interns: &Interns) -> RunError {
 }
 
 impl HeapItem for TimeZone {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.name.as_ref().map_or(0, String::len)
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {}
 }
 
@@ -274,6 +269,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeZone> {
         } else {
             format!("UTC{}", tz.format_utc_offset())
         };
-        Ok(allocate_string(s, vm.heap)?)
+        Ok(allocate_string(s, vm.heap))
     }
 }

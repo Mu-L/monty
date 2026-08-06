@@ -793,12 +793,12 @@ impl VM<'_> {
         func.signature.bind(args, defaults, this, func.name, namespace)?;
 
         // 3. Install owned cells and captured free-var cells at their slots.
-        this.install_closure_cells(func, cells, namespace)?;
+        this.install_closure_cells(func, cells, namespace);
 
         // 4. Create Coroutine on heap
         let (namespace, this) = namespace_guard.into_parts();
         let coroutine = Coroutine::new(func_id, namespace);
-        let coroutine_id = this.heap.allocate(HeapData::Coroutine(coroutine))?;
+        let coroutine_id = this.heap.allocate(HeapData::Coroutine(coroutine));
 
         Ok(CallResult::Value(Value::Ref(coroutine_id)))
     }
@@ -819,12 +819,7 @@ impl VM<'_> {
     /// during preparation, outside the contiguous param/cell/free region — so a
     /// positional `push` would place it wrong. Shared by sync calls and
     /// coroutine creation.
-    fn install_closure_cells(
-        &mut self,
-        func: &Function,
-        cells: &[HeapId],
-        namespace: &mut Vec<Value>,
-    ) -> Result<(), RunError> {
+    fn install_closure_cells(&mut self, func: &Function, cells: &[HeapId], namespace: &mut Vec<Value>) {
         namespace.resize_with(func.namespace_size, || Value::Undefined);
 
         for (i, &slot) in func.cell_var_slots.iter().enumerate() {
@@ -832,7 +827,7 @@ impl VM<'_> {
                 Some(param_idx) => namespace[param_idx].clone_with_heap(self),
                 None => Value::Undefined,
             };
-            let cell_id = self.heap.allocate(HeapData::Cell(CellValue(cell_value)))?;
+            let cell_id = self.heap.allocate(HeapData::Cell(CellValue(cell_value)));
             namespace[slot.index()] = Value::Ref(cell_id);
         }
 
@@ -840,8 +835,6 @@ impl VM<'_> {
             self.heap.inc_ref(cell_id);
             namespace[func.free_var_slots[i].index()] = Value::Ref(cell_id);
         }
-
-        Ok(())
     }
 
     /// Calls a sync function by pushing a new frame.
@@ -866,13 +859,6 @@ impl VM<'_> {
         let namespace_size = func.namespace_size;
         let locals_count = u16::try_from(namespace_size).expect("function namespace size exceeds u16");
 
-        // Track memory for this frame's locals. Symmetric with
-        // `cleanup_frame_state`. Comprehension variables live on the operand
-        // stack (pushed per-comp), not in any frame-level region, so they
-        // don't enter this accounting.
-        let size = namespace_size * mem::size_of::<Value>();
-        self.heap.tracker_mut().on_grow(|| size)?;
-
         // 1. Build the namespace in the reusable scratch buffer to avoid a
         //    per-call allocation. On error `DropGuard` drops the buffer, so the
         //    pool just restarts empty next call.
@@ -885,14 +871,11 @@ impl VM<'_> {
         {
             let bind_result = func.signature.bind(args, defaults, this, func.name, namespace);
 
-            if let Err(e) = bind_result {
-                this.heap.tracker_mut().on_free(|| size);
-                return Err(e);
-            }
+            bind_result?;
         }
 
         // 3. Install owned cells and captured free-var cells at their slots.
-        this.install_closure_cells(func, cells, namespace)?;
+        this.install_closure_cells(func, cells, namespace);
 
         let code = &func.code;
 
@@ -942,17 +925,9 @@ impl VM<'_> {
     /// on external/OS calls; the `is_initializer` flag is threaded through frame
     /// serialization so a suspended initializer resumes correctly.
     fn instantiate_class(&mut self, class_id: HeapId, args: ArgValues) -> Result<CallResult, RunError> {
-        // Allocate the instance. On allocation failure drop the args we own.
-        let instance_id = match self
+        let instance_id = self
             .heap
-            .allocate(HeapData::Instance(Box::new(Instance::new(class_id, Dict::new()))))
-        {
-            Ok(id) => id,
-            Err(e) => {
-                args.drop_with(self);
-                return Err(e.into());
-            }
-        };
+            .allocate(HeapData::Instance(Box::new(Instance::new(class_id, Dict::new()))));
         // The instance now owns a reference to its class object.
         self.heap.inc_ref(class_id);
 

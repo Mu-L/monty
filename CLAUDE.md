@@ -139,15 +139,15 @@ subprocesses:
   are cancel-safe (partial-frame state lives in the worker, no pump task),
   and turn deadlines are tokio timers rather than a watchdog thread.
 - `crates/monty-alloc` — the `#[global_allocator]` both workers run under: it
-  counts live bytes against the session's `max_memory` (via
-  `Child::session_budget`, re-armed after every request) and ends the process
-  rather than letting Rust abort. Its `exit-code` feature picks how:
+  counts live bytes against soft and hard session limits (via
+  `Child::session_budget`, re-armed after every request). The interpreter reads
+  the soft limit at execution checkpoints; crossing the hard limit ends the
+  process rather than letting Rust abort. Its `exit-code` feature picks how:
   `monty-runtime` enables it and exits with `OOM_EXIT_CODE` for the pool to
   classify, `monty-wasm-runtime` leaves it off and traps, having no exit status
   to offer. Only a binary or a wasm module may declare a global allocator, so
-  the crate provides the type and each declares its own. TODO: the interpreter
-  meters allocations too — that second implementation is to be removed, leaving
-  this the only one.
+  the crate provides the type and each declares its own. Direct interpreter use
+  must install and arm this allocator before configuring `max_memory`.
 - `pydantic_monty.Monty` / `pydantic_monty.AsyncMonty` — the ONLY Python
   execution surface (there is no in-process Python API): sync and async pools
   of workers (`with Monty() as pool: with pool.checkout() as session:
@@ -297,9 +297,9 @@ iter.drop_with(self); // single path, no branching
 
 ### Resource-tracked string construction (`StringBuilder`)
 
-Any code that builds a `String` whose final size is not already bounded by an already-tracked input **must** use `StringBuilder` (in `crates/monty/src/string_builder.rs`) rather than `String::with_capacity(...).push(...)`. Intermediate `String`s live on the Rust heap *outside* the resource tracker, so a loop-built string can OOM the host before `allocate_string` ever consults the tracker — this is exactly the class of bug that hit `str.expandtabs` (huge `tabsize` amplifying a single tab into a multi-gigabyte allocation).
+Any code that builds a `String` whose final size is not already bounded by an existing input **must** use `StringBuilder` (in `crates/monty/src/string_builder.rs`) rather than `String::with_capacity(...).push(...)`. A loop-built string can otherwise jump past both allocator limits before an execution checkpoint — this is exactly the class of bug that hit `str.expandtabs` (huge `tabsize` amplifying a single tab into a multi-gigabyte allocation).
 
-`StringBuilder` actively *reserves* bytes with the tracker (via `on_grow`) as it grows, not just previews. This matters for nested builds: a `str.join` that invokes user-defined `__str__` methods, an f-string spec that evaluates an inner expression, etc. With a preview-only check, each builder would only see the *committed* memory and miss the outer's in-progress buffer — together they could exceed the limit. Reservations are released on `Drop` (cleanup on `?` / early-return paths) or in `finish(heap)` (which folds the handoff to `allocate_string` into the builder so the final size is re-added via `on_grow` exactly once). Growth is amortized via 2× doubling:
+`StringBuilder` preflights capacity growth against allocator-backed usage. The in-progress buffer is itself visible to the allocator, so nested builders share the same real-byte budget. Growth is amortized via 2× doubling:
 
 ```rust
 // Bounded size known up front (padding to a given width):
@@ -317,6 +317,35 @@ builder.finish(vm.heap)
 `StringBuilder` also implements `fmt::Write`, so `write!(builder, ...)`, `format_args!`, and the existing `py_repr_fmt(f, ...)` machinery work against a tracker-protected buffer. `fmt::Error` is payload-free, so any `ResourceError` raised by a write is stashed on the builder and surfaced by `finish(heap)` — callers using `write!` don't need to thread the tracker error themselves.
 
 When the input *is* already bounded (e.g. `s.to_lowercase()`, slicing, `to_owned()` of an existing tracked string), passing a plain `String` / `&str` to `allocate_string` is fine — the result is bounded by a known multiple of an already-tracked input, so no amplification is possible.
+
+### Soft memory-limit checks — when and why
+
+`max_memory` is a **soft** limit: the VM polls allocator-backed usage before every
+instruction (`check_time`), and everything pathological is caught by the hard
+limits — the allocator's hard ceiling (soft + headroom, worker exits with
+`OOM_EXIT_CODE` and the pool replaces it) and the pool's turn timeout. Soft
+checks exist ONLY to turn *common* overshoots into a graceful `MemoryError`
+that keeps the session alive; they are not a safety boundary, so do not
+sprinkle them everywhere — every check is code noise and hot-path cost.
+
+Add a check only where ordinary code commonly allocates a multi-MiB burst
+inside a single builtin call (i.e. before the next instruction checkpoint):
+
+- Known-size bulk allocation: one up-front `tracker().check_allocation(n * VALUE_SIZE)`
+  (container clone/copy, e.g. `clone_all_items`, `list_copy`) or
+  `check_repeat_size`-style estimate (`resource_checks.rs`).
+- Iterator collection: `collect_python_iterator` / `checked_preallocation_hint`
+  already handle it; for push-loops that bypass them, a one-shot size-hint
+  preflight (see `deque_extend`) — never a per-item poll.
+- Unbounded/amplifying string building: `StringBuilder` (above).
+
+Do NOT add per-iteration `check_time()` polls to Rust-side loops for memory's
+sake, and do NOT preflight results bounded by a constant multiple of an
+already-tracked input (path joins, `*args` tuples, regex match lists, parsed
+JSON) — rare oversized cases there are the hard limit's job. Test each graceful
+path in `large_allocations_are_rejected_before_the_hard_limit`
+(`crates/monty-runtime/tests/subprocess.rs`) — the interpreter's own tests
+never arm the allocator, so only subprocess tests exercise `max_memory`.
 
 ## Dev Commands
 
@@ -755,7 +784,7 @@ Raw ownership is also acceptable when immediately transferred into a documented 
 **Mutability of the heap parameter is asymmetric** — do not assume the two methods take the same kind of borrow:
 
 - `clone_with_heap` takes `&impl ContainsHeap` (immutable). The refcount field lives behind interior mutability, so `inc_ref` is `&self` on `Heap`. This means you can call `clone_with_heap` while other immutable borrows of the heap (e.g. a `HeapRead` handle obtained via `.get(heap)`) are still live.
-- `Heap::allocate` is also `&self` for the same reason — entry storage and the allocation tracker are behind interior mutability. New heap entries can be created without a `&mut Heap`.
+- `Heap::allocate` is also `&self` because entry storage is behind interior mutability. New heap entries can be created without a `&mut Heap`.
 - `drop_with` takes `&mut C` (the cleanup context — `Heap` / `HeapReader` / `VM` / `Encoder`), because dropping may free entries and run destructors, which mutates the heap.
 
 If you find yourself fighting the borrow checker around `clone_with_heap` or `allocate`, the fix is almost never `&mut` — it is more likely that you are passing the wrong receiver (e.g. `vm` instead of `vm.heap`) or holding a `&mut` borrow elsewhere that should be `&`.

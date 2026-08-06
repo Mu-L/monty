@@ -952,39 +952,18 @@ impl Heap {
         &mut self.tracker
     }
 
-    /// Checks whether the configured time limit has been exceeded.
+    /// Checks whether a configured time or memory limit has been exceeded.
     ///
-    /// Delegates to the resource tracker's `check_time()`, which compares
-    /// elapsed execution time against the configured `max_duration` (a no-op
-    /// when no time limit is set).
+    /// Delegates to the resource tracker's `check_time()`, which polls
+    /// allocator-backed usage against `max_memory` and elapsed execution time
+    /// against `max_duration` (each a no-op when unset).
     ///
     /// Call this inside Rust-side loops (builtins, sort, iterator collection)
     /// that execute within a single bytecode instruction and would otherwise
-    /// bypass the VM's per-instruction timeout check.
+    /// bypass the VM's per-instruction checkpoint.
     #[inline]
     pub fn check_time(&self) -> Result<(), ResourceError> {
         self.tracker.check_time()
-    }
-
-    /// Tracks in-place memory growth of an existing heap object.
-    ///
-    /// Call this before performing mutations that grow containers (append, insert,
-    /// extend, dict set, set add). Returns `Err(ResourceError::Memory)` if the
-    /// growth would exceed configured memory limits.
-    #[inline]
-    pub fn track_growth(&self, additional_bytes: usize) -> Result<(), ResourceError> {
-        self.tracker.on_grow(|| additional_bytes)
-    }
-
-    /// Mirror of [`track_growth`](Self::track_growth) for in-place shrinks.
-    ///
-    /// Needed when a heap entry's `py_estimate_size` decreases without the
-    /// entry itself being freed: `on_free` at entry release reads the
-    /// *current* size, so growth charged earlier would otherwise leak in
-    /// the tracker counter.
-    #[inline]
-    pub fn track_shrink(&self, bytes: usize) {
-        self.tracker.on_free(|| bytes);
     }
 
     /// Number of entries in the heap (including freed slots).
@@ -1005,16 +984,12 @@ impl Heap {
 
     /// Allocates a new heap entry.
     ///
-    /// Returns `Err(ResourceError)` if allocation would exceed configured limits.
-    /// Use this when you need to handle resource limit errors gracefully.
-    ///
     /// GC-tracked types bump `allocations_since_gc` so that
     /// [`should_gc`](Self::should_gc) eventually fires; trial deletion's own
     /// candidate enrollment happens later, at `dec_ref` time. Leaf types
     /// (strings, bytes, …) cannot participate in cycles and don't count
     /// against the GC interval.
-    pub fn allocate(&self, data: HeapData) -> Result<HeapId, ResourceError> {
-        self.tracker.on_grow(|| data.py_estimate_size())?;
+    pub fn allocate(&self, data: HeapData) -> HeapId {
         if data.is_gc_tracked() {
             self.allocations_since_gc
                 .set(self.allocations_since_gc.get().wrapping_add(1));
@@ -1027,8 +1002,7 @@ impl Heap {
             color: Cell::new(CcColor::Black),
         };
 
-        let id = self.entries.allocate(new_entry);
-        Ok(id)
+        self.entries.allocate(new_entry)
     }
 
     /// Returns the singleton empty tuple.
@@ -1049,17 +1023,17 @@ impl Heap {
     ///
     /// The cache holds no reference count of its own. Its entry is removed when the
     /// last owning reference is dropped, before the heap slot can be reused.
-    pub fn get_ext_function(&mut self, name: &str) -> Result<Value, ResourceError> {
+    pub fn get_ext_function(&mut self, name: &str) -> Value {
         if let Some(id) = self.ext_function_cache.get(name).copied() {
             self.inc_ref(id);
-            Ok(Value::Ref(id))
+            Value::Ref(id)
         } else {
             let function = ExtFunction::new(name);
             let cache_key = function.cache_key();
-            let id = self.allocate(HeapData::ExtFunction(function))?;
+            let id = self.allocate(HeapData::ExtFunction(function));
             let previous = self.ext_function_cache.insert(cache_key, id);
             debug_assert!(previous.is_none());
-            Ok(Value::Ref(id))
+            Value::Ref(id)
         }
     }
 
@@ -1074,17 +1048,17 @@ impl Heap {
     ///
     /// The returned `Value::Ref` has its refcount incremented so the caller can drop
     /// it normally. The singleton itself is kept alive by the `timezone_utc` field.
-    pub fn get_timezone_utc(&mut self) -> Result<Value, ResourceError> {
+    pub fn get_timezone_utc(&mut self) -> Value {
         if let Some(id) = self.timezone_utc {
             self.inc_ref(id);
-            Ok(Value::Ref(id))
+            Value::Ref(id)
         } else {
             let tz = TimeZone::utc();
-            let id = self.allocate(HeapData::TimeZone(tz))?;
+            let id = self.allocate(HeapData::TimeZone(tz));
             // Keep an extra refcount for the singleton cache
             self.inc_ref(id);
             self.timezone_utc = Some(id);
-            Ok(Value::Ref(id))
+            Value::Ref(id)
         }
     }
 
@@ -1174,12 +1148,6 @@ impl Heap {
                     // a &self borrow on `StableHeap`. At least this repeated lookup is already
                     // on the slow path.
                     let mut value = reader.heap.entries.entry(current_id).expect("already looked up").free();
-
-                    // Notify tracker of freed memory
-                    reader
-                        .heap
-                        .tracker
-                        .on_free(|| value.data.0.get_mut().py_estimate_size());
 
                     // Collect child IDs and push onto work stack for iterative processing
                     py_dec_ref_ids_for_data(value.data.0.get_mut(), &mut work_stack);
@@ -1346,7 +1314,6 @@ impl Heap {
             if let HeapData::ExtFunction(function) = value.data.0.get_mut() {
                 Self::remove_ext_function_cache_entry(&mut self.ext_function_cache, &function.cache_key(), id);
             }
-            self.tracker.on_free(|| value.data.0.get_mut().py_estimate_size());
             freed += 1;
             // Walk children, marking child `Value::Ref`s as `Dereferenced`
             // under `memory-model-checks` so dropping the freed entry's data
@@ -2040,7 +2007,7 @@ mod tests {
     /// The list's items become `[Value::Ref(id)]` and its refcount is bumped
     /// to 2 to reflect both the caller's ref and the new self-reference.
     fn alloc_self_cycle(heap: &Heap) -> HeapId {
-        let id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let id = heap.allocate(HeapData::List(List::new(vec![])));
         let entry = heap
             .entries
             .iter()
@@ -2074,8 +2041,8 @@ mod tests {
     /// stack must not grow with edge multiplicity — otherwise the outer
     /// pop processes A's children multiple times and over-counts.
     fn alloc_dup_child_cycle(heap: &Heap) -> (HeapId, HeapId) {
-        let p_id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
-        let a_id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let p_id = heap.allocate(HeapData::List(List::new(vec![])));
+        let a_id = heap.allocate(HeapData::List(List::new(vec![])));
 
         let push_refs = |target: HeapId, refs: &[HeapId]| {
             let entry = heap
@@ -2190,7 +2157,7 @@ mod tests {
     #[test]
     fn dec_ref_must_not_invalidate_live_heap_read() {
         let mut heap = Heap::new(16, ResourceTracker::default());
-        let id = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let id = heap.allocate(HeapData::List(List::new(vec![])));
         // Bump refcount so `dec_ref` enters the non-freeing branch where
         // the offending `data.0.get_mut()` lives. `List` is GC-tracked, so
         // `is_gc_tracked` returns true and the branch is fully exercised.
@@ -2351,17 +2318,16 @@ mod tests {
     #[test]
     fn callable_iterator_traces_callable_and_sentinel() {
         let heap = Heap::new(16, ResourceTracker::default());
-        let c = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
-        let s = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let c = heap.allocate(HeapData::List(List::new(vec![])));
+        let s = heap.allocate(HeapData::List(List::new(vec![])));
 
         heap.inc_ref(c);
         heap.inc_ref(s);
-        let iter = heap
-            .allocate(HeapData::CallableIterator(CallableIterator::new(
-                Value::Ref(c),
-                Value::Ref(s),
-            )))
-            .unwrap();
+        let iter = heap.allocate(HeapData::CallableIterator(CallableIterator::new(
+            Value::Ref(c),
+            Value::Ref(s),
+        )));
+
         let mut traced = vec![];
         for_each_child_id(heap.get(iter), |id| traced.push(id));
         assert_eq!(traced, vec![c, s], "callable and sentinel are both traced");
@@ -2371,12 +2337,11 @@ mod tests {
         // under-decrements and frees a live object.
         heap.inc_ref(c);
         heap.inc_ref(c);
-        let shared = heap
-            .allocate(HeapData::CallableIterator(CallableIterator::new(
-                Value::Ref(c),
-                Value::Ref(c),
-            )))
-            .unwrap();
+        let shared = heap.allocate(HeapData::CallableIterator(CallableIterator::new(
+            Value::Ref(c),
+            Value::Ref(c),
+        )));
+
         let mut dup = vec![];
         for_each_child_id(heap.get(shared), |id| dup.push(id));
         assert_eq!(dup, vec![c, c], "a shared callable/sentinel is traced twice");
@@ -2388,16 +2353,14 @@ mod tests {
     #[test]
     fn callable_iterator_cycle_is_collected() {
         let mut heap = Heap::new(16, ResourceTracker::default());
-        let sentinel = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
-        let list = heap.allocate(HeapData::List(List::new(vec![]))).unwrap();
+        let sentinel = heap.allocate(HeapData::List(List::new(vec![])));
+        let list = heap.allocate(HeapData::List(List::new(vec![])));
         heap.inc_ref(list);
         heap.inc_ref(sentinel);
-        let iter = heap
-            .allocate(HeapData::CallableIterator(CallableIterator::new(
-                Value::Ref(list),
-                Value::Ref(sentinel),
-            )))
-            .unwrap();
+        let iter = heap.allocate(HeapData::CallableIterator(CallableIterator::new(
+            Value::Ref(list),
+            Value::Ref(sentinel),
+        )));
 
         // Close the cycle: the callable list references the iterator back.
         heap.inc_ref(iter);

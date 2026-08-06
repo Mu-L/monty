@@ -9,7 +9,6 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
-    mem,
 };
 
 use chrono::TimeDelta as ChronoTimeDelta;
@@ -196,7 +195,7 @@ pub(crate) fn init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         + microseconds.0;
 
     let delta = from_total_microseconds(total_microseconds)?;
-    Ok(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(delta))?))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(delta))))
 }
 
 /// Argument shape for `timedelta(days=0, seconds=0, microseconds=0, *, milliseconds=0, minutes=0, hours=0, weeks=0)`.
@@ -292,10 +291,6 @@ pub(crate) fn format_repr(delta: &TimeDelta) -> String {
 }
 
 impl HeapItem for TimeDelta {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {}
 }
 
@@ -357,7 +352,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
             let day_word = if days.abs() == 1 { "day" } else { "days" };
             format!("{days} {day_word}, {time}")
         };
-        Ok(allocate_string(s, vm.heap)?)
+        Ok(allocate_string(s, vm.heap))
     }
 
     /// `-delta` — `from_total_microseconds` is fallible, though no in-range
@@ -365,7 +360,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
     /// negation lands back inside them.
     fn py_neg_impl(&self, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
         let negated = from_total_microseconds(-total_microseconds(self.get(vm.heap)))?;
-        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(negated))?)))
+        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(negated)))))
     }
 
     /// `+delta` is the identity, so hand back this same immutable value. The
@@ -379,11 +374,11 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
 
     fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>, _self_id: Option<HeapId>) -> RunResult<Option<Value>> {
         match other.read_heap(vm) {
-            Some(HeapReadOutput::Date(other)) => Ok(date::py_add(*other.get(vm.heap), *self.get(vm.heap), vm.heap)?),
+            Some(HeapReadOutput::Date(other)) => Ok(date::py_add(*other.get(vm.heap), *self.get(vm.heap), vm.heap)),
             Some(HeapReadOutput::DateTime(other)) => {
                 let other = other.get(vm.heap).clone();
                 let value = *self.get(vm.heap);
-                Ok(datetime::py_add(&other, &value, vm.heap)?)
+                Ok(datetime::py_add(&other, &value, vm.heap))
             }
             Some(HeapReadOutput::TimeDelta(other)) => {
                 let total = total_microseconds(self.get(vm.heap)).checked_add(total_microseconds(other.get(vm.heap)));
@@ -391,7 +386,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
                 let Ok(result) = from_total_microseconds(total) else {
                     return Ok(None);
                 };
-                Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result))?)))
+                Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result)))))
             }
             _ => Ok(None),
         }
@@ -406,7 +401,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
         let Ok(result) = from_total_microseconds(total) else {
             return Ok(None);
         };
-        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result))?)))
+        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result)))))
     }
 
     fn py_mul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
@@ -419,7 +414,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
             .checked_mul(multiplier)
             .ok_or_else(|| SimpleException::new_msg(ExcType::OverflowError, "timedelta multiplication overflow"))?;
         let result = from_total_microseconds(total)?;
-        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result))?)))
+        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result)))))
     }
 
     fn py_rmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
@@ -436,7 +431,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
         let total = total_microseconds(self.get(vm.heap));
         let result = div_microseconds_round_ties_even(total, divisor);
         let result = from_total_microseconds(result)?;
-        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result))?)))
+        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result)))))
     }
 
     fn py_floordiv_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
@@ -448,7 +443,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, TimeDelta> {
         };
         let total = total_microseconds(self.get(vm.heap));
         let result = from_total_microseconds(total.div_euclid(divisor))?;
-        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result))?)))
+        Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result)))))
     }
 
     fn py_call_attr(

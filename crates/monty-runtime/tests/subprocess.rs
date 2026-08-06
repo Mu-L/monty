@@ -432,15 +432,112 @@ fn child_enforces_time_limit() {
     child.shutdown();
 }
 
-/// A session's `max_memory` must not disturb work that stays inside it. The
-/// limit here is deliberately tiny: the headroom above it is what keeps a small
-/// limit servable at all.
+/// A session's `max_memory` must not disturb work that stays inside it. This
+/// small budget includes the real allocations needed to compile and run a feed.
 #[test]
 fn small_memory_limit_leaves_normal_work_alone() {
     let mut child = ChildProc::spawn();
-    child.create_repl_with(configure_with_max_memory(1024));
+    child.create_repl_with(configure_with_max_memory(64 * 1024));
     assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
     child.shutdown();
+}
+
+/// Crossing the allocator's soft limit raises an ordinary session error rather
+/// than killing the worker, and unwinding releases the incomplete result.
+#[test]
+fn exceeding_the_soft_memory_limit_preserves_the_worker() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(8 * 1024 * 1024));
+    let (_, event) = child.feed("[str(i) for i in range(131_072)]");
+    assert_eq!(expect_error(event).exc_type, "MemoryError");
+    assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
+    child.shutdown();
+}
+
+/// Async scheduler state is allocator-accounted even though it lives outside
+/// Monty's object heap, so recursive gathers reach the soft limit safely.
+#[test]
+fn async_accumulation_reaches_the_soft_limit() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(1024 * 1024));
+    let code = "import asyncio\nasync def f():\n    return await asyncio.gather(f())\nasyncio.run(f())";
+    let (_, event) = child.feed(code);
+    assert_eq!(expect_error(event).exc_type, "MemoryError");
+    assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
+    child.shutdown();
+}
+
+/// Known large results are rejected against allocator usage before they can
+/// jump from below the soft limit past the hard ceiling. The reported figure is
+/// what each result really costs, so it pins down that the refusal accounted for
+/// the whole allocation rather than tripping on some smaller intermediate.
+#[test]
+fn large_allocations_are_rejected_before_the_hard_limit() {
+    // each case with the allocator usage it should be refused at
+    let cases = [
+        ("'x' * 10_000_000", 10_030_889),
+        ("b'x' * 10_000_000", 10_031_021),
+        ("[None] * 1_000_000", 16_031_143),
+        ("2 ** 10_000_000", 10_030_982),
+        ("1 << 10_000_000", 1_280_983),
+        ("('a' * 1000).replace('a', 'b' * 2000)", 2_034_521),
+        // Bulk container clones: `+=` preflights the temp clone plus the target
+        // growth, `+` preflights each side's clone.
+        ("x = [None] * 40_000\nx += x", 1_951_587),
+        ("t = (None,) * 40_000\nt + t", 1_311_587),
+        ("x = [None] * 40_000\nx.copy()", 1_311_337),
+        // `deque.extend` preflights exact-hint iterators up front.
+        (
+            "from collections import deque\nd = deque()\nd.extend(range(1_000_000))",
+            16_031_723,
+        ),
+    ];
+
+    for (code, expected) in cases {
+        let mut child = ChildProc::spawn();
+        child.create_repl_with(configure_with_max_memory(1024 * 1024));
+        let (_, event) = child.feed(code);
+        let error = expect_error(event);
+        assert_eq!(error.exc_type, "MemoryError", "{code}");
+        let message = error.message.expect("MemoryError should have a message");
+        assert_reported_usage(&message, expected, code);
+        assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2), "{code}");
+        child.shutdown();
+    }
+}
+
+/// A bounded deque retains at most `maxlen` items, so extending it from a huge
+/// exact-hint iterator (the sliding-window pattern) must not trip the
+/// `deque.extend` preflight — the memory really is capped at `maxlen`.
+#[test]
+fn bounded_deque_extend_is_not_preflighted() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(1024 * 1024));
+    let code = "from collections import deque\nd = deque(maxlen=8)\nd.extend(range(500_000))\nlen(d)";
+    assert_eq!(child.feed_complete(code), MontyObject::Int(8));
+    child.shutdown();
+}
+
+/// Assert a `memory limit exceeded` message reports roughly `expected` bytes
+/// used against a 1 MiB limit.
+///
+/// Exact equality is not usable: the figure is real allocator bytes, so the
+/// baseline the session starts from varies by a few dozen bytes between
+/// platforms (macOS runs consistently below Linux and Windows). The tolerance is
+/// far below what a mis-accounted allocation would move the number by.
+fn assert_reported_usage(message: &str, expected: u64, code: &str) {
+    const TOLERANCE: u64 = 1024;
+
+    let used: u64 = message
+        .strip_prefix("memory limit exceeded: ")
+        .and_then(|rest| rest.strip_suffix(" bytes > 1048576 bytes"))
+        .unwrap_or_else(|| panic!("{code}: unexpected message {message:?}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("{code}: unexpected message {message:?}"));
+    assert!(
+        used.abs_diff(expected) <= TOLERANCE,
+        "{code}: reported {used} bytes, expected within {TOLERANCE} of {expected}"
+    );
 }
 
 /// A refused allocation must leave the parent something it can classify: the
@@ -456,16 +553,16 @@ fn refused_allocation_exits_with_the_oom_code() {
     // no `max_memory`, so the sandbox tracker permits this outright
     child.feed_expecting_death("x = ' ' * (1 << 60)");
     let (status, stderr) = child.reap_with_stderr();
-    assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
+    assert_eq!(status.code(), Some(monty_types::OOM_EXIT_CODE), "got {status:?}");
     assert!(
         stderr.contains("allocation of 1152921504606846976 bytes failed"),
         "{stderr}"
     );
 }
 
-/// The point of enforcing in the allocator: memory the interpreter never
-/// accounts for must still kill the process rather than grow the host without
-/// bound. The allocation here comes from the frame reader — a bare length
+/// Memory allocated outside interpreter checkpoints must still hit the hard
+/// ceiling rather than grow the host without bound. The allocation here comes
+/// from the frame reader — a bare length
 /// prefix, under the wire cap and over the limit, buys a 200 MiB buffer with
 /// four bytes. Same exit code as a refused allocation; the limit only changes
 /// *where* refusal starts.
@@ -475,7 +572,7 @@ fn exceeding_the_memory_limit_exits_with_the_oom_code() {
     child.create_repl_with(configure_with_max_memory(1024));
     child.oversized_prefix_expecting_death();
     let (status, stderr) = child.reap_with_stderr();
-    assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
+    assert_eq!(status.code(), Some(monty_types::OOM_EXIT_CODE), "got {status:?}");
     assert!(
         stderr.contains("allocation of 209715200 bytes exceeds the memory limit"),
         "{stderr}"
@@ -488,7 +585,7 @@ fn exceeding_the_memory_limit_exits_with_the_oom_code() {
 #[test]
 fn loading_a_dump_applies_its_own_memory_limit() {
     let mut source = ChildProc::spawn();
-    source.create_repl_with(configure_with_max_memory(1024));
+    source.create_repl_with(configure_with_max_memory(64 * 1024));
     assert_eq!(source.feed_complete("x = 1"), MontyObject::None);
     source.send(pb::parent_request::Kind::Dump(pb::Dump {}));
     let pb::child_event::Kind::DumpResult(dump) = source.recv() else {
@@ -503,7 +600,7 @@ fn loading_a_dump_applies_its_own_memory_limit() {
     };
     restored.oversized_prefix_expecting_death();
     let (status, stderr) = restored.reap_with_stderr();
-    assert_eq!(status.code(), Some(monty_proto::OOM_EXIT_CODE), "got {status:?}");
+    assert_eq!(status.code(), Some(monty_types::OOM_EXIT_CODE), "got {status:?}");
     assert!(
         stderr.contains("allocation of 209715200 bytes exceeds the memory limit"),
         "{stderr}"

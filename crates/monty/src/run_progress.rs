@@ -170,8 +170,7 @@ impl FunctionCall {
         self.snapshot.heap.tracker_mut()
     }
 
-    /// Returns the resource tracker, letting hosts inspect resource usage
-    /// (e.g. [`ResourceTracker::current_memory`]) while execution is suspended.
+    /// Returns the resource tracker while execution is suspended.
     #[must_use]
     pub fn tracker(&self) -> &ResourceTracker {
         self.snapshot.heap.tracker()
@@ -271,10 +270,7 @@ impl OsCall {
         self.snapshot.run(result, print)
     }
 
-    /// Returns the resource tracker, letting hosts inspect resource usage
-    /// (e.g. [`ResourceTracker::current_memory`]) while execution is suspended —
-    /// for example verifying that a `read()` counts the file buffer against
-    /// `max_memory` between OS-call resumes.
+    /// Returns the resource tracker while execution is suspended.
     #[must_use]
     pub fn tracker(&self) -> &ResourceTracker {
         self.snapshot.heap.tracker()
@@ -317,8 +313,7 @@ impl NameLookup {
         }
     }
 
-    /// Returns the resource tracker, letting hosts inspect resource usage
-    /// (e.g. [`ResourceTracker::current_memory`]) while execution is suspended.
+    /// Returns the resource tracker while execution is suspended.
     #[must_use]
     pub fn tracker(&self) -> &ResourceTracker {
         self.snapshot.heap.tracker()
@@ -437,8 +432,7 @@ impl ResolveFutures {
         &self.pending_call_ids
     }
 
-    /// Returns the resource tracker, letting hosts inspect resource usage
-    /// (e.g. [`ResourceTracker::current_memory`]) while execution is suspended.
+    /// Returns the resource tracker while execution is suspended.
     #[must_use]
     pub fn tracker(&self) -> &ResourceTracker {
         self.heap.tracker()
@@ -590,10 +584,8 @@ impl Snapshot {
                     ExtFunctionResult::Error(exc) => vm.resume_with_exception(exc.into()),
                     ExtFunctionResult::Future(raw_call_id) => {
                         let call_id = CallId::new(raw_call_id);
-                        match vm.add_pending_call(call_id) {
-                            Ok(()) => vm.run_external(),
-                            Err(err) => vm.resume_with_exception(err),
-                        }
+                        vm.add_pending_call(call_id);
+                        vm.run_external()
                     }
                     ExtFunctionResult::NotFound(function_name) => {
                         vm.resume_with_exception(ExtFunctionResult::not_found_exc(&function_name))

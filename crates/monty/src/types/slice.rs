@@ -8,7 +8,6 @@ use std::{
     fmt,
     fmt::Write,
     hash::{Hash, Hasher},
-    mem,
 };
 
 use super::LazyHeapSet;
@@ -82,7 +81,7 @@ impl Slice {
             _ => return Err(ExcType::type_error_at_most("slice", 3, pos_args.len())),
         };
 
-        Ok(Value::Ref(heap.allocate(HeapData::Slice(slice))?))
+        Ok(Value::Ref(heap.allocate(HeapData::Slice(slice))))
     }
 
     /// Computes concrete indices for a sequence of the given length.
@@ -220,10 +219,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Slice> {
 }
 
 impl HeapItem for Slice {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // Slice doesn't contain heap references, nothing to do
     }

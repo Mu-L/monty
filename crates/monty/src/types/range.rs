@@ -7,7 +7,6 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
-    mem,
 };
 
 use num_integer::div_ceil;
@@ -143,7 +142,7 @@ impl Range {
             _ => return Err(ExcType::type_error_at_most("range", 3, pos_args.len())),
         };
 
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Range(range))?))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::Range(range))))
     }
 
     /// Handles slice-based indexing for ranges.
@@ -176,7 +175,7 @@ impl Range {
         let new_stop = i64::try_from(new_stop_i128).map_err(|_| ExcType::overflow_c_ssize_t())?;
 
         let new_range = Self::new(new_start, new_stop, new_step);
-        Ok(Value::Ref(heap.allocate(HeapData::Range(new_range))?))
+        Ok(Value::Ref(heap.allocate(HeapData::Range(new_range))))
     }
 }
 
@@ -222,7 +221,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
     }
 
     fn py_iter(&self, _: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        RangeIterator::allocate(*self.get(vm.heap), vm)
+        Ok(RangeIterator::allocate(*self.get(vm.heap), vm))
     }
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
@@ -324,10 +323,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
 }
 
 impl HeapItem for Range {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // Range doesn't contain heap references, nothing to do
     }
@@ -343,12 +338,12 @@ pub(crate) struct RangeIterator {
 
 impl RangeIterator {
     /// Allocates independent iteration state copied from `range`.
-    fn allocate(range: Range, vm: &mut VM<'_>) -> RunResult<Value> {
-        Ok(Value::Ref(vm.heap.allocate(HeapData::RangeIterator(Self {
+    fn allocate(range: Range, vm: &mut VM<'_>) -> Value {
+        Value::Ref(vm.heap.allocate(HeapData::RangeIterator(Self {
             next: range.start,
             step: range.step,
             remaining: range.len(),
-        }))?))
+        })))
     }
 
     /// Returns the exact number of values not yet yielded.
@@ -358,10 +353,6 @@ impl RangeIterator {
 }
 
 impl HeapItem for RangeIterator {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, _: &mut Vec<HeapId>) {}
 }
 

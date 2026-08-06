@@ -23,7 +23,6 @@ use std::{
 /// - `count(value)` - Count occurrences
 ///
 /// All tuple methods from Python's builtins are implemented.
-use monty_types::ResourceError;
 use smallvec::SmallVec;
 
 use super::{CmpOrder, PyTrait, iter::collect_owned_iterable};
@@ -42,7 +41,7 @@ use crate::{
         long_int::repeat_count,
         slice::{normalize_sequence_index, slice_collect_iterator},
     },
-    value::{EitherStr, Value},
+    value::{EitherStr, VALUE_SIZE, Value},
 };
 
 /// Inline capacity for small tuples. Tuples with 2 or fewer elements avoid
@@ -129,7 +128,7 @@ impl Tuple {
             }
             Some(v) => {
                 let items = collect_owned_iterable(v, vm)?;
-                Ok(allocate_tuple(items, vm.heap)?)
+                Ok(allocate_tuple(items, vm.heap))
             }
         }
     }
@@ -152,22 +151,11 @@ impl From<Tuple> for TupleVec {
 /// This is the preferred way to allocate tuples as it provides:
 /// - Empty tuple interning: `() is ()` returns `True`
 /// - SmallVec optimization for small tuples (≤2 elements)
-///
-/// # Example Usage
-/// ```ignore
-/// // Empty tuple - returns singleton
-/// let empty = allocate_tuple(Vec::new(), heap)?;
-///
-/// // Small tuple - stored inline in SmallVec
-/// let pair = allocate_tuple(vec![Value::Int(1), Value::Int(2)], heap)?;
-/// ```
-pub fn allocate_tuple(items: SmallVec<[Value; TUPLE_INLINE_CAPACITY]>, heap: &Heap) -> Result<Value, ResourceError> {
+pub fn allocate_tuple(items: SmallVec<[Value; TUPLE_INLINE_CAPACITY]>, heap: &Heap) -> Value {
     if items.is_empty() {
-        Ok(heap.get_empty_tuple())
+        heap.get_empty_tuple()
     } else {
-        // Allocate a new tuple (SmallVec will inline if ≤2 elements)
-        let heap_id = heap.allocate(HeapData::Tuple(Tuple::new(items)))?;
-        Ok(Value::Ref(heap_id))
+        Value::Ref(heap.allocate(HeapData::Tuple(Tuple::new(items))))
     }
 }
 
@@ -177,20 +165,24 @@ impl<'h> HeapRead<'h, Tuple> {
         self.get(vm.heap).items[index].clone_with_heap(vm)
     }
 
-    /// Clones all items from this tuple with proper refcount management.
     /// Clones every item into a plain `Vec`, for the namedtuple orderings in
     /// [`cmp_item_seqs`](crate::types::namedtuple::cmp_item_seqs).
-    pub(crate) fn cloned_items(&self, vm: &mut VM<'h>) -> Vec<Value> {
-        self.clone_all_items(vm).into_vec()
+    pub(crate) fn cloned_items(&self, vm: &mut VM<'h>) -> RunResult<Vec<Value>> {
+        Ok(self.clone_all_items(vm)?.into_vec())
     }
 
-    fn clone_all_items(&self, vm: &mut VM<'h>) -> TupleVec {
+    /// Clones all items from this tuple with proper refcount management.
+    ///
+    /// Preflights the slot bytes so an over-budget clone raises a graceful
+    /// `MemoryError` instead of bursting past the allocator's hard limit.
+    fn clone_all_items(&self, vm: &mut VM<'h>) -> RunResult<TupleVec> {
         let len = self.get(vm.heap).items.len();
+        vm.heap.tracker().check_allocation(len.saturating_mul(VALUE_SIZE))?;
         let mut result = TupleVec::with_capacity(len);
         for i in 0..len {
             result.push(self.clone_item(i, vm));
         }
-        result
+        Ok(result)
     }
 
     /// Returns a stack-borrowed lending iterator over the tuple's items,
@@ -311,7 +303,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
     }
 
     fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        TupleIterator::from_tuple(self_id.expect("heap values have an id"), vm)
+        Ok(TupleIterator::from_tuple(self_id.expect("heap values have an id"), vm))
     }
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
@@ -325,7 +317,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
         {
             let items =
                 slice_collect_iterator(vm, slice_obj, self.get(vm.heap).items.iter(), |v| v.clone_with_heap(vm))?;
-            return Ok(allocate_tuple(items, vm.heap)?);
+            return Ok(allocate_tuple(items, vm.heap));
         }
 
         // Extract integer index, accepting Int, Bool (True=1, False=0), and LongInt
@@ -442,9 +434,9 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
         let Some(HeapReadOutput::Tuple(other)) = other.read_heap(vm) else {
             return Ok(None);
         };
-        let mut items = self.clone_all_items(vm);
-        items.extend(other.clone_all_items(vm));
-        Ok(Some(allocate_tuple(items, vm.heap)?))
+        let mut items = self.clone_all_items(vm)?;
+        items.extend(other.clone_all_items(vm)?);
+        Ok(Some(allocate_tuple(items, vm.heap)))
     }
 
     fn py_mul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
@@ -465,7 +457,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
             result.extend(value.as_slice().iter().map(|value| value.clone_with_heap(vm.heap)));
             vm.heap.check_time()?;
         }
-        Ok(Some(allocate_tuple(result, vm.heap)?))
+        Ok(Some(allocate_tuple(result, vm.heap)))
     }
 
     fn py_rmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
@@ -518,10 +510,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
 }
 
 impl HeapItem for Tuple {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.items.len() * mem::size_of::<Value>()
-    }
-
     /// Pushes all heap IDs contained in this tuple onto the stack.
     ///
     /// Called during garbage collection to decrement refcounts of nested values.
@@ -617,12 +605,12 @@ enum TupleIteratorSource {
 
 impl TupleIterator {
     /// Allocates an iterator retaining a tuple.
-    pub(crate) fn from_tuple(id: HeapId, vm: &mut VM<'_>) -> RunResult<Value> {
+    pub(crate) fn from_tuple(id: HeapId, vm: &mut VM<'_>) -> Value {
         Self::allocate(TupleIteratorSource::Tuple(id), vm)
     }
 
     /// Allocates an iterator retaining a named tuple.
-    pub(crate) fn from_named_tuple(id: HeapId, vm: &mut VM<'_>) -> RunResult<Value> {
+    pub(crate) fn from_named_tuple(id: HeapId, vm: &mut VM<'_>) -> Value {
         Self::allocate(TupleIteratorSource::NamedTuple(id), vm)
     }
 
@@ -649,21 +637,17 @@ impl TupleIterator {
     }
 
     /// Allocates an iterator and retains its source.
-    fn allocate(source: TupleIteratorSource, vm: &mut VM<'_>) -> RunResult<Value> {
+    fn allocate(source: TupleIteratorSource, vm: &mut VM<'_>) -> Value {
         let source_id = match source {
             TupleIteratorSource::Tuple(id) | TupleIteratorSource::NamedTuple(id) => id,
         };
-        let id = vm.heap.allocate(HeapData::TupleIterator(Self { source, index: 0 }))?;
+        let id = vm.heap.allocate(HeapData::TupleIterator(Self { source, index: 0 }));
         vm.heap.inc_ref(source_id);
-        Ok(Value::Ref(id))
+        Value::Ref(id)
     }
 }
 
 impl HeapItem for TupleIterator {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         stack.push(self.source_id());
     }

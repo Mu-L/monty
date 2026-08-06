@@ -26,7 +26,7 @@ use crate::{
         defaultdict::defaultdict_missing,
     },
     types::Type,
-    value::{EitherStr, VALUE_SIZE, Value},
+    value::{EitherStr, Value},
 };
 
 /// Python dict type preserving insertion order.
@@ -136,18 +136,6 @@ impl DictKind {
     pub fn counter() -> Self {
         Self(Some(Box::new(DictSpecial::Counter)))
     }
-
-    /// Bytes the boxed [`DictSpecial`] adds on top of `size_of::<Dict>()`.
-    ///
-    /// Code that turns an *already allocated* dict special must charge this
-    /// with [`Heap::track_growth`], because [`Dict::py_estimate_size`] adds it
-    /// unconditionally and the refund at free time reads the current size.
-    pub const SPECIAL_SIZE: usize = mem::size_of::<DictSpecial>();
-
-    /// Heap bytes owned by this kind beyond the `DictKind` word itself.
-    fn estimate_size(&self) -> usize {
-        if self.0.is_some() { Self::SPECIAL_SIZE } else { 0 }
-    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -177,9 +165,6 @@ impl Dict {
     /// Marks this dict as a `defaultdict` with the given factory (a callable or
     /// `None`), taking ownership of the factory reference. Called once at
     /// construction; the factory joins the dict's `contains_refs` accounting.
-    ///
-    /// If the dict is already on the heap, the caller must first charge
-    /// [`DictKind::SPECIAL_SIZE`] with [`Heap::track_growth`].
     pub fn make_defaultdict(&mut self, factory: Option<Value>) {
         if matches!(factory, Some(Value::Ref(_))) {
             self.contains_refs = true;
@@ -194,9 +179,6 @@ impl Dict {
     }
 
     /// Marks this dict as a `collections.Counter`.
-    ///
-    /// Same tracker contract as [`Dict::make_defaultdict`]: charge
-    /// [`DictKind::SPECIAL_SIZE`] first if the dict is already allocated.
     pub fn make_counter(&mut self) {
         self.kind = DictKind::counter();
     }
@@ -344,10 +326,6 @@ impl Dict {
             old_entry.key.drop_with(vm);
             Ok(Some(old_entry.value))
         } else {
-            if let Err(error) = vm.heap.track_growth(2 * VALUE_SIZE) {
-                entry.drop_with(vm);
-                return Err(error.into());
-            }
             let index = self.entries.len();
             self.entries.push(entry);
             self.indices.insert_unique(hash, index, |&i| self.entries[i].hash);
@@ -565,14 +543,6 @@ impl<'h> HeapRead<'h, Dict> {
             // Transfer ownership of the old value to caller (no clone needed)
             Ok(Some(old_entry.value))
         } else {
-            // Key doesn't exist — track memory growth before adding the new entry.
-            // Growth unit is 2 * size_of::<Value>() to match Dict::py_estimate_size.
-            if let Err(error) = vm.heap.track_growth(2 * VALUE_SIZE) {
-                // The entry never reaches the dict, so release what the caller
-                // transferred rather than leaking it — same contract as above.
-                entry.drop_with(vm);
-                return Err(error.into());
-            }
             let this = self.get_mut(vm.heap);
             let index = this.entries.len();
             this.entries.push(entry);
@@ -684,7 +654,7 @@ impl Dict {
         }
 
         let dict = dict_guard.into_inner();
-        let heap_id = vm.heap.allocate(HeapData::Dict(dict))?;
+        let heap_id = vm.heap.allocate(HeapData::Dict(dict));
         Ok(Value::Ref(heap_id))
     }
 }
@@ -1168,7 +1138,11 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dict> {
     }
 
     fn py_iter(&self, self_id: Option<HeapId>, vm: &mut VM<'h>) -> RunResult<Value> {
-        DictKeyIterator::allocate(self_id.expect("heap values have an id"), self.get(vm.heap).len(), vm)
+        Ok(DictKeyIterator::allocate(
+            self_id.expect("heap values have an id"),
+            self.get(vm.heap).len(),
+            vm,
+        ))
     }
 
     fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
@@ -1368,21 +1342,19 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dict> {
             }
             StaticStrings::Keys => {
                 args.check_zero_args("dict.keys", vm.heap)?;
-                let view_id = vm.heap.allocate(HeapData::DictKeysView(DictKeysView::new(self_id)))?;
+                let view_id = vm.heap.allocate(HeapData::DictKeysView(DictKeysView::new(self_id)));
                 vm.heap.inc_ref(self_id);
                 Ok(Value::Ref(view_id))
             }
             StaticStrings::Values => {
                 args.check_zero_args("dict.values", vm.heap)?;
-                let view_id = vm
-                    .heap
-                    .allocate(HeapData::DictValuesView(DictValuesView::new(self_id)))?;
+                let view_id = vm.heap.allocate(HeapData::DictValuesView(DictValuesView::new(self_id)));
                 vm.heap.inc_ref(self_id);
                 Ok(Value::Ref(view_id))
             }
             StaticStrings::Items => {
                 args.check_zero_args("dict.items", vm.heap)?;
-                let view_id = vm.heap.allocate(HeapData::DictItemsView(DictItemsView::new(self_id)))?;
+                let view_id = vm.heap.allocate(HeapData::DictItemsView(DictItemsView::new(self_id)));
                 vm.heap.inc_ref(self_id);
                 Ok(Value::Ref(view_id))
             }
@@ -1511,12 +1483,6 @@ impl<'h> HeapRead<'h, Dict> {
 }
 
 impl HeapItem for Dict {
-    fn py_estimate_size(&self) -> usize {
-        // Dict size: struct overhead + the boxed kind state (defaultdict/Counter)
-        // + entries (2 Values per entry for key+value)
-        mem::size_of::<Self>() + self.kind.estimate_size() + self.len() * 2 * VALUE_SIZE
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // Release the default_factory (a defaultdict with a heap-ref factory, e.g.
         // a lambda). MUST be reported here and in `for_each_child_id` identically.
@@ -1599,7 +1565,7 @@ fn dict_copy<'h>(dict: &mut HeapRead<'h, Dict>, vm: &mut VM<'h>) -> RunResult<Va
     let mut kind_guard = DropGuard::new(kind, vm);
     let mut new_dict = Dict::from_pairs(pairs, kind_guard.ctx())?;
     new_dict.set_kind(kind_guard.into_inner());
-    let heap_id = vm.heap.allocate(HeapData::Dict(new_dict))?;
+    let heap_id = vm.heap.allocate(HeapData::Dict(new_dict));
     Ok(Value::Ref(heap_id))
 }
 
@@ -1778,7 +1744,7 @@ fn dict_popitem<'h>(dict: &mut HeapRead<'h, Dict>, vm: &mut VM<'h>) -> RunResult
     }
 
     // Create tuple (key, value)
-    Ok(allocate_tuple(smallvec![entry.key, entry.value], vm.heap)?)
+    Ok(allocate_tuple(smallvec![entry.key, entry.value], vm.heap))
 }
 
 // Custom serde implementation for Dict.
@@ -1851,7 +1817,7 @@ pub fn dict_fromkeys(args: ArgValues, kind: DictKind, vm: &mut VM<'_>) -> RunRes
 
     let mut dict = dict_guard.into_inner();
     dict.set_kind(kind);
-    let heap_id = vm.heap.allocate(HeapData::Dict(dict))?;
+    let heap_id = vm.heap.allocate(HeapData::Dict(dict));
     Ok(Value::Ref(heap_id))
 }
 
@@ -1899,14 +1865,14 @@ macro_rules! impl_dict_iterator {
     ($ty:ty, $python_type:expr, $heap_variant:path, $next:expr) => {
         impl $ty {
             /// Allocates an iterator retaining `dict`.
-            pub(crate) fn allocate(dict: HeapId, expected_len: usize, vm: &mut VM<'_>) -> RunResult<Value> {
+            pub(crate) fn allocate(dict: HeapId, expected_len: usize, vm: &mut VM<'_>) -> Value {
                 let id = vm.heap.allocate($heap_variant(Self(DictIteratorState {
                     dict,
                     index: 0,
                     expected_len,
-                })))?;
+                })));
                 vm.heap.inc_ref(dict);
-                Ok(Value::Ref(id))
+                Value::Ref(id)
             }
 
             /// Returns the retained dictionary id for GC tracing.
@@ -1921,10 +1887,6 @@ macro_rules! impl_dict_iterator {
         }
 
         impl HeapItem for $ty {
-            fn py_estimate_size(&self) -> usize {
-                mem::size_of::<Self>()
-            }
-
             fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
                 stack.push(self.source_id());
             }
@@ -2008,7 +1970,7 @@ impl_dict_iterator!(
         Ok(Some(allocate_tuple(
             smallvec![key.clone_with_heap(vm.heap), value.clone_with_heap(vm.heap)],
             vm.heap,
-        )?))
+        )))
     }
 );
 

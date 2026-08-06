@@ -16,15 +16,14 @@ repository = { workspace = true }
 name = "monty_alloc"
 
 [dependencies]
-# Only for `OOM_EXIT_CODE`, and only when the host can read an exit status.
-monty-proto = { workspace = true, optional = true }
+monty-types = { workspace = true }
 
 [features]
-# Report a breach by exiting with `monty_proto::OOM_EXIT_CODE` rather than
+# Report a breach by exiting with `monty_types::OOM_EXIT_CODE` rather than
 # aborting. For a worker whose host reads a process exit status and classifies
 # it (the subprocess pool); without it a breach aborts, which is all a wasm
 # module can do — see the crate docs.
-exit-code = ["dep:monty-proto"]
+exit-code = []
 
 [lints]
 workspace = true
