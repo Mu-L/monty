@@ -1,18 +1,24 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    env, fmt, fs,
+    env, fmt, fs, io,
     process::ExitCode,
     time::{Duration, Instant},
 };
 
+// Shadows `std::eprintln!` on purpose: every diagnostic below goes to stderr
+// through `anstream`, which strips styling when stderr is not a terminal (or
+// `NO_COLOR` is set) and enables virtual-terminal mode on Windows. Sandbox
+// output keeps using `std::println!` — it is program data, not our styling.
+use anstream::{AutoStream, ColorChoice, eprintln};
+use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use monty::{MontyRepl, MontyRun, ReplContinuationMode, ReplProgress, RunProgress, detect_repl_continuation_mode};
 use monty_fs::{MountCallOutcome, MountMode, MountTable, OverlayState};
-use monty_type_checking::{SourceFile, type_check};
+use monty_type_checking::{SourceFile, TypeChecker};
 use monty_types::{
     CompileOptions, ExtFunctionResult, MontyObject, NameLookupResult, OsFunctionCall, PrintWriter, ResourceLimits,
-    ResourceTracker,
+    ResourceTracker, TypeCheckingConfig, TypeCheckingFormat,
 };
 use rustyline::{DefaultEditor, error::ReadlineError};
 use tracing::field::Empty;
@@ -26,17 +32,31 @@ mod subprocess;
 #[global_allocator]
 static ALLOC: monty_alloc::LimitedAllocator = monty_alloc::LimitedAllocator;
 
-/// ANSI escape code for dim/gray text.
-const DIM: &str = "\x1b[2m";
-/// ANSI escape code for bold red text (errors).
-const BOLD_RED: &str = "\x1b[1m\x1b[31m";
-/// ANSI escape code for bold green text (success, headings).
-const BOLD_GREEN: &str = "\x1b[1m\x1b[32m";
-/// ANSI escape code for bold cyan text (commands, prompts).
-const BOLD_CYAN: &str = "\x1b[1m\x1b[36m";
-/// ANSI escape code to reset all text styling.
-const RESET: &str = "\x1b[0m";
+/// Dim/gray text (timings). `{DIM}` opens the style, `{DIM:#}` closes it.
+const DIM: Style = Style::new().dimmed();
+/// Bold red text (errors).
+const BOLD_RED: Style = Style::new().bold().fg_color(Some(Color::Ansi(AnsiColor::Red)));
+/// Bold green text (success, headings).
+const BOLD_GREEN: Style = Style::new().bold().fg_color(Some(Color::Ansi(AnsiColor::Green)));
+/// Bold cyan text (commands, prompts).
+const BOLD_CYAN: Style = Style::new().bold().fg_color(Some(Color::Ansi(AnsiColor::Cyan)));
 const ARROW: &str = "❯";
+
+/// Whether stderr should carry ANSI styling.
+///
+/// Resolved by `anstream` from the signals its macros use — is stderr a
+/// terminal, `NO_COLOR`, `CLICOLOR{,_FORCE}`, `TERM` — so that what we render
+/// ourselves (the type checker's diagnostics) agrees with the styling
+/// `eprintln!` puts around it.
+fn stderr_styled() -> bool {
+    AutoStream::choice(&io::stderr()) != ColorChoice::Never
+}
+
+/// The same question for stdout, which is where rustyline writes the REPL
+/// prompt. Asking about stderr instead would put escapes in `monty -i > out`.
+fn stdout_styled() -> bool {
+    AutoStream::choice(&io::stdout()) != ColorChoice::Never
+}
 
 /// Monty — a sandboxed Python interpreter written in Rust.
 ///
@@ -52,6 +72,11 @@ struct Cli {
     /// Run the type checker before executing.
     #[arg(short = 't', long = "type-check")]
     type_check: bool,
+
+    /// Rendering of the type checker's diagnostics: full (default), concise,
+    /// azure, json, jsonlines, rdjson, pylint, gitlab or github.
+    #[arg(long = "type-check-format", value_parser = TypeCheckingFormat::from_name, requires = "type_check")]
+    type_check_format: Option<TypeCheckingFormat>,
 
     /// Execute a Python program passed as a string (like `python -c`).
     #[arg(short = 'c')]
@@ -166,7 +191,7 @@ fn main() -> ExitCode {
 
     if let Some(Command::Subprocess) = cli.subcommand {
         if let Some(flag) = cli.subprocess_conflict() {
-            eprintln!("{BOLD_RED}error{RESET}: `subprocess` cannot be combined with {flag}");
+            eprintln!("{BOLD_RED}error{BOLD_RED:#}: `subprocess` cannot be combined with {flag}");
             return ExitCode::FAILURE;
         }
         return subprocess::run();
@@ -175,7 +200,7 @@ fn main() -> ExitCode {
     let logfire = match configure_logfire() {
         Ok(logfire) => logfire,
         Err(err) => {
-            eprintln!("{BOLD_RED}error{RESET}: failed to configure telemetry: {err}");
+            eprintln!("{BOLD_RED}error{BOLD_RED:#}: failed to configure telemetry: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -189,36 +214,40 @@ fn main() -> ExitCode {
 
 /// Dispatches a parsed standalone CLI invocation.
 fn run_cli(cli: Cli) -> ExitCode {
-    let type_check_enabled = cli.type_check;
+    // `Some` enables the check and carries how its diagnostics are rendered.
+    let type_check = cli.type_check.then(|| TypeCheckingConfig {
+        format: cli.type_check_format.unwrap_or_default(),
+        color: stderr_styled(),
+    });
 
     let limits = match cli.resource_limits() {
         Ok(limits) => limits,
         Err(err) => {
-            eprintln!("{BOLD_RED}error{RESET}: {err}");
+            eprintln!("{BOLD_RED}error{BOLD_RED:#}: {err}");
             return ExitCode::FAILURE;
         }
     };
-    monty_alloc::set_limit(limits.max_memory, type_check_enabled)
+    monty_alloc::set_limit(limits.max_memory, type_check.is_some())
         .expect("monty-runtime must install LimitedAllocator globally");
 
     // Build mount table early to fail fast on bad -m args.
     let mount_table = match build_mount_table(&cli.mounts) {
         Ok(mt) => mt,
         Err(err) => {
-            eprintln!("{BOLD_RED}error{RESET}: {err}");
+            eprintln!("{BOLD_RED}error{BOLD_RED:#}: {err}");
             return ExitCode::FAILURE;
         }
     };
 
     if let Some(cmd) = cli.command {
         if cli.file.is_some() {
-            eprintln!("{BOLD_RED}error{RESET}: cannot specify both -c and a file");
+            eprintln!("{BOLD_RED}error{BOLD_RED:#}: cannot specify both -c and a file");
             return ExitCode::FAILURE;
         }
         return if cli.interactive {
             dispatch_repl("<string>", &cmd, limits, mount_table)
         } else {
-            dispatch_script("<string>", cmd, type_check_enabled, limits, mount_table)
+            dispatch_script("<string>", cmd, type_check, limits, mount_table)
         };
     }
 
@@ -226,14 +255,14 @@ fn run_cli(cli: Cli) -> ExitCode {
         let code = match read_file(file_path) {
             Ok(code) => code,
             Err(err) => {
-                eprintln!("{BOLD_RED}error{RESET}: {err}");
+                eprintln!("{BOLD_RED}error{BOLD_RED:#}: {err}");
                 return ExitCode::FAILURE;
             }
         };
         return if cli.interactive {
             dispatch_repl(file_path, &code, limits, mount_table)
         } else {
-            dispatch_script(file_path, code, type_check_enabled, limits, mount_table)
+            dispatch_script(file_path, code, type_check, limits, mount_table)
         };
     }
 
@@ -261,17 +290,11 @@ fn configure_logfire() -> Result<Option<logfire::ShutdownGuard>, logfire::Config
 fn dispatch_script(
     file_path: &str,
     code: String,
-    type_check_enabled: bool,
+    type_check: Option<TypeCheckingConfig>,
     limits: ResourceLimits,
     mount_table: Option<MountTable>,
 ) -> ExitCode {
-    run_script(
-        file_path,
-        code,
-        type_check_enabled,
-        ResourceTracker::new(limits),
-        mount_table,
-    )
+    run_script(file_path, code, type_check, ResourceTracker::new(limits), mount_table)
 }
 
 /// REPL analog of [`dispatch_script`].
@@ -291,22 +314,23 @@ fn dispatch_repl(file_path: &str, code: &str, limits: ResourceLimits, mount_tabl
 fn run_script(
     file_path: &str,
     code: String,
-    type_check_enabled: bool,
+    type_check: Option<TypeCheckingConfig>,
     tracker: ResourceTracker,
     mut mount_table: Option<MountTable>,
 ) -> ExitCode {
-    if type_check_enabled {
+    if let Some(config) = type_check {
         let start = Instant::now();
-        if let Some(failure) = type_check(&SourceFile::new(&code, file_path), None).unwrap() {
+        let mut checker = TypeChecker::default();
+        if let Some(failure) = checker.run(&SourceFile::new(&code, file_path), None, config).unwrap() {
             let elapsed = start.elapsed();
             eprintln!(
-                "{DIM}{}{RESET} {BOLD_CYAN}{ARROW}{RESET} {BOLD_RED}type check failed{RESET}:\n{failure}",
+                "{DIM}{}{DIM:#} {BOLD_CYAN}{ARROW}{BOLD_CYAN:#} {BOLD_RED}type check failed{BOLD_RED:#}:\n{failure}",
                 FormattedDuration(elapsed)
             );
         } else {
             let elapsed = start.elapsed();
             eprintln!(
-                "{DIM}{}{RESET} {BOLD_CYAN}{ARROW}{RESET} {BOLD_GREEN}type check passed{RESET}",
+                "{DIM}{}{DIM:#} {BOLD_CYAN}{ARROW}{BOLD_CYAN:#} {BOLD_GREEN}type check passed{BOLD_GREEN:#}",
                 FormattedDuration(elapsed)
             );
         }
@@ -318,7 +342,7 @@ fn run_script(
     let runner = match MontyRun::new(code, file_path, input_names, CompileOptions::default()) {
         Ok(ex) => ex,
         Err(err) => {
-            eprintln!("{BOLD_RED}error{RESET}:\n{err}");
+            eprintln!("{BOLD_RED}error{BOLD_RED:#}:\n{err}");
             return ExitCode::FAILURE;
         }
     };
@@ -332,7 +356,7 @@ fn run_script(
             Err(err) => {
                 let elapsed = start.elapsed();
                 eprintln!(
-                    "{DIM}{}{RESET} {BOLD_CYAN}{ARROW}{RESET} {BOLD_RED}error{RESET}: {err}",
+                    "{DIM}{}{DIM:#} {BOLD_CYAN}{ARROW}{BOLD_CYAN:#} {BOLD_RED}error{BOLD_RED:#}: {err}",
                     FormattedDuration(elapsed)
                 );
                 return ExitCode::FAILURE;
@@ -343,7 +367,7 @@ fn run_script(
             Ok(value) => {
                 let elapsed = start.elapsed();
                 eprintln!(
-                    "{DIM}{}{RESET} {BOLD_CYAN}{ARROW}{RESET} {value}",
+                    "{DIM}{}{DIM:#} {BOLD_CYAN}{ARROW}{BOLD_CYAN:#} {value}",
                     FormattedDuration(elapsed)
                 );
                 ExitCode::SUCCESS
@@ -351,7 +375,7 @@ fn run_script(
             Err(err) => {
                 let elapsed = start.elapsed();
                 eprintln!(
-                    "{DIM}{}{RESET} {BOLD_CYAN}{ARROW}{RESET} {BOLD_RED}error{RESET}: {err}",
+                    "{DIM}{}{DIM:#} {BOLD_CYAN}{ARROW}{BOLD_CYAN:#} {BOLD_RED}error{BOLD_RED:#}: {err}",
                     FormattedDuration(elapsed)
                 );
                 ExitCode::FAILURE
@@ -364,7 +388,7 @@ fn run_script(
             Err(err) => {
                 let elapsed = start.elapsed();
                 eprintln!(
-                    "{DIM}{}{RESET} {BOLD_CYAN}{ARROW}{RESET} {BOLD_RED}error{RESET}: {err}",
+                    "{DIM}{}{DIM:#} {BOLD_CYAN}{ARROW}{BOLD_CYAN:#} {BOLD_RED}error{BOLD_RED:#}: {err}",
                     FormattedDuration(elapsed)
                 );
                 return ExitCode::FAILURE;
@@ -372,7 +396,7 @@ fn run_script(
         };
         let elapsed = start.elapsed();
         eprintln!(
-            "{DIM}{}{RESET} {BOLD_CYAN}{ARROW}{RESET} {value}",
+            "{DIM}{}{DIM:#} {BOLD_CYAN}{ARROW}{BOLD_CYAN:#} {value}",
             FormattedDuration(elapsed)
         );
         ExitCode::SUCCESS
@@ -401,7 +425,7 @@ fn run_repl(file_path: &str, code: &str, tracker: ResourceTracker, mut mount_tab
     let mut rl = match DefaultEditor::new() {
         Ok(rl) => rl,
         Err(err) => {
-            eprintln!("{BOLD_RED}error{RESET} initializing editor: {err}");
+            eprintln!("{BOLD_RED}error{BOLD_RED:#} initializing editor: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -409,14 +433,22 @@ fn run_repl(file_path: &str, code: &str, tracker: ResourceTracker, mut mount_tab
     let mut pending_snippet = String::new();
     let mut continuation_mode = ReplContinuationMode::Complete;
 
+    // rustyline writes the prompt to stdout itself, so `anstream` never sees
+    // it — style it up front, against stdout, or not at all.
+    let statement_prompt = if stdout_styled() {
+        format!("{BOLD_CYAN}{ARROW}{BOLD_CYAN:#} ")
+    } else {
+        format!("{ARROW} ")
+    };
+
     loop {
         let prompt = if continuation_mode == ReplContinuationMode::Complete {
-            format!("{BOLD_CYAN}{ARROW}{RESET} ")
+            statement_prompt.as_str()
         } else {
-            "… ".to_owned()
+            "… "
         };
 
-        let line = match rl.readline(&prompt) {
+        let line = match rl.readline(prompt) {
             Ok(line) => line,
             Err(ReadlineError::Eof) => return ExitCode::SUCCESS,
             Err(ReadlineError::Interrupted) => {
@@ -426,7 +458,7 @@ fn run_repl(file_path: &str, code: &str, tracker: ResourceTracker, mut mount_tab
                 continue;
             }
             Err(err) => {
-                eprintln!("{BOLD_RED}error{RESET} reading input: {err}");
+                eprintln!("{BOLD_RED}error{BOLD_RED:#} reading input: {err}");
                 return ExitCode::FAILURE;
             }
         };
@@ -490,7 +522,7 @@ fn execute_repl_snippet(repl: &mut Option<MontyRepl>, snippet: &str, mount_table
                 *repl = Some(returned_repl);
             }
             Err((returned_repl, err)) => {
-                eprintln!("{BOLD_RED}error{RESET}: {err}");
+                eprintln!("{BOLD_RED}error{BOLD_RED:#}: {err}");
                 *repl = Some(returned_repl);
             }
         }
@@ -504,7 +536,7 @@ fn execute_repl_snippet(repl: &mut Option<MontyRepl>, snippet: &str, mount_table
                 }
             }
             Err(err) => {
-                eprintln!("{BOLD_RED}error{RESET}: {err}");
+                eprintln!("{BOLD_RED}error{BOLD_RED:#}: {err}");
             }
         }
         *repl = Some(r);

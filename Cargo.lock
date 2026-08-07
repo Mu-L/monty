@@ -2406,7 +2406,6 @@ name = "monty-js"
 version = "0.0.19"
 dependencies = [
  "monty-pool",
- "monty-type-checking",
  "monty-types",
  "napi",
  "napi-build",
@@ -2472,6 +2471,8 @@ dependencies = [
 name = "monty-runtime"
 version = "0.0.19"
 dependencies = [
+ "anstream 0.6.21",
+ "anstyle",
  "clap",
  "logfire",
  "monty",
@@ -2492,6 +2493,7 @@ dependencies = [
  "codspeed-criterion-compat",
  "criterion",
  "insta",
+ "monty-types",
  "monty-typeshed",
  "pprof",
  "pretty_assertions",
