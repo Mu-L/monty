@@ -139,6 +139,16 @@ The error quotes the path with its middle elided — the first and last 20
 characters around a `…` — where CPython quotes it whole. An over-long path
 is by definition too big to repeat back.
 
+### `absolute()` raises on a null byte
+
+Null bytes otherwise behave as CPython's do, message for message. Only
+`absolute()` differs: CPython returns the path without inspecting it, while
+Monty refuses it at the boundary rather than carve out the one operation that
+never reaches a syscall. It raises `ValueError: embedded null byte` — the
+generic wording, since no syscall is involved to name. A path that is both
+over-long and null-containing reports the length error, where CPython reports
+the null byte.
+
 ### A search-only host directory may not be mountable
 
 Mounting opens a descriptor on the host directory. On macOS and the BSDs that
@@ -147,13 +157,14 @@ needs read permission, so a search-only directory (mode `0o111`) is refused —
 and read known paths inside. Linux opens directories with `O_PATH` and accepts
 it. Grant `r-x` on anything you intend to mount portably.
 
-### Symlink targets must be relative
+### Symlink targets must be relative (direct mounts)
 
-**A symlink inside a mount is followed only if its target is relative; an
-absolute target raises `PermissionError` even when it points back into the
-same mount.** CPython follows both. A descriptor has no path of its own, so a
-leading `/` cannot be interpreted and "absolute but inside" is
-indistinguishable from "absolute and outside".
+**A symlink inside a `ReadWrite` or `ReadOnly` mount is followed only if its
+target is relative; an absolute target raises `PermissionError` even when it
+points back into the same mount.** CPython follows both. A descriptor has no
+path of its own, so a leading `/` cannot be interpreted and "absolute but
+inside" is indistinguishable from "absolute and outside". `OverlayMemory`
+follows no link at all — see below.
 
 This is the one thing to check before mounting an existing directory.
 Sandboxed code cannot create symlinks, so only links **already present** are
@@ -183,39 +194,44 @@ whatever name it now has, and a *new* directory created at the original path
 is not picked up. CPython, resolving each path afresh, would see the
 replacement. Recreate the mount to follow a path.
 
-### `OverlayMemory` writes refuse symlinks
+### `OverlayMemory` refuses symlinks entirely
 
-CPython (and a direct mount) writes *through* a symlink to its target. An
-overlay write never touches the host, so it cannot do that — recording the
-entry under the link's spelling instead would silently alias the two paths.
-Any write (`write_text`, `open('w'/'a')`, `mkdir`, `unlink`, `rmdir`, rename
-destinations, …) whose path contains a symlink **anywhere** — as the final
-component or an intermediate directory, whether it resolves in-mount, dangles,
-is absolute, or escapes — raises `PermissionError`. A rename *source* is the
-exception: a symlink named as one is moved intact, recorded as itself rather
-than as its target. The
-refusal is uniform on purpose: the link's target is never even resolved, so
-the error reveals nothing about it. Deletes are included because tombstoning
-a link's spelling would report it gone while its target stayed readable under
-the real name — the same aliasing, reached by deleting rather than writing.
+**Any operation whose path contains a symlink — as the final component or an
+intermediate directory, whether it resolves in-mount, dangles, is absolute or
+escapes — raises `PermissionError`.** Reads, writes, deletes, `stat`,
+`iterdir` and both ends of a `rename` alike. CPython follows the link.
+
+An overlay entry is keyed by name, but a symlink resolves on the *host*, so it
+names a file the overlay only knows by its target's name. Following one would
+serve content the overlay has already replaced or deleted — write to
+`hello.txt`, then read `link.txt`, and CPython gives the new text while a
+following overlay would give the old. No in-memory representation fixes that,
+so the mode refuses links rather than answering wrongly. The target is never
+resolved, so the error reveals nothing about it.
 
 Renaming a **directory that contains a symlink** is refused for the same
-reason: the link cannot move with it (there is nothing to record) and cannot
-be left behind (it would stay readable inside a directory the overlay then
-reports as deleted). CPython moves the directory and the link together.
+reason: the link cannot move with it and cannot be left behind.
 
-Reads still follow relative in-mount links as before, and direct mounts
-still allow writes through them; only escaping/absolute links are refused
-there. `mkdir(parents=True)` through an escaping symlink raises
-`PermissionError` in every mode.
+`is_symlink()` still answers `True` — it reports only that the name is a link,
+as CPython does; the other predicates answer `False`. Direct mounts are
+unaffected and still follow relative in-mount links for reads and writes.
+`mkdir(parents=True)` through an escaping symlink raises `PermissionError` in
+every mode.
+
+The refusal is a coherence policy, not the sandbox boundary, and it is not
+atomic with the operation it guards: a host process that swaps a symlink into
+the path between the check and the read gets it followed. The descriptor still
+bounds the result to inside the mount, so this is the same window a host
+already has by replacing a file outright (above) — not a way out.
 
 ### `OverlayMemory` renames of real files
 
 A rename records a mount-relative reference to the existing file rather than
 copying its bytes, so it cannot come to name anything outside the mount. If
 the host replaces the underlying file before the read, the read sees whatever
-now occupies that path inside the mount; CPython, holding no such reference,
-would not find the renamed-away original.
+now occupies that path inside the mount — unless that is a symlink, refused
+like any other; CPython, holding no such reference, would not find the
+renamed-away original.
 
 Renaming a directory that really contains an entry with a non-UTF-8 name
 raises `OSError` (`directory contains an entry with a non-UTF-8 name`):

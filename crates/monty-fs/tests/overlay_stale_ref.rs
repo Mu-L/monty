@@ -1,16 +1,16 @@
 //! An `OverlayMemory` rename records a `RealFileRef` instead of copying the
 //! bytes, and reads followed that cached host path unchecked. Every path that
-//! dereferences one is exercised here: `read_text`, `read_bytes`, and the
+//! consumes one is exercised here: `read_text`, `read_bytes`, `stat`, and the
 //! `existing_file_len` / `existing_file_bytes` pair an append goes through.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
 use std::process::Command;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
-#[cfg(unix)]
-use std::{io::ErrorKind, os::unix::fs::PermissionsExt};
 
 use monty_fs::{MountCallOutcome, MountError, MountMode, MountTable, OverlayState};
 use monty_types::{MontyObject, OsFunctionCall, PathStringDataArgs, RenameCallArgs};
@@ -129,6 +129,16 @@ fn stale_ref_is_revalidated_on_read_bytes() {
     StaleRef::new().assert_rejected(OsFunctionCall::ReadBytes("/mnt/moved.txt".into()));
 }
 
+/// `stat` must not expose metadata through a backing path that is now a
+/// symlink, even though it does not need to reopen the file for fresh metadata.
+#[test]
+fn stale_ref_is_revalidated_on_stat() {
+    if !symlinks_supported() {
+        return;
+    }
+    StaleRef::new().assert_rejected(OsFunctionCall::Stat("/mnt/moved.txt".into()));
+}
+
 /// Appending materializes the backing file into the overlay via
 /// `existing_file_len` then `existing_file_bytes`, so both must re-validate —
 /// otherwise the secret lands in overlay state and reads back from memory.
@@ -187,14 +197,15 @@ fn mount_root_swap_does_not_redirect_a_cached_ref() {
     assert_eq!(outcome.unwrap(), MontyObject::String("public".to_owned()));
 }
 
-/// Renaming an in-mount symlink whose target is unreadable must report the I/O
-/// error, not a path escape.
+/// Renaming a symlink is refused without ever consulting its target.
 ///
-/// `PathEscape` means the boundary caught something; a permission failure on a
-/// target that is plainly inside the mount is not that.
+/// The target here is unreadable, so a refusal that had resolved it would
+/// surface as a permission error instead. `PathEscape` is the proof the
+/// overlay stopped at the link itself — which is what lets the docs say the
+/// refusal reveals nothing about where a link points.
 #[test]
 #[cfg(unix)]
-fn renaming_symlink_to_denied_target_reports_the_io_error() {
+fn renaming_a_symlink_never_resolves_its_target() {
     if !symlinks_supported() {
         return;
     }
@@ -214,8 +225,8 @@ fn renaming_symlink_to_denied_target_reports_the_io_error() {
 
     fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
-        matches!(&outcome, Err(MountError::Io(err, _)) if err.kind() == ErrorKind::PermissionDenied),
-        "expected a permission error, got {outcome:?}"
+        matches!(&outcome, Err(MountError::PathEscape { .. })),
+        "expected the link itself to be refused, got {outcome:?}"
     );
 }
 
@@ -278,5 +289,33 @@ fn renaming_escaping_symlink_into_overlay_is_rejected() {
     assert!(
         matches!(rename_outcome, Err(MountError::PathEscape { .. })),
         "expected the rename to be refused with PathEscape, got {rename_outcome:?}"
+    );
+}
+
+/// A cached ref whose backing path becomes an *in-mount* symlink must not be
+/// followed either. The escaping case is refused by the descriptor; this one
+/// resolves happily inside the mount, so only the overlay's own rule stops it.
+#[test]
+fn stale_ref_repointed_at_an_in_mount_symlink_is_refused() {
+    if !symlinks_supported() {
+        return;
+    }
+    let mount_dir = TempDir::new().unwrap();
+    fs::create_dir_all(mount_dir.path().join("inner")).unwrap();
+    let real_file = mount_dir.path().join("inner/file.txt");
+    fs::write(&real_file, "public").unwrap();
+    fs::write(mount_dir.path().join("other.txt"), "OTHER").unwrap();
+
+    let mut mt = mount_overlay(mount_dir.path());
+    dispatch(&mut mt, rename_call("/mnt/inner/file.txt", "/mnt/moved.txt")).expect("rename should succeed");
+
+    // A host-side actor re-points the backing path at another in-mount file.
+    fs::remove_file(&real_file).unwrap();
+    symlink_file("../other.txt", &real_file);
+
+    let outcome = dispatch(&mut mt, OsFunctionCall::ReadText("/mnt/moved.txt".into()));
+    assert!(
+        matches!(&outcome, Err(MountError::PathEscape { .. })),
+        "a ref must not follow a symlink swapped in behind it, got {outcome:?}"
     );
 }

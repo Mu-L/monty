@@ -184,6 +184,35 @@ impl OsFunctionCall {
         )
     }
 
+    /// CPython's `ValueError` message for a path containing a null byte.
+    ///
+    /// The wording is not uniform in CPython: it comes from whichever layer
+    /// first inspects the path, so the content operations go through `open()`
+    /// and say `embedded null byte`, while the metadata ones are named by the
+    /// syscall their `os` wrapper was about to make. `for_destination` picks
+    /// the rename argument that carried the byte.
+    #[must_use]
+    pub fn embedded_null_message(&self, for_destination: bool) -> &'static str {
+        match self {
+            Self::Mkdir(_) => "mkdir: embedded null character in path",
+            Self::Unlink(_) => "unlink: embedded null character in path",
+            Self::Rmdir(_) => "rmdir: embedded null character in path",
+            Self::Stat(_) => "stat: embedded null character in path",
+            // `pathlib.Path.iterdir` reaches `os.scandir`, not `os.listdir`.
+            Self::Iterdir(_) => "scandir: embedded null character in path",
+            Self::Rename(_) if for_destination => "rename: embedded null character in dst",
+            Self::Rename(_) => "rename: embedded null character in src",
+            // `resolve()` lstats each component before returning.
+            Self::Resolve(_) => "lstat: embedded null character in path",
+            // Reads, writes, appends and `open` all land in `io.open`.
+            // `absolute()` shares that generic wording: it is pure string work
+            // that CPython never raises from, so naming a syscall would be a
+            // fiction (see `limitations/filesystem.md`). The predicates never
+            // reach here — they answer `False`.
+            _ => "embedded null byte",
+        }
+    }
+
     /// The call's primary path if it's a FS operation, `None` otherwise.
     ///
     /// Used for routing and error reporting.
@@ -226,8 +255,7 @@ impl OsFunctionCall {
     /// for FS ops (with the path), `RuntimeError` for non-FS ops.
     #[must_use]
     pub fn on_no_handler(&self) -> MontyException {
-        if self.fs_primary_path().is_some() {
-            let path = self.fs_primary_path().unwrap_or("<unknown>");
+        if let Some(path) = self.fs_primary_path() {
             MontyException::new(
                 ExcType::PermissionError,
                 Some(format!("Permission denied: {}", StringRepr(path))),

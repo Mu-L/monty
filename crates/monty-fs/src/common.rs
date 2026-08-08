@@ -262,8 +262,10 @@ pub(super) fn host_mkdir(
 ) -> Result<MontyObject, MountError> {
     let result = if parents {
         // `create_dir_all` silently returns `Ok(())` when the directory already exists,
-        // so we must check for pre-existing paths ourselves.
-        match dir.symlink_metadata(rel) {
+        // so we must check for pre-existing paths ourselves. The lookup follows,
+        // matching both CPython and the `parents=false` recovery arm below: a
+        // symlink to a directory satisfies `exist_ok` either way.
+        match dir.metadata(rel) {
             Ok(meta) if meta.is_dir() => {
                 return if exist_ok {
                     Ok(MontyObject::None)
