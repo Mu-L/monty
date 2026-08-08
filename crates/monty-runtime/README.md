@@ -22,12 +22,25 @@ hello world
 - `--max-memory 10MB`, `--max-duration 0.5`, `--max-recursion-depth`,
   `--gc-interval` — sandbox resource limits
 
+## Features
+
+- `standalone` (default) — the `monty <file>` / `-c` / REPL path and its
+  terminal stack (`rustyline`, `anstream`, `anstyle`). Without it the binary
+  serves `monty subprocess` alone, which is all a pool ever spawns; the flags
+  still parse, but anything other than `subprocess` is refused.
+- `telemetry` — see below. Implies `standalone`, since it only instruments that
+  path.
+
 ## Observability
 
-Standalone CLI runs configure the Rust Logfire SDK when `LOGFIRE_TOKEN` is
-set. The SDK also honors standard OpenTelemetry exporter and resource
-environment variables. The CLI owns the SDK lifecycle and flushes it before
-exiting.
+Behind the `telemetry` feature, off by default because its exporter links MBs
+of TLS that `monty subprocess` — which never exports — would otherwise carry.
+Without it, `LOGFIRE_TOKEN` is ignored.
+
+Built with `--features telemetry`, standalone CLI runs configure the Rust
+Logfire SDK when `LOGFIRE_TOKEN` is set. The SDK also honors standard
+OpenTelemetry exporter and resource environment variables. The CLI owns the SDK
+lifecycle and flushes it before exiting.
 
 `monty subprocess` deliberately ignores telemetry environment configuration:
 worker processes are instrumented by their parent pool, avoiding duplicate
