@@ -81,7 +81,29 @@ class CollectString:
 
 @final
 class MountDir:
-    """A mount point mapping a virtual path to a host directory."""
+    """A mount point mapping a virtual path to a host directory.
+
+    The directory is opened here, and every feed this mount is passed to serves
+    that same directory — so build one and reuse it. `'overlay'` writes live in
+    each feed's own table and are discarded when the feed ends.
+
+    ```python
+    from pathlib import Path
+
+    from pydantic_monty import Monty, MountDir
+
+    with Monty() as pool, MountDir(host_path=Path('host-dir'), virtual_path='/data') as mount:
+        with pool.checkout() as session:
+            contents = session.feed_run("open('/data/notes.txt').read()", mount=mount)
+    ```
+
+    The directory is held open from construction until the mount is closed, not
+    for the duration of a feed — so reusing one across feeds is free, and works
+    the same inside a `with` block or outside it. `with` (or `close()`) is what
+    hands the directory back; feeds passed a closed mount raise `ValueError`.
+    Without it the directory stays open until the object is collected: a file
+    descriptor on Unix, but on Windows that blocks renaming or deleting it.
+    """
 
     host_path: str
     virtual_path: str
@@ -131,6 +153,18 @@ class MountDir:
                 overlay data and transient filesystem results; an operation that
                 would exceed it raises `MemoryError` in the sandbox.
         """
+
+    def close(self) -> None:
+        """Release the open host directory. Idempotent.
+
+        Feeds passed this mount afterwards raise `ValueError`; the attributes
+        above keep answering. Only Windows needs this — it refuses to rename or
+        delete a directory while a handle to it is open — but `MountDir` also
+        works as a context manager, which closes on exit.
+        """
+
+    def __enter__(self) -> MountDir: ...
+    def __exit__(self, *args: object) -> bool: ...
 
 class MontyError(Exception):
     """Base exception for all Monty interpreter errors.

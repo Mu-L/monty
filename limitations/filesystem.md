@@ -90,6 +90,11 @@ root.
   the mount's own path raise `PermissionError` in every mode, where CPython on
   an ordinary empty directory would succeed (the root has no name inside the
   mount, so there is nothing to detach it from).
+- A rename is only serviced when source and destination land in the *same*
+  mount. Any other combination — different mounts, or one side under no mount
+  at all — raises `OSError` `[Errno 18] Invalid cross-device link`, including
+  where CPython would report `FileNotFoundError` for a missing destination
+  directory. Neither side moves.
 - Null bytes in any path component are rejected (`ValueError`).
 - Resolved paths returned to the sandbox (e.g. via `Path.resolve()`) are
   virtual paths, never host paths.
@@ -106,6 +111,33 @@ the preceding component, which differs whenever a symlink is involved: with
 while Monty reads it as `sibling.txt` — each finds a file the other does not.
 The textual rule is what makes `..` unable to escape at all, so it is
 deliberate; only paths mixing `..` with symlinked directories are affected.
+
+### Path length is Linux's, measured before `..` collapses
+
+A path over 4096 bytes, or with a component over 255, raises `OSError`
+`[Errno 36] File name too long`. Both limits are Linux's and apply on every
+host, so a path macOS (`PATH_MAX` 1024) or Windows would reject is accepted,
+and a long one they would accept is not. The length counts the path as sent,
+before `.`/`..` are collapsed: `'/mnt/' + 'a/' * 5000 + '../' * 5000 + 'f.txt'`
+is refused even though it names `/mnt/f.txt`. CPython hands the uncollapsed
+bytes to the kernel and gets `ENAMETOOLONG` too, so this matches — but Monty
+applies it uniformly rather than deferring to the host filesystem.
+
+The check runs before anything else looks at the path, which has three visible
+consequences:
+
+- `resolve()` and `absolute()` raise, where CPython returns the path — they are
+  the only operations that would otherwise succeed on an over-long path, since
+  they never reach the filesystem. Collapsing a path costs memory proportional
+  to its length, so an unbounded one is refused rather than normalized.
+- The rejection applies even where no mount covers the path, so an over-long
+  path never reaches the `os` callback.
+- `exists()`, `is_file()`, `is_dir()` and `is_symlink()` answer `False`, as
+  CPython's do — `pathlib` swallows `ENAMETOOLONG` in the predicates.
+
+The error quotes the path with its middle elided — the first and last 20
+characters around a `…` — where CPython quotes it whole. An over-long path
+is by definition too big to repeat back.
 
 ### A search-only host directory may not be mountable
 
@@ -137,8 +169,19 @@ Windows refuses to rename or delete a directory while a handle to it is open,
 so the host cannot move or delete a directory for as long as it is mounted —
 the attempt fails with `ERROR_SHARING_VIOLATION`. Unix is unaffected. The
 window is the mount's lifetime, which for `pydantic_monty` and
-`@pydantic/monty` is one feed (see
+`@pydantic/monty` is the lifetime of the mount object, not one feed — close it
+(`MountDir.close()`, or the `with` / `using` block) to release the directory
+before the host touches it (see
 [pool-architecture.md](pool-architecture.md)).
+
+### A mount follows its directory, not its path
+
+The host directory is opened when the mount is created, and everything runs
+against that descriptor. Renaming or replacing the directory afterwards is
+therefore invisible to the mount: it keeps serving the same directory under
+whatever name it now has, and a *new* directory created at the original path
+is not picked up. CPython, resolving each path afresh, would see the
+replacement. Recreate the mount to follow a path.
 
 ### `OverlayMemory` writes refuse symlinks
 

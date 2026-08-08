@@ -54,7 +54,6 @@ pub(super) fn resolve_virtual_path(
     reject_null_bytes(virtual_path)?;
 
     let normalized = normalize_virtual_path(virtual_path);
-    reject_overlong_path(&normalized, virtual_path)?;
     let relative = strip_mount_prefix(&normalized, mount_virtual_path)
         .ok_or_else(|| MountError::NoMountPoint(virtual_path.to_owned()))?
         .to_owned();
@@ -146,18 +145,37 @@ fn reject_null_bytes(virtual_path: &str) -> Result<(), MountError> {
 /// Rejects paths that exceed Linux filesystem length limits.
 ///
 /// Applied regardless of host OS so the sandbox behaves identically everywhere,
-/// rather than inheriting whatever the host filesystem happens to allow.
-pub(super) fn reject_overlong_path(normalized: &str, original: &str) -> Result<(), MountError> {
-    let too_long = normalized.len() > PATH_MAX || normalized.split('/').any(|component| component.len() > NAME_MAX);
+/// rather than inheriting whatever the host filesystem happens to allow. Measures
+/// the path as sent, before normalization: a request padded with `..` collapses
+/// short, and the kernel would reject the bytes handed to it, not the collapsed
+/// form. Checking first also keeps the per-segment normalization off oversized
+/// input.
+pub(super) fn reject_overlong_path(path: &str) -> Result<(), MountError> {
+    let too_long = path.len() > PATH_MAX || path.split('/').any(|component| component.len() > NAME_MAX);
     if too_long {
+        // Elided, because the error echoes the path back: quoting it whole would
+        // make the largest input produce the largest allocation, on the cheapest
+        // branch to reach.
         Err(MountError::io_err(
             ErrorKind::InvalidFilename,
             "File name too long",
-            original,
+            elide_middle(path).as_deref().unwrap_or(path),
         ))
     } else {
         Ok(())
     }
+}
+
+/// Characters kept at each end of an over-long path echoed into an error.
+const ERROR_PATH_EDGE: usize = 20;
+
+/// Replaces the middle of `path` with `…`, keeping [`ERROR_PATH_EDGE`]
+/// characters at each end.
+fn elide_middle(path: &str) -> Option<String> {
+    let mut boundaries = path.char_indices().map(|(index, _)| index);
+    let head_end = boundaries.nth(ERROR_PATH_EDGE)?;
+    let tail_start = boundaries.nth_back(ERROR_PATH_EDGE - 1)?;
+    Some(format!("{}…{}", &path[..head_end], &path[tail_start..]))
 }
 
 /// Fast path for paths already in normalized absolute form.

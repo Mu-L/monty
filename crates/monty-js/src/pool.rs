@@ -40,7 +40,9 @@ use monty_types::{
     TypeCheckingFormat,
 };
 use napi::{
-    bindgen_prelude::{Array, Buffer, FnArgs, FromNapiValue, Function, JsObjectValue, Object, PromiseRaw, Unknown},
+    bindgen_prelude::{
+        Array, Buffer, ClassInstance, FnArgs, FromNapiValue, Function, JsObjectValue, Object, PromiseRaw, Unknown,
+    },
     threadsafe_function::UnknownReturnValue,
     Env, Error, Result,
 };
@@ -145,6 +147,34 @@ pub struct NativeMount {
     pub write_bytes_limit: Option<f64>,
     /// Aggregate budget for retained overlay data and transient results.
     pub memory_usage_limit: f64,
+}
+
+/// A mount whose host directory is opened here and held until this object is
+/// dropped, so every feed using it mounts that same directory. Wrapped by the
+/// TypeScript `MountDir` — not part of the public API.
+#[napi(js_name = "NativeMountDir")]
+pub struct NativeMountDir {
+    /// `None` once closed: the open directory is released and no later feed
+    /// can mount it. A feed already running holds its own reference.
+    spec: Option<MountSpec>,
+}
+
+#[napi]
+impl NativeMountDir {
+    /// Opens the host directory, throwing if it is missing, is not a directory,
+    /// or the virtual path is not absolute.
+    #[napi(constructor)]
+    pub fn new(mount: NativeMount) -> Result<Self> {
+        Ok(Self {
+            spec: Some(MountSpec::try_from(mount)?),
+        })
+    }
+
+    /// Releases the open directory. Idempotent.
+    #[napi]
+    pub fn close(&mut self) {
+        self.spec = None;
+    }
 }
 
 /// A pool of `monty` worker subprocesses. Wrapped by the TypeScript `Monty`
@@ -316,15 +346,12 @@ impl NativeSession {
         env: &'env Env,
         code: String,
         inputs: Option<Object<'env>>,
-        mounts: Vec<NativeMount>,
+        mounts: Vec<ClassInstance<'env, NativeMountDir>>,
         skip_type_check: bool,
         on_print: PrintCallback<'env>,
     ) -> Result<PromiseRaw<'env, Object<'env>>> {
         let inputs = convert_inputs(env, inputs)?;
-        let mounts = mounts
-            .into_iter()
-            .map(MountSpec::try_from)
-            .collect::<Result<Vec<_>>>()?;
+        let mounts = mount_specs(&mounts)?;
         self.run_turn(
             env,
             on_print,
@@ -512,13 +539,10 @@ impl NativeSession {
         &self,
         env: &'env Env,
         state: Buffer,
-        mounts: Vec<NativeMount>,
+        mounts: Vec<ClassInstance<'env, NativeMountDir>>,
         on_print: PrintCallback<'env>,
     ) -> Result<PromiseRaw<'env, Object<'env>>> {
-        let mounts = mounts
-            .into_iter()
-            .map(MountSpec::try_from)
-            .collect::<Result<Vec<_>>>()?;
+        let mounts = mount_specs(&mounts)?;
         let state = state.to_vec();
         self.run_outcome(
             env,
@@ -961,13 +985,12 @@ impl TryFrom<NativeMount> for MountSpec {
             .map(|limit| bytes_limit(limit, "writeBytesLimit"))
             .transpose()?;
         let memory_usage_limit = bytes_limit(mount.memory_usage_limit, "memoryUsageLimit")?;
-        Ok(Self {
-            virtual_path: mount.virtual_path,
-            host_path: mount.host_path.into(),
-            mode,
-            write_bytes_limit,
-            memory_usage_limit,
-        })
+        // Opens the directory: the spec carries a descriptor from here on, so
+        // the host path is resolved once per mount object rather than per feed.
+        let mut spec = Self::new(&mount.virtual_path, &mount.host_path, mode).map_err(pool_error)?;
+        spec.write_bytes_limit = write_bytes_limit;
+        spec.memory_usage_limit = memory_usage_limit;
+        Ok(spec)
     }
 }
 
@@ -994,6 +1017,24 @@ fn duration_from_ms(ms: f64) -> Result<Duration> {
 /// `.lock().await` (or `try_lock` on the event-loop thread).
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Clones each mount's opened configuration for one turn — the descriptor is
+/// shared, so nothing is reopened and no host path is resolved again.
+///
+/// # Errors
+///
+/// Rejects the turn if any mount has been closed.
+fn mount_specs(mounts: &[ClassInstance<'_, NativeMountDir>]) -> Result<Vec<MountSpec>> {
+    mounts
+        .iter()
+        .map(|mount| {
+            mount
+                .spec
+                .clone()
+                .ok_or_else(|| invalid("mount is closed: create a new MountDir"))
+        })
+        .collect()
 }
 
 fn pool_error(err: PoolError) -> napi::Error {
