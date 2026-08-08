@@ -16,7 +16,7 @@ use tempfile::TempDir;
 // Only `symlink_file` is needed here; `symlink_dir` is dead in this crate.
 #[expect(dead_code, reason = "shared helper module; not every test crate uses all of it")]
 mod common;
-use common::symlink_file;
+use common::{symlink_file, symlinks_supported};
 
 // =============================================================================
 // Helpers
@@ -220,6 +220,9 @@ fn rw_is_symlink() {
 
 #[test]
 fn rw_is_symlink_true_for_symlink() {
+    if !symlinks_supported() {
+        return;
+    }
     let dir = create_test_dir();
     symlink_file(dir.path().join("hello.txt"), dir.path().join("link.txt"));
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
@@ -243,6 +246,9 @@ fn rw_is_symlink_true_for_symlink() {
 
 #[test]
 fn overlay_is_symlink_true_for_symlink() {
+    if !symlinks_supported() {
+        return;
+    }
     let dir = create_test_dir();
     symlink_file(dir.path().join("hello.txt"), dir.path().join("link.txt"));
     let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
@@ -999,6 +1005,96 @@ fn ovl_mem_rmdir_overlay() {
         call_ok(&mut mt, &OsFunctionCall::Exists("/mnt/temp_dir".into())),
         MontyObject::Bool(false)
     );
+}
+
+/// The mount root has no name inside the mount, so renaming it must be refused
+/// in every mode.
+///
+/// Overlay mode plans its move in memory before the descriptor is consulted, so
+/// without this check it silently "succeeds" at an operation the descriptor
+/// would refuse, leaving overlay state disagreeing with the real backend.
+#[test]
+fn rename_of_mount_root_is_refused_in_both_modes() {
+    for mode in [MountMode::ReadWrite, MountMode::OverlayMemory(OverlayState::new())] {
+        let dir = create_test_dir();
+        let mut mt = mount_at_mnt(&dir, mode);
+
+        // Whichever end names the root is the one reported.
+        for (src, dst) in [("/mnt", "/mnt/moved"), ("/mnt/moved", "/mnt")] {
+            let err = call(&mut mt, &rename(src, dst)).unwrap().unwrap_err().into_exception();
+            assert_exc(&err, ExcType::PermissionError, "[Errno 13] Permission denied: '/mnt'");
+        }
+
+        // The mount must be untouched by the refusal.
+        assert_eq!(
+            call_ok(&mut mt, &OsFunctionCall::Exists("/mnt/hello.txt".into())),
+            MontyObject::Bool(true)
+        );
+    }
+}
+
+/// `rmdir` of the mount root must be refused in every mode, like rename.
+///
+/// Without the guard, overlay mode tombstoned the root in memory while writes
+/// to its children kept succeeding, and direct mode surfaced whatever errno the
+/// OS picks for `rmdir(".")`. The explicit guard gives both modes the same
+/// `PermissionError` on every platform.
+#[test]
+fn rmdir_of_mount_root_is_refused_in_both_modes() {
+    for mode in [MountMode::ReadWrite, MountMode::OverlayMemory(OverlayState::new())] {
+        let dir = create_test_dir();
+        let mut mt = mount_at_mnt(&dir, mode);
+
+        let err = call(&mut mt, &OsFunctionCall::Rmdir("/mnt".into()))
+            .unwrap()
+            .unwrap_err()
+            .into_exception();
+        assert_exc(&err, ExcType::PermissionError, "[Errno 13] Permission denied: '/mnt'");
+
+        // The refusal must leave the mount fully live, root included.
+        assert_eq!(
+            call_ok(&mut mt, &OsFunctionCall::Exists("/mnt".into())),
+            MontyObject::Bool(true)
+        );
+        assert_eq!(
+            call_ok(&mut mt, &OsFunctionCall::Exists("/mnt/hello.txt".into())),
+            MontyObject::Bool(true)
+        );
+    }
+}
+
+/// A missing path must be `FileNotFoundError`, not `NotADirectoryError`.
+///
+/// `resolve_virtual_path` never touches the filesystem, so "does not exist" and
+/// "exists but is not a directory" both arrive as `Ok` and must be separated
+/// here; both modes must agree.
+#[test]
+fn rmdir_nonexistent_is_not_found_in_both_modes() {
+    for mode in [MountMode::ReadWrite, MountMode::OverlayMemory(OverlayState::new())] {
+        let dir = create_test_dir();
+        let mut mt = mount_at_mnt(&dir, mode);
+
+        let err = call(&mut mt, &OsFunctionCall::Rmdir("/mnt/nonexistent_dir".into()))
+            .unwrap()
+            .unwrap_err()
+            .into_exception();
+        assert_exc(
+            &err,
+            ExcType::FileNotFoundError,
+            "[Errno 2] No such file or directory: '/mnt/nonexistent_dir'",
+        );
+
+        // The neighbouring case must keep its own error.
+        let err = call(&mut mt, &OsFunctionCall::Rmdir("/mnt/hello.txt".into()))
+            .unwrap()
+            .unwrap_err()
+            .into_exception();
+        assert_exc(
+            &err,
+            ExcType::NotADirectoryError,
+            "[Errno 20] Not a directory: '/mnt/hello.txt'",
+        );
+    }
 }
 
 #[test]
@@ -2116,6 +2212,9 @@ fn no_limit_allows_large_writes() {
 #[test]
 #[cfg(unix)]
 fn rw_unlink_symlink_removes_link_not_target() {
+    if !symlinks_supported() {
+        return;
+    }
     let dir = create_test_dir();
     symlink_file(dir.path().join("hello.txt"), dir.path().join("link.txt"));
 
@@ -2137,6 +2236,9 @@ fn rw_unlink_symlink_removes_link_not_target() {
 #[test]
 #[cfg(unix)]
 fn rw_rename_symlink_renames_link_not_target() {
+    if !symlinks_supported() {
+        return;
+    }
     let dir = create_test_dir();
     symlink_file(dir.path().join("hello.txt"), dir.path().join("link.txt"));
 
@@ -2299,8 +2401,11 @@ fn ovl_mem_rename_overlay_file_onto_overlay_dir() {
 #[test]
 #[cfg(unix)]
 fn ovl_mem_rename_symlink_preserves_symlink() {
+    if !symlinks_supported() {
+        return;
+    }
     let dir = create_test_dir();
-    symlink_file(dir.path().join("hello.txt"), dir.path().join("link.txt"));
+    symlink_file("hello.txt", dir.path().join("link.txt"));
 
     let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
 

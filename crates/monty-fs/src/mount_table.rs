@@ -8,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use cap_std::{ambient_authority, fs::Dir};
 use monty_types::{MontyObject, OsFunctionCall};
 
 use super::{
@@ -49,14 +50,18 @@ impl MountTable {
 
     /// Adds a mount point mapping a virtual path to a host directory.
     ///
-    /// The host path is canonicalized at mount time so that all subsequent
-    /// boundary checks compare canonical-to-canonical. Mount memory uses
-    /// [`DEFAULT_MEMORY_USAGE_LIMIT`] unless a pre-built [`Mount`] overrides it.
+    /// The host directory is opened once here, and every later operation runs
+    /// relative to that descriptor — so the mount stays attached to the
+    /// directory that was named, whatever the host does to the path afterwards.
+    /// Mount memory uses [`DEFAULT_MEMORY_USAGE_LIMIT`] unless a pre-built
+    /// [`Mount`] overrides it.
     ///
     /// # Errors
     ///
     /// Returns [`MountError::InvalidMount`] if the virtual path is not absolute,
-    /// or the host path doesn't exist or isn't a directory.
+    /// the host path doesn't exist or isn't a directory, or it cannot be opened
+    /// — on macOS/BSD that includes a search-only (`0o111`) directory, which
+    /// Linux accepts because it opens directories with `O_PATH`.
     pub fn mount(
         &mut self,
         virtual_path: &str,
@@ -89,8 +94,8 @@ impl MountTable {
     /// back untouched for the caller's fallback handler (a host callback or
     /// [`OsFunctionCall::on_no_handler`]).
     pub fn handle_os_call(&mut self, call: OsFunctionCall) -> MountCallOutcome {
-        if call.is_filesystem() {
-            match self.route_call(&call) {
+        if let Some(primary_path) = call.fs_primary_path() {
+            match self.route_call(primary_path, &call) {
                 Some(Ok(index)) => MountCallOutcome::Handled(self.mounts[index].execute(call)),
                 Some(Err(err)) => MountCallOutcome::Handled(Err(err)),
                 None => MountCallOutcome::NotHandled(call),
@@ -117,8 +122,7 @@ impl MountTable {
     ///
     /// Rename requests require both source and destination to resolve to the
     /// same longest-prefix mount. Other requests only route on the primary path.
-    fn route_call(&self, call: &OsFunctionCall) -> Option<Result<usize, MountError>> {
-        let primary_path = call.primary_path().expect("filesystem call always has a primary path");
+    fn route_call(&self, primary_path: &str, call: &OsFunctionCall) -> Option<Result<usize, MountError>> {
         let src_mount_index = self.find_mount_index(primary_path)?;
 
         if let Some(dst_path) = call.rename_destination() {
@@ -152,8 +156,12 @@ impl MountTable {
 pub struct Mount {
     /// Virtual path prefix (absolute, normalized).
     virtual_path: String,
-    /// Canonical host directory path (resolved at construction time).
+    /// Canonical host directory path. Diagnostics only — see `dir`.
     host_path: PathBuf,
+    /// Descriptor for the mounted directory, opened once here — the sandbox
+    /// boundary. Resolution cannot leave it, and no rename can re-point a name
+    /// between a check and its use.
+    dir: Dir,
     /// Access mode (also owns overlay state for [`MountMode::OverlayMemory`]).
     mode: MountMode,
     /// Cumulative bytes written through this mount (monotonically increasing).
@@ -165,13 +173,13 @@ pub struct Mount {
 }
 
 impl Mount {
-    /// Creates a new mount point, canonicalizing the host path.
+    /// Creates a new mount point, opening a descriptor on the host directory.
     /// Mount memory defaults to [`DEFAULT_MEMORY_USAGE_LIMIT`].
     ///
     /// # Errors
     ///
     /// Returns [`MountError::InvalidMount`] if the virtual path is not absolute,
-    /// or the host path doesn't exist or isn't a directory.
+    /// or the host path cannot be opened as a directory or canonicalized.
     pub fn new(
         virtual_path: &str,
         host_path: impl AsRef<Path>,
@@ -188,20 +196,27 @@ impl Mount {
 
         let normalized_virtual = normalize_virtual_path(virtual_path);
 
-        let canonical_host = fs::canonicalize(host_path).map_err(|e| {
-            MountError::InvalidMount(format!("cannot canonicalize host path '{}': {e}", host_path.display()))
-        })?;
+        // The only use of ambient authority, and the mount's whole trust root.
+        // Deliberately first: resolving the name to a validated path and *then*
+        // opening that path would let whoever can rename in the parent swap a
+        // symlink into the gap. The directory check rides on the open itself
+        // (`O_DIRECTORY`, a handle `metadata()` on Windows), so it cannot.
+        let dir = Dir::open_ambient_dir(host_path, ambient_authority())
+            .map_err(|e| MountError::InvalidMount(format!("cannot open host path '{}': {e}", host_path.display())))?;
 
-        if !canonical_host.is_dir() {
-            return Err(MountError::InvalidMount(format!(
-                "host path is not a directory: '{}'",
-                host_path.display()
-            )));
-        }
+        // Diagnostics only — nothing resolves through this path. Resolved after
+        // the open, so a host racing it leaves a stale label on the right
+        // descriptor, never the reverse. Still fatal on failure: callers copy
+        // this out as a mount's durable identity, and a relative path would
+        // later re-resolve against the process CWD.
+        let canonical_host = fs::canonicalize(host_path).map_err(|e| {
+            MountError::InvalidMount(format!("cannot resolve host path '{}': {e}", host_path.display()))
+        })?;
 
         Ok(Self {
             virtual_path: normalized_virtual,
             host_path: canonical_host,
+            dir,
             mode,
             write_bytes_used: 0,
             write_bytes_limit,
@@ -215,7 +230,7 @@ impl Mount {
         &self.virtual_path
     }
 
-    /// Returns the canonical host directory path.
+    /// Returns the canonical host directory path. Diagnostics only.
     #[must_use]
     pub fn host_path(&self) -> &Path {
         &self.host_path
@@ -266,7 +281,7 @@ impl Mount {
     fn execute(&mut self, call: OsFunctionCall) -> Result<MontyObject, MountError> {
         let mut ctx = MountContext {
             mount_virtual: &self.virtual_path,
-            mount_host: &self.host_path,
+            mount_dir: &self.dir,
             write_bytes_used: &mut self.write_bytes_used,
             write_bytes_limit: self.write_bytes_limit,
             memory_usage_limit: self.memory_usage_limit,

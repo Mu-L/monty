@@ -5,18 +5,19 @@
 //! Tests cover all mount modes to ensure the security invariant holds everywhere.
 
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
-use std::{fmt, fs};
+use std::{ffi::OsStr, os::unix::ffi::OsStrExt, os::unix::fs::symlink};
+use std::{fmt, fs, io::ErrorKind};
 
 use monty_fs::{MountCallOutcome, MountError, MountMode, MountTable, OverlayState};
 use monty_types::{
     FileMode, MkdirCallArgs, MontyObject, MontyPath, OpenCallArgs, OsFunctionCall, PathBytesDataArgs,
-    PathStringDataArgs,
+    PathStringDataArgs, RenameCallArgs,
 };
 use tempfile::TempDir;
 
+#[expect(dead_code, reason = "shared helper module; not every test crate uses all of it")]
 mod common;
-use common::{symlink_dir, symlink_file};
+use common::{symlink_dir, symlink_file, symlinks_supported};
 
 // =============================================================================
 // Helpers
@@ -148,6 +149,18 @@ fn assert_blocked(mt: &mut MountTable, op: PathOp, path: &str) {
         Some(Err(MountError::PathEscape { .. } | MountError::NoMountPoint(_) | MountError::Io(_, _))) | None => {}
         Some(Ok(val)) => panic!("expected blocked, got Ok({val:?}) for path: {path}"),
         Some(Err(other)) => panic!("unexpected error variant for {path}: {other}"),
+    }
+}
+
+/// Asserts a boolean query answers `False` rather than raising.
+///
+/// `pathlib` predicates never raise, so a path leaving the mount comes back as
+/// `False` — indistinguishable from "does not exist". Raising would leak that
+/// something is there to be blocked.
+fn assert_invisible(mt: &mut MountTable, op: PathOp, path: &str) {
+    match call(mt, op, path) {
+        Some(Ok(MontyObject::Bool(false))) => {}
+        other => panic!("expected Ok(Bool(false)) for path: {path}, got {other:?}"),
     }
 }
 
@@ -375,8 +388,269 @@ fn null_byte_overlay_memory() {
 mod symlink_tests {
     use super::*;
 
+    /// Overlay writes refuse to land on a symlink, even one resolving inside
+    /// the mount: a direct mount writes *through* the link to its target, and
+    /// shadowing the link name in memory instead would silently alias the two.
+    #[test]
+    fn overlay_write_over_inbound_symlink_is_refused() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        symlink_file(dir.path().join("hello.txt"), dir.path().join("link.txt"));
+
+        let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
+        let outcome = dispatch(
+            &mut mt,
+            OsFunctionCall::WriteText(PathStringDataArgs {
+                path: MontyPath::new("/mnt/link.txt".to_owned()),
+                data: "aliased".to_owned(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Err(MountError::PathEscape { .. })),
+            "overlay write over an in-mount symlink must be refused, got {outcome:?}"
+        );
+
+        // The link's target must be untouched.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hello world\n"
+        );
+    }
+
+    /// A dangling in-mount symlink gets the same refusal — writing "through" it
+    /// would create the target on a direct mount, which the overlay cannot do.
+    #[test]
+    fn overlay_write_over_dangling_symlink_is_refused() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        symlink_file(dir.path().join("missing.txt"), dir.path().join("dangle.txt"));
+
+        let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
+        let outcome = dispatch(
+            &mut mt,
+            OsFunctionCall::WriteText(PathStringDataArgs {
+                path: MontyPath::new("/mnt/dangle.txt".to_owned()),
+                data: "ghost".to_owned(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Err(MountError::PathEscape { .. })),
+            "overlay write over a dangling symlink must be refused, got {outcome:?}"
+        );
+        assert!(
+            !dir.path().join("missing.txt").exists(),
+            "link target must not be created"
+        );
+    }
+
+    /// Renaming a directory that contains a symlink is refused outright.
+    ///
+    /// The link has no overlay representation, so the move could only skip it,
+    /// stranding a live file: unreachable at the new name, still readable at
+    /// the old one inside a directory the overlay now reports as deleted.
+    #[test]
+    fn overlay_rename_of_dir_containing_a_symlink_is_refused() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        symlink_file("nested.txt", dir.path().join("subdir/link.txt"));
+
+        let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
+        let outcome = dispatch(
+            &mut mt,
+            OsFunctionCall::Rename(RenameCallArgs {
+                src: MontyPath::new("/mnt/subdir".to_owned()),
+                dst: MontyPath::new("/mnt/moved".to_owned()),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Err(MountError::PathEscape { .. })),
+            "renaming a directory containing a symlink must be refused, got {outcome:?}"
+        );
+
+        // The refusal must be total: the directory keeps its name and contents,
+        // rather than half-moving and leaving the link behind.
+        assert_eq!(
+            call(&mut mt, PathOp::Exists, "/mnt/subdir").unwrap().unwrap(),
+            MontyObject::Bool(true)
+        );
+        assert_eq!(
+            call(&mut mt, PathOp::ReadText, "/mnt/subdir/nested.txt")
+                .unwrap()
+                .unwrap(),
+            MontyObject::String("nested content".to_owned())
+        );
+        assert_eq!(
+            call(&mut mt, PathOp::Exists, "/mnt/moved").unwrap().unwrap(),
+            MontyObject::Bool(false)
+        );
+    }
+
+    /// `unlink` and `rmdir` are writes, so the symlink refusal covers them too.
+    ///
+    /// Tombstoning a link's spelling would report it gone while its target
+    /// stayed readable under the real name — the aliasing the write policy
+    /// exists to prevent, arrived at by deleting instead of writing.
+    #[test]
+    fn overlay_delete_through_a_symlink_is_refused() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        symlink_dir("subdir", dir.path().join("link_dir"));
+        symlink_file("hello.txt", dir.path().join("link.txt"));
+
+        let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
+        // Below an intermediate link, on the link itself, and rmdir of a link
+        // to a directory (POSIX answers ENOTDIR; either way it is not removed).
+        for path in ["/mnt/link_dir/nested.txt", "/mnt/link.txt"] {
+            let outcome = call(&mut mt, PathOp::Unlink, path).unwrap();
+            assert!(
+                matches!(&outcome, Err(MountError::PathEscape { .. })),
+                "unlink of {path} must be refused, got {outcome:?}"
+            );
+        }
+        let outcome = dispatch(
+            &mut mt,
+            OsFunctionCall::Rmdir(MontyPath::new("/mnt/link_dir".to_owned())),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Err(MountError::PathEscape { .. })),
+            "rmdir of a symlink must be refused, got {outcome:?}"
+        );
+
+        // Nothing was shadowed, so both spellings still agree with the host.
+        assert_eq!(
+            call(&mut mt, PathOp::ReadText, "/mnt/subdir/nested.txt")
+                .unwrap()
+                .unwrap(),
+            MontyObject::String("nested content".to_owned())
+        );
+        assert_eq!(
+            call(&mut mt, PathOp::Exists, "/mnt/link_dir/nested.txt")
+                .unwrap()
+                .unwrap(),
+            MontyObject::Bool(true)
+        );
+    }
+
+    /// A rename destination is classified like any other write target, so it
+    /// cannot land on an existing symlink — which `write_text` already refuses
+    /// for the same path.
+    #[test]
+    fn overlay_rename_onto_a_symlink_is_refused() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        symlink_file("hello.txt", dir.path().join("link.txt"));
+        fs::write(dir.path().join("src.txt"), "moved").unwrap();
+
+        let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
+        let outcome = dispatch(
+            &mut mt,
+            OsFunctionCall::Rename(RenameCallArgs {
+                src: MontyPath::new("/mnt/src.txt".to_owned()),
+                dst: MontyPath::new("/mnt/link.txt".to_owned()),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Err(MountError::PathEscape { .. })),
+            "renaming onto a symlink must be refused, got {outcome:?}"
+        );
+
+        // The link still resolves to its own target, not the moved file.
+        assert_eq!(
+            call(&mut mt, PathOp::ReadText, "/mnt/link.txt").unwrap().unwrap(),
+            MontyObject::String("hello world\n".to_owned())
+        );
+        assert_eq!(
+            call(&mut mt, PathOp::Exists, "/mnt/src.txt").unwrap().unwrap(),
+            MontyObject::Bool(true)
+        );
+    }
+
+    /// `open(..., 'a')` on a file that already exists below an in-mount symlink
+    /// is refused at open time, not on the first append. Only the append path
+    /// takes the "target already exists" shortcut, which used to skip the
+    /// parent walk that every other overlay write runs.
+    #[test]
+    fn overlay_append_open_below_inbound_symlink_dir_is_refused() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        symlink_dir("subdir", dir.path().join("link_dir"));
+
+        let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
+        assert_open_blocked(&mut mt, "/mnt/link_dir/nested.txt", "a");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("subdir/nested.txt")).unwrap(),
+            "nested content"
+        );
+    }
+
+    /// Even a symlink resolving to an in-mount directory blocks overlay writes
+    /// through it: entries would be keyed under the link's spelling, invisible
+    /// via the resolved name. Direct mode follows such links; the overlay
+    /// refuses, whether the link is the immediate parent or deeper in the path.
+    #[test]
+    fn overlay_write_through_inbound_symlink_dir_is_refused() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        // A relative target — an absolute one is never followed, even in-mount
+        // (see `limitations/filesystem.md`).
+        symlink_dir("subdir", dir.path().join("link_dir"));
+
+        let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
+        let outcome = dispatch(
+            &mut mt,
+            OsFunctionCall::Mkdir(MkdirCallArgs {
+                path: MontyPath::new("/mnt/link_dir/new".to_owned()),
+                parents: true,
+                exist_ok: false,
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Err(MountError::PathEscape { .. })),
+            "overlay mkdir through an in-mount symlink dir must be refused, got {outcome:?}"
+        );
+
+        // The link as a non-immediate parent is caught by the component walk,
+        // not just the final-parent lookup ("subdir/deep" exists for real).
+        let outcome = dispatch(
+            &mut mt,
+            OsFunctionCall::WriteText(PathStringDataArgs {
+                path: MontyPath::new("/mnt/link_dir/deep/x.txt".to_owned()),
+                data: "aliased".to_owned(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Err(MountError::PathEscape { .. })),
+            "overlay write below an in-mount symlink dir must be refused, got {outcome:?}"
+        );
+        assert!(!dir.path().join("subdir/deep/x.txt").exists(), "host must be untouched");
+    }
+
     #[test]
     fn symlink_to_outside_directory() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("secret.txt"), "secret data").unwrap();
@@ -386,12 +660,15 @@ mod symlink_tests {
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
         assert_blocked(&mut mt, PathOp::ReadText, "/mnt/escape_link/secret.txt");
-        assert_blocked(&mut mt, PathOp::Exists, "/mnt/escape_link/secret.txt");
+        assert_invisible(&mut mt, PathOp::Exists, "/mnt/escape_link/secret.txt");
         assert_blocked(&mut mt, PathOp::Iterdir, "/mnt/escape_link");
     }
 
     #[test]
     fn symlink_to_outside_file() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("secret.txt"), "secret").unwrap();
@@ -404,6 +681,9 @@ mod symlink_tests {
 
     #[test]
     fn symlink_open_escape() {
+        if !symlinks_supported() {
+            return;
+        }
         // `open()` on a path that escapes the mount via a symlink must be
         // rejected — for read (would read an outside file) and for write
         // (the open-time truncate would write outside the mount).
@@ -420,6 +700,9 @@ mod symlink_tests {
 
     #[test]
     fn symlink_to_parent() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
         let parent = dir.path().parent().unwrap();
 
@@ -432,6 +715,9 @@ mod symlink_tests {
     #[test]
     #[cfg(unix)] // Relative symlink targets are not supported on Windows
     fn relative_symlink_escape() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
 
         // Create symlink that uses relative path to escape.
@@ -441,8 +727,35 @@ mod symlink_tests {
         assert_blocked(&mut mt, PathOp::Iterdir, "/mnt/rel_escape");
     }
 
+    /// `is_symlink()` does not follow the final component, so an outbound link
+    /// that is itself inside the mount still answers `True` — as in CPython, and
+    /// revealing nothing about where it points. The following predicates differ.
+    #[test]
+    fn is_symlink_reports_an_outbound_link_that_lives_in_the_mount() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        symlink_file(outside.path().join("secret.txt"), dir.path().join("escape_link"));
+
+        for mode in [MountMode::ReadWrite, MountMode::OverlayMemory(OverlayState::new())] {
+            let mut mt = mount_at_mnt(&dir, mode);
+            assert_eq!(
+                call(&mut mt, PathOp::IsSymlink, "/mnt/escape_link").unwrap().unwrap(),
+                MontyObject::Bool(true)
+            );
+            assert_invisible(&mut mt, PathOp::Exists, "/mnt/escape_link");
+            assert_invisible(&mut mt, PathOp::IsFile, "/mnt/escape_link");
+        }
+    }
+
     #[test]
     fn symlink_escape_no_info_leak() {
+        if !symlinks_supported() {
+            return;
+        }
         // Error messages should only contain virtual path, not host path.
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
@@ -465,6 +778,9 @@ mod symlink_tests {
 
     #[test]
     fn symlink_escape_overlay_memory() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("secret.txt"), "secret").unwrap();
@@ -472,14 +788,17 @@ mod symlink_tests {
 
         let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
         assert_blocked(&mut mt, PathOp::ReadText, "/mnt/escape/secret.txt");
-        assert_blocked(&mut mt, PathOp::Exists, "/mnt/escape/secret.txt");
+        assert_invisible(&mut mt, PathOp::Exists, "/mnt/escape/secret.txt");
     }
 
     #[test]
     fn symlink_within_mount_allowed() {
+        if !symlinks_supported() {
+            return;
+        }
         // Symlinks that stay within the mount boundary should work.
         let dir = create_test_dir();
-        symlink_file(dir.path().join("hello.txt"), dir.path().join("internal_link"));
+        symlink_file("hello.txt", dir.path().join("internal_link"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
         let result = call(&mut mt, PathOp::ReadText, "/mnt/internal_link").unwrap().unwrap();
@@ -488,9 +807,12 @@ mod symlink_tests {
 
     #[test]
     fn symlink_to_directory_within_mount_allowed() {
+        if !symlinks_supported() {
+            return;
+        }
         // Symlink to a subdirectory within the mount should work for all operations.
         let dir = create_test_dir();
-        symlink_dir(dir.path().join("subdir"), dir.path().join("dir_link"));
+        symlink_dir("subdir", dir.path().join("dir_link"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
@@ -513,10 +835,13 @@ mod symlink_tests {
 
     #[test]
     fn chained_symlinks_within_mount_allowed() {
+        if !symlinks_supported() {
+            return;
+        }
         // A symlink pointing to another symlink, both within the mount, should work.
         let dir = create_test_dir();
-        symlink_file(dir.path().join("hello.txt"), dir.path().join("link1"));
-        symlink_file(dir.path().join("link1"), dir.path().join("link2"));
+        symlink_file("hello.txt", dir.path().join("link1"));
+        symlink_file("link1", dir.path().join("link2"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
         let result = call(&mut mt, PathOp::ReadText, "/mnt/link2").unwrap().unwrap();
@@ -525,6 +850,9 @@ mod symlink_tests {
 
     #[test]
     fn chained_symlinks_escape_blocked() {
+        if !symlinks_supported() {
+            return;
+        }
         // A symlink within mount pointing to another symlink that escapes should be blocked.
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
@@ -540,6 +868,9 @@ mod symlink_tests {
 
     #[test]
     fn mkdir_parents_through_symlink_escape_blocked_readwrite() {
+        if !symlinks_supported() {
+            return;
+        }
         // Regression test: mkdir(parents=True) through a symlinked ancestor must
         // not create directories outside the mount boundary in ReadWrite mode.
         let dir = create_test_dir();
@@ -566,6 +897,9 @@ mod symlink_tests {
 
     #[test]
     fn mkdir_parents_through_symlink_escape_blocked_readonly() {
+        if !symlinks_supported() {
+            return;
+        }
         // ReadOnly mode should also block mkdir through symlink escape.
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
@@ -588,6 +922,9 @@ mod symlink_tests {
 
     #[test]
     fn mkdir_parents_through_nested_symlink_escape_blocked() {
+        if !symlinks_supported() {
+            return;
+        }
         // mkdir(parents=True) through a symlinked directory deeper in the tree.
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
@@ -623,11 +960,14 @@ mod symlink_tests {
 
     #[test]
     fn mkdir_parents_through_internal_symlink_allowed() {
+        if !symlinks_supported() {
+            return;
+        }
         // mkdir(parents=True) through a symlink that stays within the mount is fine.
         let dir = create_test_dir();
 
         // Create a symlink within mount pointing to another dir within mount.
-        symlink_dir(dir.path().join("subdir"), dir.path().join("internal_link"));
+        symlink_dir("subdir", dir.path().join("internal_link"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
@@ -705,6 +1045,9 @@ mod hard_link_tests {
     #[test]
     #[cfg(unix)]
     fn broken_symlink_write_escape_blocked() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         let escape_target = outside.path().join("pwned.txt");
@@ -727,12 +1070,15 @@ mod hard_link_tests {
         );
     }
 
-    /// Overlay mode writes to in-memory storage, never the real filesystem,
-    /// so a broken outbound symlink on the real FS is harmless — the overlay
-    /// simply stores the content in memory under the virtual path.
+    /// Overlay mode refuses to write over a symlink the descriptor cannot
+    /// follow — shadowing it in memory would alias the name, so the write
+    /// raises `PermissionError` instead, and the real target is never created.
     #[test]
     #[cfg(unix)]
-    fn broken_symlink_overlay_writes_to_memory_not_real_fs() {
+    fn broken_symlink_overlay_write_is_refused() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         let escape_target = outside.path().join("pwned.txt");
@@ -741,17 +1087,18 @@ mod hard_link_tests {
 
         let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
 
-        // Write succeeds (goes to overlay memory).
-        let result = dispatch(
+        let outcome = dispatch(
             &mut mt,
             OsFunctionCall::WriteText(PathStringDataArgs {
                 path: MontyPath::new("/mnt/broken_link.txt".to_owned()),
                 data: "safe".to_owned(),
             }),
         )
-        .unwrap()
         .unwrap();
-        assert_eq!(result, MontyObject::Int(4));
+        assert!(
+            matches!(&outcome, Err(MountError::PathEscape { .. })),
+            "overlay write over an outbound symlink must be refused, got {outcome:?}"
+        );
 
         // Real FS target was NOT created.
         assert!(!escape_target.exists());
@@ -762,6 +1109,9 @@ mod hard_link_tests {
     #[test]
     #[cfg(unix)]
     fn iterdir_filters_outbound_symlinks_but_keeps_regular_and_inbound() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("external.txt"), "external").unwrap();
@@ -769,7 +1119,7 @@ mod hard_link_tests {
         // Outbound symlink (points outside mount) — should be filtered.
         symlink(outside.path().join("external.txt"), dir.path().join("escape_link")).unwrap();
         // Inbound symlink (points inside mount) — should be kept.
-        symlink(dir.path().join("hello.txt"), dir.path().join("internal_link")).unwrap();
+        symlink("hello.txt", dir.path().join("internal_link")).unwrap();
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
         let result = call(&mut mt, PathOp::Iterdir, "/mnt").unwrap().unwrap();
@@ -802,18 +1152,95 @@ mod hard_link_tests {
         }
     }
 
+    /// An in-mount symlink whose *name* is not valid UTF-8 must still be listed.
+    ///
+    /// The in-mount check has to run against the raw directory entry: rebuilding
+    /// the path from a lossy name looks up something that does not exist, so the
+    /// link is silently dropped. Its listed name is still lossy — that predates
+    /// this and is unchanged here.
+    #[test]
+    #[cfg(unix)]
+    fn iterdir_keeps_inbound_symlink_with_non_utf8_name() {
+        if !symlinks_supported() {
+            return;
+        }
+        let dir = create_test_dir();
+        let raw_name = OsStr::from_bytes(b"nonutf8\xff_link");
+        if symlink("hello.txt", dir.path().join(raw_name)).is_err() {
+            // APFS and friends reject non-UTF-8 filenames outright, so the bug
+            // this guards is unobservable there. ext4 exercises it.
+            eprintln!("skipped: filesystem rejects non-UTF-8 filenames");
+            return;
+        }
+
+        let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
+        let result = call(&mut mt, PathOp::Iterdir, "/mnt").unwrap().unwrap();
+        let names = sorted_names_from_list(&result);
+
+        let lossy = raw_name.to_string_lossy().to_string();
+        assert!(
+            names.contains(&lossy),
+            "in-mount symlink with a non-UTF-8 name was dropped: {names:?}"
+        );
+    }
+
+    /// Renaming a directory whose real contents include a non-UTF-8 name must
+    /// fail loudly and leave everything in place.
+    ///
+    /// Such a name cannot be an overlay key, so the rename plan cannot
+    /// represent the move. It used to be built from the lossy name instead,
+    /// which stats a path that does not exist — the file silently vanished
+    /// from the destination while the source read as deleted.
+    #[test]
+    #[cfg(unix)]
+    fn overlay_rename_of_dir_with_non_utf8_named_entry_is_refused() {
+        let dir = create_test_dir();
+        let raw_name = OsStr::from_bytes(b"nonutf8\xff.txt");
+        if fs::write(dir.path().join("subdir").join(raw_name), b"data").is_err() {
+            // APFS and friends reject non-UTF-8 filenames outright, so the bug
+            // this guards is unobservable there. ext4 exercises it.
+            eprintln!("skipped: filesystem rejects non-UTF-8 filenames");
+            return;
+        }
+
+        let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
+        let outcome = dispatch(
+            &mut mt,
+            OsFunctionCall::Rename(monty_types::RenameCallArgs {
+                src: MontyPath::new("/mnt/subdir".to_owned()),
+                dst: MontyPath::new("/mnt/moved".to_owned()),
+            }),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Err(MountError::Io(err, _)) if err.kind() == ErrorKind::InvalidData),
+            "rename over a non-UTF-8 name must fail with InvalidData, got {outcome:?}"
+        );
+
+        // The refusal must leave the source tree fully visible and create nothing.
+        let exists = call(&mut mt, PathOp::Exists, "/mnt/subdir/nested.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(exists, MontyObject::Bool(true));
+        let moved = call(&mut mt, PathOp::Exists, "/mnt/moved").unwrap().unwrap();
+        assert_eq!(moved, MontyObject::Bool(false));
+    }
+
     /// Overlay mode should expose the same visible real entries as direct mode:
     /// inbound symlinks stay visible, outbound and broken symlinks are filtered.
     #[test]
     #[cfg(unix)]
     fn overlay_iterdir_filters_symlinks_like_direct_mode() {
+        if !symlinks_supported() {
+            return;
+        }
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("external.txt"), "external").unwrap();
 
         symlink(outside.path().join("external.txt"), dir.path().join("escape_link")).unwrap();
         symlink(outside.path().join("missing.txt"), dir.path().join("broken_link")).unwrap();
-        symlink(dir.path().join("hello.txt"), dir.path().join("internal_link")).unwrap();
+        symlink("hello.txt", dir.path().join("internal_link")).unwrap();
 
         let mut direct = mount_at_mnt(&dir, MountMode::ReadWrite);
         let direct_result = call(&mut direct, PathOp::Iterdir, "/mnt").unwrap().unwrap();
@@ -832,6 +1259,7 @@ mod hard_link_tests {
 }
 
 /// Extracts sorted entry basenames from an `iterdir()` result list.
+#[cfg(unix)]
 fn sorted_names_from_list(obj: &MontyObject) -> Vec<String> {
     match obj {
         MontyObject::List(entries) => {
@@ -1075,6 +1503,9 @@ fn rename_traversal_dst() {
 ///    the outside file's contents, completely bypassing boundary checks.
 #[test]
 fn rename_symlink_escape_overlay_read_text() {
+    if !symlinks_supported() {
+        return;
+    }
     // Create the mount directory and a file *outside* it.
     let mount_dir = TempDir::new().unwrap();
     let outside_dir = TempDir::new().unwrap();
@@ -1126,6 +1557,9 @@ fn rename_symlink_escape_overlay_read_text() {
 /// Same as above but for `read_bytes`.
 #[test]
 fn rename_symlink_escape_overlay_read_bytes() {
+    if !symlinks_supported() {
+        return;
+    }
     let mount_dir = TempDir::new().unwrap();
     let outside_dir = TempDir::new().unwrap();
     let secret = b"TOP SECRET BYTES";
