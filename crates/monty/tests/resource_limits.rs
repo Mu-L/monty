@@ -827,3 +827,89 @@ re.sub('(a+)+\\1b', 'X', 'a' * 30 + 'c')
         "expected backtracking error, got: {exc}"
     );
 }
+
+/// Source-driving `itertools` adaptors delegate `next()` to their wrapped
+/// iterator on the native Rust stack, so attacker-controlled nesting depth
+/// must be charged against the recursion limit — without the guard in
+/// `ItertoolsIter::py_next`, deep nesting overflowed the stack and aborted
+/// the process instead of raising a recoverable `RecursionError`.
+#[test]
+fn nested_itertools_adaptors_are_bounded_by_the_recursion_limit() {
+    for wrap in [
+        "itertools.islice(source, 0, None)",
+        "itertools.chain(source)",
+        "itertools.pairwise(source)",
+        "itertools.compress(source, itertools.repeat(1))",
+        "itertools.cycle(source)",
+    ] {
+        let code = format!(
+            r"
+import itertools
+source = iter([1, 2, 3])
+for _ in range(100):
+    source = {wrap}
+next(source)
+"
+        );
+        let ex = MontyRun::new(code, "test.py", vec![], CompileOptions::default()).unwrap();
+
+        let limits = ResourceLimits::default().max_recursion_depth(10);
+        let result = ex.run(vec![], ResourceTracker::new(limits), PrintWriter::Stdout);
+
+        let exc = result.expect_err("nested adaptors should exceed the recursion limit");
+        assert_eq!(exc.exc_type(), ExcType::RecursionError, "wrapper: {wrap}");
+    }
+}
+
+/// Companion to the test above: nesting *below* the limit still works — the
+/// per-delegation recursion charge is transient (released as each `next()`
+/// returns), so a legal nest must not accumulate depth across iterations.
+#[test]
+fn nested_itertools_adaptors_below_the_recursion_limit_iterate() {
+    let code = r"
+import itertools
+source = iter([1, 2, 3])
+for _ in range(150):
+    source = itertools.islice(source, 0, None)
+list(source)
+";
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+
+    let limits = ResourceLimits::default().max_recursion_depth(200);
+    let result = ex.run(vec![], ResourceTracker::new(limits), PrintWriter::Stdout);
+
+    let list = result.expect("nesting below the recursion limit should succeed");
+    assert_eq!(
+        list,
+        MontyObject::List(vec![MontyObject::Int(1), MontyObject::Int(2), MontyObject::Int(3)])
+    );
+}
+
+/// Ordering deeply nested namedtuples must raise `RecursionError`, not overflow
+/// the native stack. Ordering compares detached item vecs via `cmp_item_seqs`
+/// rather than a token-bearing iterator, so it charges its own recursion level;
+/// without it, nested namedtuples aborted the process. Covers both the
+/// namedtuple-vs-namedtuple and mixed namedtuple-vs-tuple dispatch paths.
+#[test]
+fn nested_namedtuple_ordering_is_bounded_by_the_recursion_limit() {
+    for build in [
+        "a = NT(0)\nb = NT(0)\nfor _ in range(100):\n    a = NT(a)\n    b = NT(b)",
+        "a = NT(0)\nb = (0,)\nfor _ in range(100):\n    a = NT(a)\n    b = (b,)",
+    ] {
+        let code = format!(
+            r"
+from collections import namedtuple
+NT = namedtuple('NT', ['x'])
+{build}
+a < b
+"
+        );
+        let ex = MontyRun::new(code, "test.py", vec![], CompileOptions::default()).unwrap();
+
+        let limits = ResourceLimits::default().max_recursion_depth(10);
+        let result = ex.run(vec![], ResourceTracker::new(limits), PrintWriter::Stdout);
+
+        let exc = result.expect_err("nested namedtuple ordering should exceed the recursion limit");
+        assert_eq!(exc.exc_type(), ExcType::RecursionError, "build: {build}");
+    }
+}
