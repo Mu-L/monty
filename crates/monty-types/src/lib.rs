@@ -1,5 +1,8 @@
 #![doc = include_str!("../README.md")]
 
+/// The monty version this build was compiled as.
+pub const MONTY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod args;
 mod builtins;
 mod exceptions;
