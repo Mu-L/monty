@@ -16,6 +16,9 @@
 
 ---
 
+> [!NOTE]
+> **Hack Monty Round 3 is live** - the last round before Monty V1. See [pydantic.dev/monty](https://pydantic.dev/monty) for details.
+
 **Experimental** - This project is still in development, and not ready for prime time.
 
 A minimal, secure Python interpreter written in Rust for use by AI.
