@@ -4,6 +4,8 @@
 //! only the newly fed snippet each time.
 
 use insta::assert_snapshot;
+#[cfg(feature = "test-hooks")]
+use monty::FunctionMetadataFault;
 use monty::{
     DUMP_VERSION, Dump, DumpError, MontyRepl, ReplContinuationMode, ReplProgress, ReplStartError, Session, SessionRef,
     detect_repl_continuation_mode, dump,
@@ -299,6 +301,78 @@ fn repl_dump_load_survives_between_snippets() {
     feed_run_print(&mut loaded, "total = total * 21").unwrap();
     let output = feed_run_print(&mut loaded, "total").unwrap();
     assert_eq!(output, MontyObject::Int(42));
+}
+
+#[test]
+fn repl_dump_load_derives_exact_positional_call_plans() {
+    let (repl, _) = init_repl("def add(a, b):\n    return a + b\n\nasync def async_add(a, b):\n    return a + b");
+    let mut loaded = round_trip_repl(&repl);
+
+    assert_eq!(
+        feed_run_print(&mut loaded, "add(20, 22)").unwrap(),
+        MontyObject::Int(42)
+    );
+    assert_eq!(
+        feed_run_print(&mut loaded, "await async_add(20, 22)").unwrap(),
+        MontyObject::Int(42)
+    );
+
+    // The fast path's arg-count guard must also survive the round trip: a
+    // mismatched call has to fall back to the general binder (and its error),
+    // not silently misfire the cached plan.
+    let err = feed_run_print(&mut loaded, "add(1)").unwrap_err();
+    assert_eq!(err.message(), Some("add() missing 1 required positional argument: 'b'"));
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn repl_dump_load_rejects_invalid_function_metadata() {
+    /// Checks forged function metadata is rejected at dump load.
+    fn assert_rejected(function: &str, fault: FunctionMetadataFault) {
+        let code = r"
+def variadic(*args, **kwargs):
+    return args, kwargs
+
+def pos_defaults(value=1, /):
+    return value
+
+def defaults(value=1):
+    return value
+
+def kw_defaults(*, first=1, second=2):
+    return first, second
+
+def outer(first, second):
+    def middle():
+        local = 1
+        def inner():
+            return first + second + local
+        return inner
+    return middle
+";
+        let (mut repl, _) = init_repl(code);
+        repl.__corrupt_function_metadata_for_tests(function, fault);
+        let bytes = dump("repl.py", None, SessionRef::Idle(&repl)).unwrap();
+        assert_eq!(
+            Dump::load(&bytes).unwrap_err(),
+            DumpError::Payload(postcard::Error::SerdeDeCustom)
+        );
+    }
+
+    assert_rejected("variadic", FunctionMetadataFault::SignatureSlotsBeyondNamespace);
+    assert_rejected("variadic", FunctionMetadataFault::NamespaceTooLarge);
+    assert_rejected("inner", FunctionMetadataFault::FreeVarLengthMismatch);
+    assert_rejected("outer", FunctionMetadataFault::CellVarLengthMismatch);
+    assert_rejected("inner", FunctionMetadataFault::FreeVarSlotOutOfRange);
+    assert_rejected("outer", FunctionMetadataFault::CellVarSlotOutOfRange);
+    assert_rejected("outer", FunctionMetadataFault::CellParamIndexOutOfRange);
+    assert_rejected("pos_defaults", FunctionMetadataFault::PosDefaultsCountOutOfRange);
+    assert_rejected("defaults", FunctionMetadataFault::ArgDefaultsCountOutOfRange);
+    assert_rejected("kw_defaults", FunctionMetadataFault::KwargDefaultMapLengthMismatch);
+    assert_rejected("kw_defaults", FunctionMetadataFault::KwargDefaultIndexGap);
+    assert_rejected("defaults", FunctionMetadataFault::DefaultsCountMismatch);
+    assert_rejected("inner", FunctionMetadataFault::DuplicateFreeVarSlot);
+    assert_rejected("middle", FunctionMetadataFault::CellFreeVarSlotOverlap);
 }
 
 #[test]
