@@ -863,6 +863,7 @@ pub enum ReplContinuationMode {
 ///
 /// This mirrors CPython's broad interactive behavior:
 /// - Incomplete bracketed / parenthesized / triple-quoted constructs continue.
+/// - Decorators continue until their class or function definition arrives.
 /// - Clause headers (`if:`, `def:`, etc.) require an indented body and then a
 ///   terminating blank line before execution.
 /// - All other parse outcomes are treated as complete (either valid code or a
@@ -872,11 +873,16 @@ pub fn detect_repl_continuation_mode(source: &str) -> ReplContinuationMode {
     let Err(error) = parse_module(source) else {
         return ReplContinuationMode::Complete;
     };
+    let error_is_at_end = error.location.is_empty() && error.location.start().to_usize() == source.len();
 
     match error.error {
         ParseErrorType::OtherError(msg) => {
             if msg.starts_with("Expected an indented block after ") {
                 ReplContinuationMode::IncompleteBlock
+            } else if msg == "Expected class, function definition or async function definition after decorator"
+                && error_is_at_end
+            {
+                ReplContinuationMode::IncompleteImplicit
             } else {
                 ReplContinuationMode::Complete
             }

@@ -213,6 +213,35 @@ fn repl_detects_continuation_mode_for_common_cases() {
         detect_repl_continuation_mode("[1,\n"),
         ReplContinuationMode::IncompleteImplicit
     );
+    assert_eq!(
+        detect_repl_continuation_mode("@decorator\n"),
+        ReplContinuationMode::IncompleteImplicit
+    );
+    assert_eq!(
+        detect_repl_continuation_mode("@first\n@second\n"),
+        ReplContinuationMode::IncompleteImplicit
+    );
+    assert_eq!(
+        detect_repl_continuation_mode("@decorator\nvalue = 1"),
+        ReplContinuationMode::Complete
+    );
+    assert_eq!(
+        detect_repl_continuation_mode("@decorator\nvalue = 1\n"),
+        ReplContinuationMode::Complete
+    );
+    assert_eq!(
+        detect_repl_continuation_mode("@decorator\nclass SearchResult:\n"),
+        ReplContinuationMode::IncompleteBlock
+    );
+    assert_eq!(
+        detect_repl_continuation_mode("@decorator\ndef search():\n"),
+        ReplContinuationMode::IncompleteBlock
+    );
+    assert_eq!(
+        detect_repl_continuation_mode("@decorator\nasync def search():\n"),
+        ReplContinuationMode::IncompleteBlock
+    );
+    assert_eq!(detect_repl_continuation_mode("@\n"), ReplContinuationMode::Complete);
 }
 
 #[test]
