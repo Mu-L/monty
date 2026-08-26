@@ -887,6 +887,9 @@ pub fn detect_repl_continuation_mode(source: &str) -> ReplContinuationMode {
         return ReplContinuationMode::Complete;
     };
     let error_is_at_end = error.location.is_empty() && error.location.start().to_usize() == source.len();
+    let error_source = source
+        .get(error.location.start().to_usize()..error.location.end().to_usize())
+        .unwrap_or_default();
 
     match error.error {
         ParseErrorType::OtherError(msg) => {
@@ -900,7 +903,11 @@ pub fn detect_repl_continuation_mode(source: &str) -> ReplContinuationMode {
                 ReplContinuationMode::Complete
             }
         }
-        ParseErrorType::Lexical(LexicalErrorType::Eof)
+        ParseErrorType::Lexical(
+            LexicalErrorType::Eof
+            | LexicalErrorType::FStringError(InterpolatedStringErrorType::UnterminatedTripleQuotedString)
+            | LexicalErrorType::TStringError(InterpolatedStringErrorType::UnterminatedTripleQuotedString),
+        )
         | ParseErrorType::ExpectedToken {
             found: TokenKind::EndOfFile,
             ..
@@ -909,8 +916,23 @@ pub fn detect_repl_continuation_mode(source: &str) -> ReplContinuationMode {
         | ParseErrorType::TStringError(InterpolatedStringErrorType::UnterminatedTripleQuotedString) => {
             ReplContinuationMode::IncompleteImplicit
         }
+        ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) if starts_with_triple_quote(error_source) => {
+            ReplContinuationMode::IncompleteImplicit
+        }
         _ => ReplContinuationMode::Complete,
     }
+}
+
+fn starts_with_triple_quote(source: &str) -> bool {
+    // Ruff uses `UnclosedStringError` for both single- and triple-quoted plain
+    // strings. Its error range starts at the optional prefix, so the first
+    // quote distinguishes the forms without treating `"unfinished` as input
+    // that should continue.
+    let bytes = source.as_bytes();
+    bytes
+        .iter()
+        .position(|byte| matches!(byte, b'\'' | b'"'))
+        .is_some_and(|quote_start| matches!(bytes.get(quote_start..quote_start + 3), Some(b"'''" | b"\"\"\"")))
 }
 
 // ---------------------------------------------------------------------------

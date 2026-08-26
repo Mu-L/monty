@@ -215,6 +215,31 @@ fn repl_detects_continuation_mode_for_common_cases() {
         detect_repl_continuation_mode("[1,\n"),
         ReplContinuationMode::IncompleteImplicit
     );
+    for source in [
+        "value = '''first line\n",
+        "value = \"\"\"first line\n",
+        "value = r\"\"\"first line\n",
+        "value = b\"\"\"first line\n",
+        "value = f\"\"\"first line\n",
+        "value = t\"\"\"first line\n",
+    ] {
+        assert_eq!(
+            detect_repl_continuation_mode(source),
+            ReplContinuationMode::IncompleteImplicit,
+            "source: {source:?}",
+        );
+    }
+    for source in ["value = 'first line\n", "value = \"first line\n"] {
+        assert_eq!(
+            detect_repl_continuation_mode(source),
+            ReplContinuationMode::Complete,
+            "source: {source:?}",
+        );
+    }
+    assert_eq!(
+        detect_repl_continuation_mode("value = \"\"\"first line\nsecond line\"\"\"\n"),
+        ReplContinuationMode::Complete
+    );
     assert_eq!(
         detect_repl_continuation_mode("@decorator\n"),
         ReplContinuationMode::IncompleteImplicit
