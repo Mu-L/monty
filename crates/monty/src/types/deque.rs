@@ -337,7 +337,8 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
 
     /// `in` walks the deque comparing each item by `==`, like `list`.
     fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let len = self.get(vm.heap).len();
+        let this = self.get(vm.heap);
+        let (len, start_state) = (this.len(), this.state());
         for i in 0..len {
             let el = self
                 .get(vm.heap)
@@ -348,6 +349,11 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
             el.drop_with(vm);
             if eq? {
                 return Ok(Some(true));
+            }
+            // A user `__eq__` mutating the deque invalidates the walk (and the
+            // indices above); CPython raises, checking only after a false compare.
+            if self.get(vm.heap).state() != start_state {
+                return Err(ExcType::runtime_error_deque_mutated());
             }
         }
         Ok(Some(false))
@@ -412,6 +418,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
         if len != other.get(vm.heap).len() {
             return Ok(Some(false));
         }
+        let start_states = states(self, &other, vm);
         // Charge a recursion level: two distinct cyclic deques (`a.append(a);
         // b.append(b); a == b`) re-enter here per level and would otherwise
         // overflow the host stack. A deque walks by index, so it charges directly.
@@ -424,6 +431,12 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
             defer_drop!(b, vm);
             if !a.py_eq(b, vm)? {
                 return Ok(Some(false));
+            }
+            // A user `__eq__` mutating either deque leaves `len` and the indices
+            // above stale. CPython walks both with iterators, which notice on the
+            // step after the comparison — so check here, not before the compare.
+            if states(self, &other, vm) != start_states {
+                return Err(ExcType::runtime_error_deque_mutated());
             }
         }
         Ok(Some(true))
@@ -438,6 +451,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
     fn py_cmp(&self, other: &Self, vm: &mut VM<'h>) -> RunResult<CmpOrder> {
         let self_len = self.get(vm.heap).len();
         let other_len = other.get(vm.heap).len();
+        let start_states = states(self, other, vm);
         let mut guard = vm.recursion_guard()?;
         let vm = &mut *guard;
         for i in 0..self_len.min(other_len) {
@@ -459,6 +473,11 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
                         return Ok(CmpOrder::Incomparable);
                     }
                 }
+            }
+            // Either comparison above can run a user `__eq__`/`__lt__` that
+            // resizes a deque, invalidating the indices — see `py_eq_impl`.
+            if states(self, other, vm) != start_states {
+                return Err(ExcType::runtime_error_deque_mutated());
             }
         }
         // All shared items equal — the shorter deque sorts first.
@@ -580,6 +599,14 @@ impl HeapItem for Deque {
             }
         }
     }
+}
+
+/// Reads both deques' mutation counters, for comparing against a captured pair.
+///
+/// The deque comparisons walk `self` and `other` by index, so a user `__eq__`
+/// resizing *either* one invalidates the walk; both counters must be watched.
+fn states<'h>(a: &HeapObjectRead<'h, Deque>, b: &HeapObjectRead<'h, Deque>, vm: &VM<'h>) -> (u64, u64) {
+    (a.get(vm.heap).state(), b.get(vm.heap).state())
 }
 
 /// Iterates over a deque, raising if it is structurally mutated mid-iteration.
@@ -850,11 +877,20 @@ fn remove<'h>(deque: &mut HeapRead<'h, Deque>, args: ArgValues, vm: &mut VM<'h>)
     let target = args.get_one_arg("deque.remove", vm.heap)?;
     defer_drop!(target, vm);
 
-    let len = deque.get(vm.heap).len();
+    let (len, start_state) = {
+        let this = deque.get(vm.heap);
+        (this.len(), this.state())
+    };
     for i in 0..len {
         let item = deque.get(vm.heap).items[i].clone_with_heap(vm.heap);
         defer_drop!(item, vm);
-        if item.py_eq(target, vm)? {
+        let eq = item.py_eq(target, vm)?;
+        // CPython checks for mutation by the user `__eq__` before acting on the
+        // comparison — even a matching one — and quirkily raises IndexError here.
+        if deque.get(vm.heap).state() != start_state {
+            return Err(ExcType::index_error_deque_mutated());
+        }
+        if eq {
             let this = deque.get_mut(vm.heap);
             let removed = this.items.remove(i).expect("index in range");
             // Only a successful removal bumps: a `remove()` that raises ValueError
@@ -890,11 +926,17 @@ fn index<'h>(deque: &mut HeapRead<'h, Deque>, args: ArgValues, vm: &mut VM<'h>) 
     };
     let stop = bound_arg(stop, len, len, vm)?;
 
+    let start_state = deque.get(vm.heap).state();
     for i in start..stop.min(len) {
         let item = deque.get(vm.heap).items[i].clone_with_heap(vm.heap);
         defer_drop!(item, vm);
         if item.py_eq(target, vm)? {
             return Ok(Value::Int(i64::try_from(i).expect("index fits in i64")));
+        }
+        // A user `__eq__` mutating the deque invalidates the walk; CPython
+        // raises, checking only after a false compare.
+        if deque.get(vm.heap).state() != start_state {
+            return Err(ExcType::runtime_error_deque_mutated());
         }
     }
     Err(ExcType::value_error_deque_index())
@@ -905,13 +947,21 @@ fn count<'h>(deque: &mut HeapRead<'h, Deque>, args: ArgValues, vm: &mut VM<'h>) 
     let target = args.get_one_arg("deque.count", vm.heap)?;
     defer_drop!(target, vm);
 
-    let len = deque.get(vm.heap).len();
+    let (len, start_state) = {
+        let this = deque.get(vm.heap);
+        (this.len(), this.state())
+    };
     let mut total: i64 = 0;
     for i in 0..len {
         let item = deque.get(vm.heap).items[i].clone_with_heap(vm.heap);
         defer_drop!(item, vm);
         if item.py_eq(target, vm)? {
             total += 1;
+        }
+        // A user `__eq__` mutating the deque invalidates the walk; CPython
+        // checks after counting each compare.
+        if deque.get(vm.heap).state() != start_state {
+            return Err(ExcType::runtime_error_deque_mutated());
         }
     }
     Ok(Value::Int(total))
