@@ -52,11 +52,17 @@ test-js: build-js ## Test the JS package (builds the monty binary the workers ru
 	cd crates/monty-js && MONTY_BIN="$${CARGO_TARGET_DIR:-../../target}/debug/monty$(EXE_EXT)" npm test
 
 .PHONY: build-wasm
-build-wasm: install-js ## Build the lean wasm worker module (requires the wasm32-wasip1 target)
+build-wasm: install-js ## Build the WASI 0.2 worker component (requires the wasm32-wasip1 target)
 	cd crates/monty-js && npm run build:wasm && npm run build:ts
 
+.PHONY: check-wasm-types
+check-wasm-types: build-wasm ## Verify checked-in component declarations match the WIT interface
+	git diff --exit-code -- crates/monty-js/ts/worker/component
+	@untracked=$$(git ls-files --others --exclude-standard -- crates/monty-js/ts/worker/component); \
+		test -z "$$untracked" || { echo "Untracked generated component declarations:"; echo "$$untracked"; exit 1; }
+
 .PHONY: test-wasm
-test-wasm: install-js ## Test the wasm worker module from node, with no browser
+test-wasm: install-js ## Test the wasm worker component from node, with no browser
 	cd crates/monty-js && npm run build:wasm && npm run build:ts && npm run test:wasm
 
 .PHONY: test-browser
