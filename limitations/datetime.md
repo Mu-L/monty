@@ -108,14 +108,6 @@ a named zone against — CPython's own `t.utcoffset()` returns `None` there —
 so there is no offset to carry. An aware `datetime` is not affected: it has a
 date, and its zone resolves through `utcoffset(dt)`.
 
-## Type names
-
-`type(t).__name__` is `'datetime.time'`, where CPython gives `'time'`. Monty
-stores one name per type and uses the qualified spelling for `time`, so it
-matches CPython in `repr(datetime.time)` and in every type-naming error
-message and pays only on `__name__`. `datetime` diverges the same way
-(`'datetime.datetime'`); `date` and `timedelta` do not.
-
 ## `timedelta`
 
 Constructor: `timedelta(days=0, seconds=0, microseconds=0, *,

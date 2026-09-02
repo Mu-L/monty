@@ -61,10 +61,17 @@ pub enum Type {
     Float,
     Range,
     Slice,
+    /// The four `datetime` classes are qualified like `collections.deque`:
+    /// this is the `tp_name` CPython gives these C types, so it is the
+    /// spelling its reprs and type-naming error messages use. `__name__`
+    /// reports the bare name, see `dunder_name`.
+    #[strum(serialize = "datetime.date")]
     Date,
     #[strum(serialize = "datetime.datetime")]
     DateTime,
+    #[strum(serialize = "datetime.timedelta")]
     TimeDelta,
+    #[strum(serialize = "datetime.timezone")]
     TimeZone,
     Str,
     Bytes,
@@ -178,8 +185,8 @@ pub enum Type {
     #[strum(serialize = "Field")]
     DataclassField,
     /// `collections.deque` — qualified like `datetime.datetime`/`re.Pattern` so
-    /// the name matches CPython's `repr` and error messages; only `__name__`
-    /// diverges from CPython's bare `'deque'`. See `limitations/collections.md`.
+    /// the name matches CPython's `repr` and error messages; `__name__` reports
+    /// the bare `'deque'`, see `dunder_name`.
     #[strum(serialize = "collections.deque")]
     Deque,
     /// `iter(deque(...))` — CPython's `_collections._deque_iterator`.
@@ -258,6 +265,19 @@ impl Type {
             Self::Instance(class_id) => class_name(class_id, heap, interns),
             Self::Exception(exc_type) => Cow::Borrowed(exc_type.into()),
             other => Cow::Borrowed(other.into()),
+        }
+    }
+
+    /// The name CPython's `__name__` reports: [`name`](Self::name) with any
+    /// module qualifier stripped (`datetime.date` → `date`). CPython keeps one
+    /// dotted `tp_name` per C type and derives the bare `__name__` from it, so
+    /// reprs and error messages qualify where `__name__` does not. Sandbox
+    /// class names ([`Instance`](Self::Instance)) are identifiers, so
+    /// stripping is a no-op for them.
+    pub(crate) fn dunder_name<'i>(self, heap: &Heap, interns: &'i Interns) -> Cow<'i, str> {
+        match self.name(heap, interns) {
+            Cow::Borrowed(name) => Cow::Borrowed(name.rsplit_once('.').map_or(name, |(_, bare)| bare)),
+            owned @ Cow::Owned(_) => owned,
         }
     }
 
