@@ -17,8 +17,9 @@ mod scheduler;
 
 use std::mem;
 
+pub(crate) use attr::PendingLookupEffect;
 pub(crate) use call::CallResult;
-use monty_types::{InvalidInputError, MontyObject, OsFunctionCall, PrintWriter};
+use monty_types::{InvalidInputError, MontyObject, MontyUuid, OsFunctionCall, PrintWriter};
 pub(crate) use recursion::{ContainsVM, RecursionToken};
 use scheduler::Scheduler;
 
@@ -138,7 +139,8 @@ macro_rules! handle_load_result {
 /// - `FramePushed`: Continue with the newly current frame
 /// - `External(ext_id, args)`: Return `FrameExit::ExternalCall` to yield to host
 /// - `OsCall(call)`: Return `FrameExit::OsCall` to yield to host
-/// - `MethodCall(name, args)`: Return `FrameExit::MethodCall` to yield to host
+/// - `MethodCall { .. }`: Return `FrameExit::MethodCall` to yield to host
+/// - `AttrLookup { .. }`: Return `FrameExit::AttrLookup` to yield to host
 /// - `AwaitValue(value)`: Push value, then implicitly await it via `exec_get_awaitable`
 /// - `Err(err)`: Handle the exception via `catch!`
 macro_rules! handle_call_result {
@@ -174,12 +176,28 @@ macro_rules! handle_call_result {
                     effect: Some(effect),
                 });
             }
-            Ok(CallResult::MethodCall(method_name, args)) => {
+            Ok(CallResult::MethodCall { name, args, object_id }) => {
                 let call_id = $self.allocate_call_id();
                 return Ok(FrameExit::MethodCall {
-                    method_name,
+                    method_name: name,
                     args,
                     call_id,
+                    object_id,
+                });
+            }
+            Ok(CallResult::AttrLookup {
+                name,
+                class_name,
+                object_id,
+                type_object,
+                effect,
+            }) => {
+                return Ok(FrameExit::AttrLookup {
+                    name,
+                    class_name,
+                    object_id,
+                    type_object,
+                    effect,
                 });
             }
             Ok(CallResult::AwaitValue(value)) => {
@@ -243,19 +261,44 @@ pub enum FrameExit {
         effect: Option<PendingOsEffect>,
     },
 
-    /// Execution paused for a dataclass method call.
+    /// Execution paused for a host-routed call: a method call on a host
+    /// class instance, or on a host class type (a classmethod, or
+    /// construction — spelled `__call__`).
     ///
-    /// The caller should invoke the method on the original Python dataclass and call
-    /// `resume()` with the result. The `method_name` is the attribute name (e.g.
-    /// `"distance"`) and `args` includes the dataclass instance as the first argument
-    /// (`self`).
+    /// The caller should invoke the method on the original host object
+    /// (routed by the `object_id` uuid) and call `resume()` with the
+    /// result. The receiver is NOT included in `args`.
     MethodCall {
-        /// Method name (e.g., "distance").
+        /// Method name (e.g. "distance", or "__call__" for construction).
         method_name: EitherStr,
-        /// Arguments including the dataclass instance as the first positional arg.
+        /// Arguments for the call (the receiver is not among them).
         args: ArgValues,
         /// Unique ID for this call, used for async correlation.
         call_id: CallId,
+        /// Uuid of the routed receiver (instance or class type).
+        object_id: MontyUuid,
+    },
+
+    /// Execution paused for a lazy attribute lookup on a host-backed object
+    /// (a class instance, or a class type when `type_object` is true).
+    ///
+    /// Produced by `obj.attr` / `Type.attr` (and `getattr()` / `hasattr()`)
+    /// when `attr` is public and missing from the eager attrs. Resumed by
+    /// value like `NameLookup` (no call_id); an "undefined" answer raises
+    /// `AttributeError` naming `class_name` unless `effect` says otherwise.
+    AttrLookup {
+        /// The attribute name being looked up.
+        name: EitherStr,
+        /// Class name for the AttributeError message.
+        class_name: String,
+        /// Uuid of the object whose attribute is read.
+        object_id: MontyUuid,
+        /// True for a lookup on a class type object — selects CPython's
+        /// `type object '...' has no attribute ...` message on failure.
+        type_object: bool,
+        /// How `getattr()` / `hasattr()` consume the answer; `None` for
+        /// `obj.attr`. The only heap reference this exit can carry.
+        effect: Option<PendingLookupEffect>,
     },
 
     /// All tasks are blocked waiting for external futures to resolve.
@@ -298,6 +341,7 @@ impl<C: ContainsHeap> DropWithContext<C> for FrameExit {
                 // Never reached the host, so no `resume` will consume it.
                 release_pending_effect(effect, heap);
             }
+            Self::AttrLookup { effect, .. } => effect.drop_with(heap),
             Self::ResolveFutures(_) | Self::NameLookup { .. } => {}
         }
     }
@@ -599,9 +643,37 @@ pub struct VMSnapshot {
     /// [`VM::pending_os_effect`].
     #[serde(default)]
     pending_os_effect: Option<PendingOsEffect>,
+    /// In-flight resume effect for the paused lazy attribute lookup, if any.
+    /// See [`VM::pending_lookup_effect`].
+    #[serde(default)]
+    pending_lookup_effect: Option<PendingLookupEffect>,
 }
 
 impl VMSnapshot {
+    /// Discards the in-flight execution state of a snapshot that will never be
+    /// restored, releasing every heap reference it holds (operand and exception
+    /// stacks, scheduler tasks, pending resume effects), and returns the globals
+    /// so an abandoned REPL snippet keeps its namespace. Mirrors `VM::drop`.
+    pub(crate) fn abandon(self, heap: &mut Heap) -> Vec<Value> {
+        let Self {
+            stack,
+            globals,
+            exception_stack,
+            mut scheduler,
+            pending_os_effect,
+            pending_lookup_effect,
+            ..
+        } = self;
+        HeapReader::with(heap, &mut (), |heap, ()| {
+            release_pending_effect(pending_os_effect, heap);
+            pending_lookup_effect.drop_with(heap);
+            exception_stack.drop_with(heap);
+            stack.drop_with(heap);
+            scheduler.cleanup(heap);
+        });
+        globals
+    }
+
     /// Number of tasks the scheduler held when this snapshot was taken.
     ///
     /// Test-only bridge for [`crate::ResolveFutures::__live_task_count_for_tests`];
@@ -706,6 +778,12 @@ pub struct VM<'h> {
     /// between OS calls, not within one).
     pub(crate) pending_os_effect: Option<PendingOsEffect>,
 
+    /// How the paused lazy attribute lookup's answer is consumed on `resume`
+    /// (`hasattr()` / `getattr()` default), armed like
+    /// [`pending_os_effect`](Self::pending_os_effect) once the lookup reaches
+    /// the host; `None` for `obj.attr` and when nothing is in flight.
+    pub(crate) pending_lookup_effect: Option<PendingLookupEffect>,
+
     /// Current recursion depth — charged by function-call frames and by nested
     /// data-structure traversals (`repr`/`eq`/`cmp`/`hash`, json, ...).
     ///
@@ -784,6 +862,7 @@ impl<'h> VM<'h> {
             module_code: None,
             json_string_cache: JsonStringCache::default(),
             pending_os_effect: None,
+            pending_lookup_effect: None,
             recursion_depth: 0,
             namespace_scratch: Vec::new(),
             run_reentry_depth: recursion::MAX_RUN_REENTRY_DEPTH,
@@ -859,6 +938,7 @@ impl<'h> VM<'h> {
             ext_function_load_ip: None,
             json_string_cache: JsonStringCache::default(),
             pending_os_effect: snapshot.pending_os_effect,
+            pending_lookup_effect: snapshot.pending_lookup_effect,
             recursion_depth: current_frame_depth,
             namespace_scratch: Vec::new(),
             // Always default value at a restore boundary — see the `run_reentry_depth` field doc.
@@ -911,6 +991,7 @@ impl<'h> VM<'h> {
             instruction_ip: self.instruction_ip,
             scheduler: mem::take(&mut self.scheduler),
             pending_os_effect: self.pending_os_effect.take(),
+            pending_lookup_effect: self.pending_lookup_effect.take(),
         }
     }
 
@@ -2446,6 +2527,7 @@ impl ContainsHeap for VM<'_> {
 impl Drop for VM<'_> {
     fn drop(&mut self) {
         release_pending_effect(self.pending_os_effect.take(), self.heap);
+        self.pending_lookup_effect.take().drop_with(self.heap);
         self.exception_stack.drain(..).drop_with(self.heap);
         self.cleanup_current_task();
         self.scheduler.cleanup(self.heap);

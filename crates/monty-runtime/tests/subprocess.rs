@@ -316,7 +316,7 @@ fn external_function_round_trip() {
         panic!("expected FunctionCall, got {event:?}");
     };
     assert_eq!(call.function_name, "add");
-    assert!(!call.method_call);
+    assert_eq!(call.object_id, None);
     assert_eq!(call.args, vec![MontyObject::Int(1), MontyObject::Int(2)]);
 
     let (_, event) = child.resume_call(call.call_id, pb::ext_function_result::Kind::ReturnValue(int_value(3)));
@@ -339,6 +339,50 @@ fn name_lookup_round_trip() {
     }));
     let (_, event) = child.recv_turn();
     assert_eq!(expect_complete(event), MontyObject::Int(42));
+    child.shutdown();
+}
+
+/// An `error` answer to a name lookup is raised inside the sandbox where the
+/// name was read — catchable there, and reported with a sandbox traceback
+/// when it is not — and the session survives it.
+#[test]
+fn name_lookup_error_raises_in_sandbox() {
+    let mut child = ChildProc::spawn();
+    child.create_repl();
+    let (_, event) = child.feed("try:\n    secret\nexcept PermissionError as e:\n    caught = str(e)\ncaught");
+    let pb::child_event::Kind::NameLookup(lookup) = event else {
+        panic!("expected NameLookup, got {event:?}");
+    };
+    assert_eq!(lookup.name, "secret");
+    let exc = pb::RaisedException {
+        exc_type: "PermissionError".to_owned(),
+        message: Some("secret is off limits".to_owned()),
+        traceback: vec![],
+        data: None,
+    };
+    child.send(pb::parent_request::Kind::ResumeNameLookup(pb::ResumeNameLookup {
+        kind: Some(pb::resume_name_lookup::Kind::Error(exc.clone())),
+    }));
+    let (_, event) = child.recv_turn();
+    assert_eq!(
+        expect_complete(event),
+        MontyObject::String("secret is off limits".to_owned())
+    );
+
+    let (_, event) = child.feed("secret");
+    assert!(matches!(event, pb::child_event::Kind::NameLookup(_)));
+    child.send(pb::parent_request::Kind::ResumeNameLookup(pb::ResumeNameLookup {
+        kind: Some(pb::resume_name_lookup::Kind::Error(exc)),
+    }));
+    let (_, event) = child.recv_turn();
+    let error = expect_error(event);
+    assert_eq!(error.exc_type, "PermissionError");
+    assert_eq!(error.message.as_deref(), Some("secret is off limits"));
+    assert!(
+        !error.traceback.is_empty(),
+        "the sandbox frame must be on the traceback"
+    );
+    assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2));
     child.shutdown();
 }
 
@@ -602,17 +646,17 @@ fn committing_a_deep_gather_nest_reaches_the_soft_limit() {
 fn large_allocations_are_rejected_before_the_hard_limit() {
     // each case with the allocator usage it should be refused at
     let cases = [
-        ("'x' * 10_000_000", 10_030_889),
-        ("b'x' * 10_000_000", 10_031_021),
-        ("[None] * 1_000_000", 16_031_143),
-        ("2 ** 10_000_000", 10_030_982),
-        ("1 << 10_000_000", 1_280_983),
-        ("('a' * 1000).replace('a', 'b' * 2000)", 2_034_521),
+        ("'x' * 10_000_000", 10_031_137),
+        ("b'x' * 10_000_000", 10_031_269),
+        ("[None] * 1_000_000", 16_031_391),
+        ("2 ** 10_000_000", 10_031_230),
+        ("1 << 10_000_000", 1_281_231),
+        ("('a' * 1000).replace('a', 'b' * 2000)", 2_034_769),
         // Bulk container clones: `+=` preflights the temp clone plus the target
         // growth, `+` preflights each side's clone.
-        ("x = [None] * 40_000\nx += x", 1_951_587),
-        ("t = (None,) * 40_000\nt + t", 1_311_587),
-        ("x = [None] * 40_000\nx.copy()", 1_311_337),
+        ("x = [None] * 40_000\nx += x", 1_951_835),
+        ("t = (None,) * 40_000\nt + t", 1_311_835),
+        ("x = [None] * 40_000\nx.copy()", 1_311_585),
         // A partial re-clones its bound arguments on every call, so that clone
         // is preflighted like any other bulk container copy.
         (
@@ -632,7 +676,7 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
         // `deque.extend` preflights exact-hint iterators up front.
         (
             "from collections import deque\nd = deque()\nd.extend(range(1_000_000))",
-            16_031_723,
+            16_031_971,
         ),
     ];
 

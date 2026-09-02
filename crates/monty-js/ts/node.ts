@@ -3,6 +3,15 @@
 
 export { Monty, type CheckoutOptions, type MontyOptions, type ResourceLimits } from './pool.js'
 export {
+  ClassInstance,
+  ClassType,
+  MontyClassProxy,
+  type AttrPolicy,
+  type BaseWrapperOptions,
+  type ClassInstanceOptions,
+  type ClassTypeOptions,
+} from './classInstance.js'
+export {
   FunctionSnapshot,
   FutureSnapshot,
   MontyComplete,

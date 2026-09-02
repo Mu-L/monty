@@ -19,6 +19,8 @@ from ._monty import (
     FunctionSnapshot,
     FutureSnapshot,
     Monty,
+    MontyClassProxy,
+    MontyClassTypeProxy,
     MontyComplete,
     MontyConversionError,
     MontyCrashedError,
@@ -34,6 +36,7 @@ from ._monty import (
     NameLookupSnapshot,
     __version__,
 )
+from .class_instance import ClassInstance, ClassType
 from .os_access import (
     AbstractFile,
     AbstractOS,
@@ -59,6 +62,9 @@ __all__ = (
     'OsHandler',
     'SyncSnapshot',
     'AsyncSnapshot',
+    # class_instance
+    'ClassInstance',
+    'ClassType',
     # _monty
     '__version__',
     'AsyncMonty',
@@ -68,6 +74,8 @@ __all__ = (
     'CollectString',
     'Frame',
     'Monty',
+    'MontyClassProxy',
+    'MontyClassTypeProxy',
     'MontyConversionError',
     'MontyCrashedError',
     'MontyDisconnectError',

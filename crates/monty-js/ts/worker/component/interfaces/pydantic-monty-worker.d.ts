@@ -62,12 +62,17 @@ export interface FileHandleNode {
   mode: string
   position: bigint
 }
-export interface DataclassNode {
+export interface ClassTypeNode {
   name: string
-  typeId: bigint
-  fieldNames: Array<string>
+  id: string
+  hostDefined: boolean
+  isDataclass: boolean
   attrs: Array<NodePair>
-  frozen: boolean
+}
+export interface ClassInstanceNode {
+  classType: number
+  instanceId: string
+  attrs: Array<NodePair>
 }
 export interface FunctionNode {
   name: string
@@ -100,11 +105,11 @@ export type ValueNode =
   | ValueNodeTimezone
   | ValueNodeException
   | ValueNodeTypeName
-  | ValueNodeInstanceType
+  | ValueNodeClassType
   | ValueNodeBuiltinFunction
   | ValueNodePath
   | ValueNodeFileHandle
-  | ValueNodeDataclass
+  | ValueNodeClassInstance
   | ValueNodeFunction
   | ValueNodeRepr
   | ValueNodeCycle
@@ -193,9 +198,9 @@ export interface ValueNodeTypeName {
   tag: 'type-name'
   val: string
 }
-export interface ValueNodeInstanceType {
-  tag: 'instance-type'
-  val: string
+export interface ValueNodeClassType {
+  tag: 'class-type'
+  val: ClassTypeNode
 }
 export interface ValueNodeBuiltinFunction {
   tag: 'builtin-function'
@@ -209,9 +214,9 @@ export interface ValueNodeFileHandle {
   tag: 'file-handle'
   val: FileHandleNode
 }
-export interface ValueNodeDataclass {
-  tag: 'dataclass'
-  val: DataclassNode
+export interface ValueNodeClassInstance {
+  tag: 'class-instance'
+  val: ClassInstanceNode
 }
 export interface ValueNodeFunction {
   tag: 'function'
@@ -321,13 +326,17 @@ export interface ResumeCallRequest {
   callId: number
   outcome: CallResult
 }
-export type NameLookupResult = NameLookupResultValue | NameLookupResultUndefined
+export type NameLookupResult = NameLookupResultValue | NameLookupResultUndefined | NameLookupResultError
 export interface NameLookupResultValue {
   tag: 'value'
   val: Value
 }
 export interface NameLookupResultUndefined {
   tag: 'undefined'
+}
+export interface NameLookupResultError {
+  tag: 'error'
+  val: RaisedError
 }
 export interface FutureResult {
   callId: number
@@ -398,7 +407,11 @@ export interface FunctionCallEvent {
   args: Array<Value>
   kwargs: Array<ValuePair>
   callId: number
-  methodCall: boolean
+  objectId?: string
+}
+export interface NameLookupEvent {
+  name: string
+  objectId?: string
 }
 export interface OsCallEvent {
   functionName: string
@@ -433,7 +446,7 @@ export interface EventOsCall {
 }
 export interface EventNameLookup {
   tag: 'name-lookup'
-  val: string
+  val: NameLookupEvent
 }
 export interface EventResolveFutures {
   tag: 'resolve-futures'

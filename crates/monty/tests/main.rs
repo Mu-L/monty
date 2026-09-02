@@ -1,5 +1,7 @@
+use std::mem;
+
 use monty::MontyRun;
-use monty_types::{CompileOptions, MontyObject};
+use monty_types::{CompileOptions, DictPairs, MontyClassInstance, MontyClassType, MontyObject, MontyUuid};
 
 /// Test we can reuse exec without borrow checker issues.
 #[test]
@@ -28,22 +30,26 @@ fn test_get_interned_string() {
     assert_eq!(int_value, "foobar");
 }
 
-/// Test that calling a method on a dataclass in standard execution mode
-/// (without iter/external function support) returns a NotImplementedError.
+/// Test that calling a method on a host class instance in standard execution
+/// mode (without iter/external function support) returns a NotImplementedError.
 /// This exercises the `FrameExit::MethodCall` path in `frame_exit_to_object`.
 #[test]
-fn dataclass_method_call_in_standard_mode_errors() {
-    let point = MontyObject::Dataclass {
-        name: "Point".to_string(),
-        type_id: 0,
-        field_names: vec!["x".to_string(), "y".to_string()],
+fn class_instance_method_call_in_standard_mode_errors() {
+    let point = MontyObject::ClassInstance(Box::new(MontyClassInstance {
+        class_type: MontyClassType {
+            name: "Point".to_string(),
+            id: MontyUuid::from_u128(1),
+            host_defined: true,
+            is_dataclass: true,
+            attrs: DictPairs::default(),
+        },
+        instance_id: MontyUuid::from_u128(2),
         attrs: vec![
             (MontyObject::String("x".to_string()), MontyObject::Int(1)),
             (MontyObject::String("y".to_string()), MontyObject::Int(2)),
         ]
         .into(),
-        frozen: true,
-    };
+    }));
 
     let ex = MontyRun::new(
         "point.sum()".to_owned(),
@@ -346,13 +352,70 @@ fn dynamic_type_with_non_string_key_raises_type_error() {
     );
 }
 
-// === Result-conversion reentrancy tests ===
-// Converting a result to `MontyObject` can run a user `__repr__` on nested
-// instances; a `__repr__` that mutates the containing collection must not
-// panic the conversion (children are snapshotted before recursing).
+// === Instance output-conversion tests ===
+// Sandbox-defined class instances convert structurally to `ClassInstance`
+// values: a user `__repr__` never runs during conversion, so it cannot mutate
+// the containing collection. These containers keep all elements, and
+// `Evil.__repr__` never fires.
+
+/// Structured `ClassInstance` a sandbox `Evil()` instance converts to.
+fn evil_instance() -> MontyObject {
+    MontyObject::ClassInstance(Box::new(MontyClassInstance {
+        class_type: MontyClassType {
+            name: "Evil".to_owned(),
+            id: MontyUuid::from_u128(0xE0),
+            host_defined: false,
+            is_dataclass: false,
+            attrs: DictPairs::default(),
+        },
+        instance_id: MontyUuid::from_u128(0xE1),
+        attrs: vec![].into(),
+    }))
+}
+
+/// Replaces the worker-generated (random) class/instance uuids in `obj` with the
+/// deterministic ids [`evil_instance`] uses, so structural comparison works.
+fn normalize_instance_uuids(obj: &mut MontyObject) {
+    match obj {
+        MontyObject::ClassInstance(instance) => {
+            let MontyClassInstance {
+                class_type,
+                instance_id,
+                attrs,
+            } = instance.as_mut();
+            class_type.id = MontyUuid::from_u128(0xE0);
+            *instance_id = MontyUuid::from_u128(0xE1);
+            let pairs = mem::replace(attrs, DictPairs::from(vec![]))
+                .into_iter()
+                .map(|(mut key, mut value)| {
+                    normalize_instance_uuids(&mut key);
+                    normalize_instance_uuids(&mut value);
+                    (key, value)
+                })
+                .collect::<Vec<_>>();
+            *attrs = pairs.into();
+        }
+        MontyObject::List(items)
+        | MontyObject::Tuple(items)
+        | MontyObject::Set(items)
+        | MontyObject::FrozenSet(items) => items.iter_mut().for_each(normalize_instance_uuids),
+        MontyObject::Dict(pairs) => {
+            let normalized = mem::replace(pairs, DictPairs::from(vec![]))
+                .into_iter()
+                .map(|(mut key, mut value)| {
+                    normalize_instance_uuids(&mut key);
+                    normalize_instance_uuids(&mut value);
+                    (key, value)
+                })
+                .collect::<Vec<_>>();
+            *pairs = normalized.into();
+        }
+        _ => {}
+    }
+}
 
 #[test]
-fn output_list_mutated_by_nested_repr() {
+fn output_list_with_nested_instance() {
     let code = "\
 class Evil:
     def __repr__(self):
@@ -362,19 +425,16 @@ class Evil:
 lst = [Evil(), 1, 2]
 lst";
     let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let result = ex.run_no_limits(vec![]).unwrap();
+    let mut result = ex.run_no_limits(vec![]).unwrap();
+    normalize_instance_uuids(&mut result);
     assert_eq!(
         result,
-        MontyObject::List(vec![
-            MontyObject::Repr("evil".to_owned()),
-            MontyObject::Int(1),
-            MontyObject::Int(2),
-        ])
+        MontyObject::List(vec![evil_instance(), MontyObject::Int(1), MontyObject::Int(2)])
     );
 }
 
 #[test]
-fn output_dict_mutated_by_nested_repr() {
+fn output_dict_with_nested_instance() {
     let code = "\
 class Evil:
     def __repr__(self):
@@ -384,15 +444,13 @@ class Evil:
 d = {'k': Evil(), 'a': 1}
 d";
     let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let result = ex.run_no_limits(vec![]).unwrap();
+    let mut result = ex.run_no_limits(vec![]).unwrap();
+    normalize_instance_uuids(&mut result);
     assert_eq!(
         result,
         MontyObject::Dict(
             vec![
-                (
-                    MontyObject::String("k".to_owned()),
-                    MontyObject::Repr("evil".to_owned())
-                ),
+                (MontyObject::String("k".to_owned()), evil_instance()),
                 (MontyObject::String("a".to_owned()), MontyObject::Int(1)),
             ]
             .into()
@@ -401,7 +459,7 @@ d";
 }
 
 #[test]
-fn output_deque_mutated_by_nested_repr() {
+fn output_deque_with_nested_instance() {
     let code = "\
 from collections import deque
 
@@ -413,13 +471,10 @@ class Evil:
 d = deque([Evil(), 1, 2])
 d";
     let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let result = ex.run_no_limits(vec![]).unwrap();
+    let mut result = ex.run_no_limits(vec![]).unwrap();
+    normalize_instance_uuids(&mut result);
     assert_eq!(
         result,
-        MontyObject::List(vec![
-            MontyObject::Repr("evil".to_owned()),
-            MontyObject::Int(1),
-            MontyObject::Int(2),
-        ])
+        MontyObject::List(vec![evil_instance(), MontyObject::Int(1), MontyObject::Int(2)])
     );
 }

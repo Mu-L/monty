@@ -13,8 +13,8 @@ use std::{
 use monty_fs::{MountCallOutcome, MountMode, MountRoot, MountTable, OverlayState};
 use monty_proto::{FrameError, PROTOCOL_VERSION, exceeds_max_value_depth, pb, validate_requirement};
 use monty_types::{
-    AssertMessageAnnotations, ExcType, MONTY_VERSION, MontyException, MontyObject, OsFunctionCall, PrintStream,
-    ResourceLimits, TypeCheckingConfig,
+    AssertMessageAnnotations, ExcType, MONTY_VERSION, MontyException, MontyObject, MontyUuid, NameLookupResult,
+    OsFunctionCall, PrintStream, ResourceLimits, TypeCheckingConfig,
 };
 use tokio::{task::spawn_blocking, time::timeout};
 
@@ -146,14 +146,16 @@ pub enum MountSpecMode {
 #[derive(Debug)]
 pub enum TurnEvent {
     /// The sandbox called an external function — answer with
-    /// [`Checkout::resume`]. When `method_call` is true this is a dataclass
-    /// method call and the instance is the first argument.
+    /// [`Checkout::resume`]. When `object_id` is set this is a method call on
+    /// a host-backed object, routed by uuid — a class instance, or a class
+    /// type (a classmethod call, or construction of a host class, which is
+    /// spelled `__call__`); the receiver is NOT included in `args`.
     FunctionCall {
         function_name: String,
         args: Vec<MontyObject>,
         kwargs: Vec<(MontyObject, MontyObject)>,
         call_id: u32,
-        method_call: bool,
+        object_id: Option<MontyUuid>,
     },
     /// The sandbox performed an OS operation (e.g. `"Path.read_text"`).
     /// Answer it from this feed's mounts with
@@ -167,9 +169,13 @@ pub enum TurnEvent {
         kwargs: Vec<(MontyObject, MontyObject)>,
         call_id: u32,
     },
-    /// The sandbox read an undefined name — answer with
-    /// [`Checkout::resume_name_lookup`].
-    NameLookup { name: String },
+    /// The sandbox read an undefined name, or — when `object_id` is set — a
+    /// lazy attribute on the host-backed object with that uuid (a class
+    /// instance, or a class type) — answer with
+    /// [`Checkout::resume_name_lookup`]. An `Undefined` (or `None`) answer
+    /// raises `NameError` for plain lookups, `AttributeError` for attribute
+    /// lookups; an `Error` answer raises the host's exception in the sandbox.
+    NameLookup { name: String, object_id: Option<MontyUuid> },
     /// Every sandbox task is blocked on external futures — answer with
     /// [`Checkout::resume_futures`].
     ResolveFutures { pending_call_ids: Vec<u32> },
@@ -548,23 +554,30 @@ impl Checkout {
         }
     }
 
-    /// Answers a [`TurnEvent::NameLookup`]: `Some(value)` resolves the name,
-    /// `None` makes the sandbox raise `NameError`.
+    /// Answers a [`TurnEvent::NameLookup`] with a [`NameLookupResult`] (or a
+    /// `MontyObject`, an `Option<MontyObject>` where `None` is `Undefined`, or
+    /// a `MontyException` for `Error`): a value resolves the name; `Undefined`
+    /// makes the sandbox raise `NameError` for a plain lookup, or
+    /// `AttributeError` when the lookup carried an `object_id` (a lazy
+    /// attribute on a host-backed object — a class instance or class type);
+    /// `Error` raises the host's exception in the sandbox, bypassing
+    /// `hasattr()` / `getattr()` defaults the way a raising property does.
     pub async fn resume_name_lookup(
         &mut self,
-        value: Option<MontyObject>,
+        result: impl Into<NameLookupResult>,
         on_print: OnPrint<'_>,
     ) -> Result<TurnEvent, PoolError> {
         self.ensure_ready()?;
         if !matches!(self.pending, Some(Pending::NameLookup)) {
             return Err(PoolError::Protocol("no suspended name lookup to resume".into()));
         }
-        if let Some(obj) = &value {
-            ensure_sendable([obj])?;
-        }
-        let kind = match value {
-            Some(obj) => pb::resume_name_lookup::Kind::Value(obj.into()),
-            None => pb::resume_name_lookup::Kind::Undefined(pb::Unit {}),
+        let kind = match result.into() {
+            NameLookupResult::Value(obj) => {
+                ensure_sendable([&obj])?;
+                pb::resume_name_lookup::Kind::Value(obj.into())
+            }
+            NameLookupResult::Undefined => pb::resume_name_lookup::Kind::Undefined(pb::Unit {}),
+            NameLookupResult::Error(exc) => pb::resume_name_lookup::Kind::Error((&exc).into()),
         };
         let request = request(pb::parent_request::Kind::ResumeNameLookup(pb::ResumeNameLookup {
             kind: Some(kind),
@@ -1016,7 +1029,7 @@ impl Checkout {
                             args: call.args,
                             kwargs: call.kwargs,
                             call_id: call.call_id,
-                            method_call: call.method_call,
+                            object_id: call.object_id,
                         })
                     });
                 }
@@ -1055,8 +1068,22 @@ impl Checkout {
                     }));
                 }
                 Some(pb::child_event::Kind::NameLookup(lookup)) => {
+                    // Frames from the child are untrusted — a malformed uuid
+                    // is a protocol violation, not a panic.
+                    let object_id = match lookup.object_id {
+                        None => None,
+                        Some(uuid) => match MontyUuid::try_from_slice(&uuid.data) {
+                            Some(uuid) => Some(uuid),
+                            None => {
+                                return Err(self.protocol_violation("NameLookup.object_id is not a 16-byte uuid"));
+                            }
+                        },
+                    };
                     self.pending = Some(Pending::NameLookup);
-                    return Ok(ControlEvent::Turn(TurnEvent::NameLookup { name: lookup.name }));
+                    return Ok(ControlEvent::Turn(TurnEvent::NameLookup {
+                        name: lookup.name,
+                        object_id,
+                    }));
                 }
                 Some(pb::child_event::Kind::ResolveFutures(futures)) => {
                     self.pending = Some(Pending::Futures);

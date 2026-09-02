@@ -12,7 +12,7 @@ use monty_proto::{
     DEFAULT_MAX_DECODE_BYTES, FrameError, MAX_FRAME_LEN, PROTOCOL_VERSION, exceeds_max_frame_len, pb,
     worker::{Child, EventSink, HandleOutcome, protocol_violation},
 };
-use monty_types::{ExcType, MONTY_VERSION, MontyException, MontyObject, OsFunctionCall};
+use monty_types::{ExcType, MONTY_VERSION, MontyException, MontyObject, MontyUuid, OsFunctionCall};
 
 #[expect(
     clippy::same_length_and_capacity,
@@ -25,8 +25,8 @@ mod bindings {
 mod value;
 
 use bindings::exports::pydantic::monty::worker::{
-    CallResult, ConfigureRequest, DispatchResult, Event, FunctionCallEvent, Guest, NameLookupResult, OsCallEvent,
-    PrintEvent, RaisedException, Request, StackFrame, Status, TypeCheckFormat, ValuePair,
+    CallResult, ConfigureRequest, DispatchResult, Event, FunctionCallEvent, Guest, NameLookupEvent, NameLookupResult,
+    OsCallEvent, PrintEvent, RaisedError, RaisedException, Request, StackFrame, Status, TypeCheckFormat, ValuePair,
 };
 
 thread_local! {
@@ -260,6 +260,9 @@ fn request_from_component(request: Request) -> Result<pb::ParentRequest, String>
                     pb::resume_name_lookup::Kind::Value(value::from_component(value, &mut budget)?.into())
                 }
                 NameLookupResult::Undefined => pb::resume_name_lookup::Kind::Undefined(pb::Unit {}),
+                NameLookupResult::Error(error) => {
+                    pb::resume_name_lookup::Kind::Error(raised_exception_from_component(error))
+                }
             };
             pb::parent_request::Kind::ResumeNameLookup(pb::ResumeNameLookup { kind: Some(kind) })
         }
@@ -328,17 +331,23 @@ fn call_result_from_component(
         CallResult::ReturnValue(value) => {
             pb::ext_function_result::Kind::ReturnValue(value::from_component(value, budget)?.into())
         }
-        CallResult::Error(error) => pb::ext_function_result::Kind::Error(pb::RaisedException {
-            exc_type: error.exc_type,
-            message: Some(error.message),
-            traceback: vec![],
-            data: None,
-        }),
+        CallResult::Error(error) => pb::ext_function_result::Kind::Error(raised_exception_from_component(error)),
         CallResult::PendingFuture(call_id) => pb::ext_function_result::Kind::Future(call_id),
         CallResult::NotFound(name) => pb::ext_function_result::Kind::NotFound(name),
         CallResult::NotHandled => pb::ext_function_result::Kind::NotHandled(pb::Unit {}),
     };
     Ok(pb::ExtFunctionResult { kind: Some(kind) })
+}
+
+/// Converts a host-raised error into the protocol's exception message; the
+/// host supplies no traceback or structured data.
+fn raised_exception_from_component(error: RaisedError) -> pb::RaisedException {
+    pb::RaisedException {
+        exc_type: error.exc_type,
+        message: Some(error.message),
+        traceback: vec![],
+        data: None,
+    }
 }
 
 /// Converts one child event into its semantic component representation.
@@ -348,22 +357,32 @@ fn event_from_proto(event: pb::ChildEvent) -> Event {
             stderr: print.stream == i32::from(pb::PrintStream::Stderr),
             text: print.text,
         }),
-        Some(pb::child_event::Kind::FunctionCall(call)) => Event::FunctionCall(FunctionCallEvent {
-            function_name: call.function_name,
-            args: call.args.into_iter().map(value::into_component).collect(),
-            kwargs: call
-                .kwargs
-                .into_iter()
-                .map(|(key, value)| ValuePair {
-                    key: value::into_component(key),
-                    value: value::into_component(value),
-                })
-                .collect(),
-            call_id: call.call_id,
-            method_call: call.method_call,
-        }),
+        Some(pb::child_event::Kind::FunctionCall(call)) => {
+            let object_id = call.object_id.map(|uuid| uuid.to_string());
+            Event::FunctionCall(FunctionCallEvent {
+                function_name: call.function_name,
+                args: call.args.into_iter().map(value::into_component).collect(),
+                kwargs: call
+                    .kwargs
+                    .into_iter()
+                    .map(|(key, value)| ValuePair {
+                        key: value::into_component(key),
+                        value: value::into_component(value),
+                    })
+                    .collect(),
+                call_id: call.call_id,
+                object_id,
+            })
+        }
         Some(pb::child_event::Kind::OsCall(_)) => invalid_event("OsCall event bypassed component budget preparation"),
-        Some(pb::child_event::Kind::NameLookup(lookup)) => Event::NameLookup(lookup.name),
+        Some(pb::child_event::Kind::NameLookup(lookup)) => Event::NameLookup(NameLookupEvent {
+            name: lookup.name,
+            // Self-produced by this worker, so always a valid 16-byte uuid.
+            object_id: lookup
+                .object_id
+                .and_then(|uuid| MontyUuid::try_from_slice(&uuid.data))
+                .map(|uuid| uuid.to_string()),
+        }),
         Some(pb::child_event::Kind::ResolveFutures(futures)) => Event::ResolveFutures(futures.pending_call_ids),
         Some(pb::child_event::Kind::Complete(complete)) => complete
             .value

@@ -20,6 +20,7 @@ use crate::{
     file_mode::FileMode,
     format::{FormatFloat, StringRepr, bytes_repr_fmt, format_offset_timedelta_repr, string_repr_fmt},
     resource::ResourceError,
+    uuid::MontyUuid,
 };
 
 /// An owned Python value exchanged between Monty and its host.
@@ -121,23 +122,10 @@ pub enum MontyObject {
     Path(String),
     /// An open file object (the result of `open()`).
     FileHandle(MontyFileHandle),
-    /// A dataclass instance with class name, field names, attributes, and mutability.
-    ///
-    /// Method calls are detected lazily at runtime: when `call_attr` is invoked
-    /// on a dataclass and the attribute name is not found in `attrs`, it is
-    /// dispatched as a `MethodCall` to the host (provided the name is public).
-    Dataclass {
-        /// The class name (e.g., "Point", "User").
-        name: String,
-        /// Identifier of the type, from `id(type(dc))` in python.
-        type_id: u64,
-        /// Declared field names in definition order (for repr).
-        field_names: Vec<String>,
-        /// All attribute name -> value mapping (includes fields and extra attrs).
-        attrs: DictPairs,
-        /// Whether this dataclass instance is immutable.
-        frozen: bool,
-    },
+    /// A class instance crossing the sandbox boundary (see [`MontyClassInstance`]).
+    /// Boxed: the payload is larger than every other variant and would grow
+    /// `MontyObject` (and so every container element) otherwise.
+    ClassInstance(Box<MontyClassInstance>),
     /// An external function provided by the host.
     ///
     /// Returned by the host in response to a `NameLookup` to provide a callable
@@ -211,9 +199,11 @@ impl MontyObject {
     /// Shallow host footprint of a freshly decoded `obj`: the fixed [`MontyObject`]
     /// size plus any leaf payload it owns *directly* (string/bytes/bigint bytes, and
     /// the `Vec<String>` field names of structured values, which aren't themselves
-    /// `MontyObject`s and would otherwise be uncharged). Container elements are
-    /// excluded — each charges its own size via `monty-proto`'s `decode_field`, so a list charges
-    /// 88 bytes here.
+    /// `MontyObject`s and would otherwise be uncharged). Boxed payloads
+    /// (`ClassInstance`, `Type(Instance)`) charge their heap allocation plus the
+    /// class name; their eager attrs are charged like container elements.
+    /// Container elements are excluded — each charges its own size via
+    /// `monty-proto`'s `decode_field`, so a list charges `size_of::<MontyObject>()` here.
     pub fn host_size(&self) -> usize {
         let names_len =
             |names: &[String]| -> usize { names.iter().map(|value| Self::host_metadata_string_size(value)).sum() };
@@ -232,11 +222,11 @@ impl MontyObject {
             Self::NamedTuple {
                 type_name, field_names, ..
             } => type_name.len() + names_len(field_names),
-            Self::Dataclass { name, field_names, .. } => name.len() + names_len(field_names),
-            // A `Type::Instance` carries the resolved class name as an owned leaf
-            // `String` (the other `MontyType`s are payload-free), so charge it here
-            // like the `String`/`Function`/... names above.
-            Self::Type(MontyType::Instance(name)) => name.len(),
+            // The boxed payloads live outside `size_of::<Self>()`, so charge the
+            // box itself plus the owned class name; the other `MontyType`s are
+            // payload-free.
+            Self::ClassInstance(instance) => size_of::<MontyClassInstance>() + instance.class_type.name.len(),
+            Self::Type(MontyType::Instance(class_type)) => size_of::<MontyClassType>() + class_type.name.len(),
             // The temporal values each carry an owned timezone name, which is
             // caller-supplied and unbounded — the rest of their fields are scalars.
             Self::DateTime(dt) => name_len(&dt.timezone_name),
@@ -263,16 +253,27 @@ impl MontyObject {
                     size = size.saturating_add(item.deep_host_size());
                 }
             }
-            Self::Dict(pairs) | Self::Dataclass { attrs: pairs, .. } => {
-                for (key, value) in pairs {
-                    size = size
-                        .saturating_add(key.deep_host_size())
-                        .saturating_add(value.deep_host_size());
-                }
+            Self::Dict(pairs) => size = size.saturating_add(Self::pairs_deep_host_size(pairs)),
+            // An instance carries its eager attrs and its class's eager attrs.
+            Self::ClassInstance(instance) => {
+                size = size
+                    .saturating_add(Self::pairs_deep_host_size(&instance.attrs))
+                    .saturating_add(Self::pairs_deep_host_size(&instance.class_type.attrs));
+            }
+            Self::Type(MontyType::Instance(class_type)) => {
+                size = size.saturating_add(Self::pairs_deep_host_size(&class_type.attrs));
             }
             _ => {}
         }
         size
+    }
+
+    /// Sum of [`Self::deep_host_size`] over every key and value of `pairs`.
+    fn pairs_deep_host_size(pairs: &DictPairs) -> usize {
+        pairs.iter().fold(0usize, |size, (key, value)| {
+            size.saturating_add(key.deep_host_size())
+                .saturating_add(value.deep_host_size())
+        })
     }
 
     /// Returns the Python `repr()` string for this value.
@@ -489,31 +490,22 @@ impl MontyObject {
                 }
                 f.write_char(')')
             }
-            Self::Dataclass {
-                name,
-                field_names,
-                attrs,
-                ..
-            } => {
-                // Format: ClassName(field1=value1, field2=value2, ...)
-                // Only declared fields are shown, not extra attributes
-                f.write_str(name)?;
+            Self::ClassInstance(instance) => {
+                // Format: ClassName(attr1=value1, attr2=value2, ...) over the
+                // eager attrs in order. Non-string keys are defensive: inputs
+                // are host-built, so render them via repr rather than panic.
+                f.write_str(&instance.class_type.name)?;
                 f.write_char('(')?;
-                let mut first = true;
-                for field_name in field_names {
-                    if !first {
+                for (i, (key, value)) in instance.attrs.iter().enumerate() {
+                    if i > 0 {
                         f.write_str(", ")?;
                     }
-                    first = false;
-                    f.write_str(field_name)?;
-                    f.write_char('=')?;
-                    // Look up value in attrs
-                    let key = Self::String(field_name.clone());
-                    if let Some(value) = attrs.iter().find(|(k, _)| k == &key).map(|(_, v)| v) {
-                        value.repr_fmt(f)?;
-                    } else {
-                        f.write_str("<?>")?;
+                    match key {
+                        Self::String(key) => f.write_str(key)?,
+                        other => other.repr_fmt(f)?,
                     }
+                    f.write_char('=')?;
+                    value.repr_fmt(f)?;
                 }
                 f.write_char(')')
             }
@@ -561,7 +553,7 @@ impl MontyObject {
             Self::Exception { .. } => true,
             Self::Path(_) => true,           // Path instances are always truthy
             Self::FileHandle { .. } => true, // File objects are always truthy
-            Self::Dataclass { .. } => true,  // Dataclass instances are always truthy
+            Self::ClassInstance(_) => true,  // class instances are always truthy
             Self::Type(_) | Self::BuiltinFunction(_) | Self::Function { .. } | Self::Repr(_) | Self::Cycle(_, _) => {
                 true
             }
@@ -570,9 +562,10 @@ impl MontyObject {
 
     /// Returns the Python type name for this value (e.g., `"int"`, `"str"`, `"list"`).
     ///
-    /// These are the same names returned by Python's `type(x).__name__`.
+    /// These are the same names returned by Python's `type(x).__name__`; a
+    /// class instance reports its class name (`"Point"`).
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub fn type_name(&self) -> &str {
         match self {
             Self::None => "NoneType",
             Self::Ellipsis => "ellipsis",
@@ -596,7 +589,7 @@ impl MontyObject {
             Self::Exception { .. } => "Exception",
             Self::Path(_) => "PosixPath",
             Self::FileHandle(handle) => handle.mode.type_name(),
-            Self::Dataclass { .. } => "dataclass",
+            Self::ClassInstance(instance) => &instance.class_type.name,
             Self::Type(_) => "type",
             Self::BuiltinFunction(_) => "builtin_function_or_method",
             Self::Function { .. } => "function",
@@ -702,28 +695,7 @@ impl PartialEq for MontyObject {
                     arg: b_arg,
                 },
             ) => a_type == b_type && a_arg == b_arg,
-            (
-                Self::Dataclass {
-                    name: a_name,
-                    type_id: a_type_id,
-                    field_names: a_field_names,
-                    attrs: a_attrs,
-                    frozen: a_frozen,
-                },
-                Self::Dataclass {
-                    name: b_name,
-                    type_id: b_type_id,
-                    field_names: b_field_names,
-                    attrs: b_attrs,
-                    frozen: b_frozen,
-                },
-            ) => {
-                a_name == b_name
-                    && a_type_id == b_type_id
-                    && a_field_names == b_field_names
-                    && a_attrs == b_attrs
-                    && a_frozen == b_frozen
-            }
+            (Self::ClassInstance(a), Self::ClassInstance(b)) => a == b,
             (Self::Path(a), Self::Path(b)) => a == b,
             (
                 Self::FileHandle(MontyFileHandle {
@@ -765,17 +737,65 @@ impl AsRef<Self> for MontyObject {
     }
 }
 
+/// A class instance crossing the sandbox boundary — the payload of
+/// [`MontyObject::ClassInstance`].
+///
+/// Host-backed instances carry a host-generated uuid as `instance_id`, so
+/// method calls and lazy attribute lookups on names missing from `attrs`
+/// suspend back to the host, routed by that id (public names only).
+/// Sandbox-defined instances carry a worker-generated uuid instead; either
+/// way the id never encodes a memory address.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MontyClassInstance {
+    /// The instance's class (never a builtin type).
+    pub class_type: MontyClassType,
+    /// Identity of the instance, generated by whichever side defined it.
+    pub instance_id: MontyUuid,
+    /// Eagerly-sent attribute name -> value mapping, in order.
+    pub attrs: DictPairs,
+}
+
+/// A non-builtin class type object crossing the sandbox boundary — the
+/// payload of [`MontyType::Instance`] and the class half of
+/// [`MontyClassInstance`].
+///
+/// `id` is generated by whichever side defined the class (host uuid4, or a
+/// worker uuid for sandbox classes); the sandbox keys its single type object
+/// per class on it and routes instantiation and classmethod calls by it. It
+/// never encodes an address. `PartialEq` compares every field, `attrs`
+/// included, not just `id`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MontyClassType {
+    /// The Python-visible class name (e.g. `"Point"`).
+    pub name: String,
+    /// Identity of the class, generated by whichever side defined it.
+    pub id: MontyUuid,
+    /// True for a host-defined class (wire origin `HOST`); false for a
+    /// sandbox-defined class (`SANDBOX`). Informational: the sandbox resolves
+    /// `id` against its live objects either way, and consults this only to
+    /// reject a sandbox id it no longer knows. Builtins never use `MontyClassType`.
+    pub host_defined: bool,
+    /// Whether `dataclasses.is_dataclass` is true for the class.
+    pub is_dataclass: bool,
+    /// Class attributes sent eagerly with the type object (class constants,
+    /// per the sending wrapper's policy), on every crossing of the class as a
+    /// value or as the type branch of an instance. The sandbox keeps one type
+    /// object per class id: a non-empty set replaces its attrs, an empty set
+    /// (no policy, or a type crossing out) leaves them unchanged.
+    pub attrs: DictPairs,
+}
+
 /// The Python type of a value at the host boundary — the public mirror of the
 /// internal runtime `Type` enum.
 ///
 /// Where the runtime `Type::Instance` carries a transient heap id, the public
-/// [`MontyType::Instance`] carries the *resolved class name* as an owned
-/// `String`, so a `MontyType` is always self-contained: it can be serialized,
+/// [`MontyType::Instance`] carries the resolved [`MontyClassType`] (name, uuid,
+/// flags), so a `MontyType` is always self-contained: it can be serialized,
 /// sent over the subprocess wire protocol, and displayed without heap access.
 ///
-/// `Instance` is output-only: a class binding cannot be reconstructed from a
-/// name, so passing `MontyType::Instance` as an *input* is rejected with an
-/// [`InvalidInputError`] (see [`MontyObject`] input conversion).
+/// A *sandbox* class type is output-only: its class binding cannot be
+/// reconstructed host-side, so passing one back as an input is rejected with
+/// an [`InvalidInputError`]. Host class types round-trip.
 #[derive(
     Debug,
     Clone,
@@ -833,14 +853,15 @@ pub enum MontyType {
     DictValues,
     Set,
     FrozenSet,
-    Dataclass,
-    /// An instance of a sandbox-defined class (`class Foo: ...`), carrying the
-    /// resolved class name (e.g. `"Foo"`). Output-only — rejected as an input.
+    /// A non-builtin class type object — a sandbox-defined or host-defined
+    /// class, carrying the resolved [`MontyClassType`] (name, uuid, flags).
+    /// Sandbox class types are output-only (rejected as inputs); host class
+    /// types round-trip.
     ///
     /// `#[strum(disabled)]`: excluded from `EnumIter` (no meaningful default
     /// name; the name round-trip tests iterate the nameable variants only).
     #[strum(disabled)]
-    Instance(String),
+    Instance(Box<MontyClassType>),
     /// Exception types render/parse via `ExcType`'s own strum name
     /// (`"ValueError"`, `"json.JSONDecodeError"`, ...), so this variant is
     /// `#[strum(disabled)]`: [`name`](Self::name) and
@@ -945,7 +966,7 @@ impl MontyType {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Instance(name) => name,
+            Self::Instance(class_type) => &class_type.name,
             Self::Exception(exc_type) => (*exc_type).into(),
             // Every remaining variant is named by strum's `IntoStaticStr`
             // (`Exception`/`Instance` are peeled off above).
@@ -1179,15 +1200,19 @@ impl Hash for MontyTimeZone {
 pub struct ConversionError {
     /// The type name that was expected (e.g., "int", "str").
     pub expected: &'static str,
-    /// The actual type name of the `MontyObject` (e.g., "list", "NoneType").
-    pub actual: &'static str,
+    /// The actual type name of the `MontyObject` (e.g., "list", "NoneType",
+    /// or a class instance's class name).
+    pub actual: String,
 }
 
 impl ConversionError {
     /// Creates a new `ConversionError` with the expected and actual type names.
     #[must_use]
-    pub fn new(expected: &'static str, actual: &'static str) -> Self {
-        Self { expected, actual }
+    pub fn new(expected: &'static str, actual: impl Into<String>) -> Self {
+        Self {
+            expected,
+            actual: actual.into(),
+        }
     }
 }
 
@@ -1298,7 +1323,7 @@ impl TryFrom<&MontyObject> for bool {
 ///
 /// Used internally by `MontyObject::Dict` to store dictionary entries while preserving
 /// insertion order. Keys and values are both `MontyObject` instances.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DictPairs(Vec<(MontyObject, MontyObject)>);
 
 impl From<Vec<(MontyObject, MontyObject)>> for DictPairs {
@@ -1343,7 +1368,8 @@ impl DictPairs {
         self.0.is_empty()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &(MontyObject, MontyObject)> {
+    /// Iterates the (key, value) pairs in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = &(MontyObject, MontyObject)> {
         self.0.iter()
     }
 }

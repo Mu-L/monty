@@ -161,8 +161,8 @@ properties that real CPython does not provide, per the caveat above.
   flat node arenas because WIT cannot express recursive types. Every
   `MontyObject` variant round-trips through either representation, with the
   same nesting bound: roughly 48 nested list-like containers, 32 nested dicts,
-  or 24 nested dataclasses. Deeper values fail the turn rather than crossing
-  the boundary.
+  or 24 nested class instances. Deeper values fail the turn rather than
+  crossing the boundary.
 - `Cycle` markers (self-referential containers) can be *received* from a
   worker but are rejected as inputs.
 - A sandbox value with no `MontyObject` equivalent — a class, a class
@@ -376,12 +376,32 @@ properties that real CPython does not provide, per the caveat above.
   dumped (`session.dump()` between feeds vs `snapshot.dump()`); using the wrong
   method raises. Both restore *into* a freshly checked-out worker, so they are
   rejected (`RuntimeError`) after any `feed_run` / `feed_start` / `load_session`
-  / `load_snapshot`, since restoring would otherwise discard work. The dump
-  restores its own `script_name` / limits / type-check state (the `checkout()`
-  config for those is not applied); the dataclass registry from `checkout()` is
-  reused. A *failed* load (wrong dump kind, or a protocol desync) poisons the
-  session: its worker is discarded, so every later feed fails too; the load is
-  not retryable and the caller must check out a fresh session.
+  / `load_snapshot` — restoring would otherwise discard work. The dump restores
+  its own `script_name` / limits / type-check state (the `checkout()` config
+  for those is not applied). The session's class-instance store is host-side
+  and NOT part of the dump: restoring into a fresh session/process starts with
+  an empty store, so a returned host instance becomes a `MontyClassProxy`
+  stand-in (a returned host class, `type(x)` included, a
+  `MontyClassTypeProxy`), a lazy attribute lookup raises `AttributeError`,
+  and a method call on it — as well as a construction or classmethod call on a
+  `ClassType`-granted class — raises `RuntimeError` ("no host object
+  registered for method call '...' (id ...) — the instance store is empty
+  after loading a dump into a fresh session").
+- **The class-instance store retains every wrapper sent into the sandbox until
+  the session ends** — that retention is what makes method routing and
+  original-object return work, and it is not covered by the sandbox's
+  `max_memory` (it is host memory). Re-sending the same instance overwrites
+  its entry (last wrapper's policy wins), but distinct instances accumulate:
+  a `convert_value` override that wraps a fresh object per method call grows
+  the store by one entry per call — as does every sandbox-driven construction
+  of an `init=True` `ClassType` — and wrappers registered during a feed that
+  later fails conversion are kept too. Long-running sessions exposing
+  object-returning methods or instantiable classes should bound what they
+  hand out (or recycle sessions periodically); the store has no built-in
+  entry cap.
+  A *failed* load (wrong dump kind, or a protocol desync) poisons the session
+  — its worker is discarded, so every later feed fails too; the load is not
+  retryable and the caller must check out a fresh session.
 - **`resume` takes no `mount=` or `os=`.** Mounts and the OS fallback are
   fixed for the whole feed (passed to `feed_start` / `load_snapshot`), and a
   plain `resume(...)` answers only the call in hand, consulting neither.
@@ -418,10 +438,6 @@ a napi-rs binding over `monty-pool`; platform npm packages ship both the native
 addon and the `monty` worker binary. The browser entry point implements the
 same protocol in TypeScript over a WASM worker. Everything above applies, plus:
 
-- **Dataclass method calls are unsupported.** JS has no dataclass registry,
-  so a sandbox call to a method on a host dataclass (`method_call` on the
-  wire) raises `RuntimeError: method calls on host objects are not
-  supported: <name>` instead of dispatching to a host method.
 - **Exception pass-through is by name.** A thrown JS error crosses into the
   sandbox using `error.name` when it matches one of monty's exception types
   (`TypeError`, `ValueError`, `KeyError`, ...); anything else becomes
@@ -437,5 +453,17 @@ same protocol in TypeScript over a WASM worker. Everything above applies, plus:
   `resumeNotHandled`) rather than a result dict; and the sandbox-future
   mechanism is fully caller-driven (`resumeFuture()` then
   `FutureSnapshot.resume([{callId, value}|{callId, error}])`).
+- **Wrapper policies never reach JS object machinery.** `constructor`,
+  `__proto__`, `prototype`, `arguments` and `caller` are refused under every
+  `ClassInstance` / `ClassType` policy, explicit lists included, and members
+  found on `Object.prototype` / `Function.prototype` (`toString`,
+  `hasOwnProperty`, `call`, `bind`, ...) count as absent. A string policy
+  other than `'all'` throws `TypeError` at construction. Keyword arguments
+  reach a host method or constructor as a null-prototype options bag with
+  any `__proto__` key dropped. An explicit `id` option must be a canonical
+  uuid and is stored lowercased. A host class returned from the sandbox
+  resolves to the class object when the session registered it (a `ClassType`
+  input, or the class of a `ClassInstance`), and is otherwise a
+  `{__monty_type__: 'Type', ...}` marker — after `loadSession`, for example.
 - Sessions and pools support `await using` (async disposal) in addition to
   explicit `close()`.

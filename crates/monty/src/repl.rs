@@ -7,7 +7,7 @@
 use std::mem;
 
 use ahash::AHashMap;
-use monty_types::{ExcType, MontyException, MontyObject, OsFunctionCall, PrintWriter, ResourceTracker};
+use monty_types::{ExcType, MontyException, MontyObject, MontyUuid, OsFunctionCall, PrintWriter, ResourceTracker};
 use ruff_python_ast::token::TokenKind;
 use ruff_python_parser::{InterpolatedStringErrorType, LexicalErrorType, ParseErrorType, parse_module};
 
@@ -23,7 +23,10 @@ use crate::{
     name_map::NameMap,
     object_bridge::MontyObjectExt,
     run::{CompileOptions, Executor},
-    run_progress::{ConvertedExit, ExtFunctionResult, ExtFunctionResultExt, NameLookupResult, convert_frame_exit},
+    run_progress::{
+        ConvertedExit, ExtFunctionResult, ExtFunctionResultExt, LookupAnswer, LookupScope, NameLookupResult,
+        convert_frame_exit, resume_lookup,
+    },
     types::tuple::allocate_tuple,
     value::Value,
 };
@@ -353,6 +356,16 @@ impl MontyRepl {
                     loop {
                         run_result = match run_result {
                             Ok(FrameExit::Return(value)) => break Ok(MontyObject::new(value, vm)),
+                            // No host answers inside a host-driven call, so the
+                            // lookup is `Undefined`: `hasattr()` is False,
+                            // `getattr()` yields its default.
+                            Ok(FrameExit::AttrLookup {
+                                effect: Some(effect), ..
+                            }) => {
+                                let value = effect.apply(None, vm);
+                                vm.push(value);
+                                vm.run_external()
+                            }
                             Ok(exit) => {
                                 let error = vm.unsupported_frame_exit("MontyRepl::call_function", exit);
                                 vm.resume_with_exception(error)
@@ -554,7 +567,7 @@ impl ReplProgress {
 // ReplFunctionCall
 // ---------------------------------------------------------------------------
 
-/// REPL execution paused at an external function call or dataclass method call.
+/// REPL execution paused at an external function call or host-class method call.
 ///
 /// Resume with `resume(result, print)` to provide the return value and continue,
 /// or `resume_pending(print)` to push an `ExternalFuture` for async resolution.
@@ -568,8 +581,10 @@ pub struct ReplFunctionCall {
     pub kwargs: Vec<(MontyObject, MontyObject)>,
     /// Unique identifier for this call (used for async correlation).
     pub call_id: u32,
-    /// Whether this is a dataclass method call (first arg is `self`).
-    pub method_call: bool,
+    /// Uuid of the routed receiver — an instance, or a class type (a
+    /// classmethod call, or construction spelled `__call__`); `None` for
+    /// plain external function calls. The receiver is NOT included in `args`.
+    pub object_id: Option<MontyUuid>,
     /// Internal REPL execution snapshot.
     snapshot: ReplSnapshot,
 }
@@ -652,19 +667,20 @@ impl ReplOsCall {
 // ReplNameLookup
 // ---------------------------------------------------------------------------
 
-/// REPL execution paused for an unresolved name lookup.
+/// REPL execution paused for an unresolved name lookup, or — when
+/// [`object_id`](Self::object_id) is set — a lazy attribute lookup on a
+/// host-backed object (a class instance or class type).
 ///
-/// The host should check if the name corresponds to a known external function or
-/// value. Call `resume(result, print)` with the appropriate `NameLookupResult`.
-/// The namespace slot and scope are managed internally.
+/// The host should check if the name corresponds to a known external function,
+/// value, or instance attribute. Call `resume(result, print)` with the
+/// appropriate `NameLookupResult`. The namespace slot and scope are managed
+/// internally.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ReplNameLookup {
     /// The name being looked up.
     pub name: String,
-    /// The namespace slot where the resolved value should be cached.
-    namespace_slot: u16,
-    /// Whether this is a global slot or a local/function slot.
-    is_global: bool,
+    /// Where the resolved value lands (namespace slot or host attribute).
+    scope: LookupScope,
     /// Internal REPL execution snapshot.
     snapshot: ReplSnapshot,
 }
@@ -678,17 +694,22 @@ impl ReplNameLookup {
         self.snapshot.into_repl()
     }
 
+    /// Identity of the receiver for a lazy attribute lookup; `None` for a
+    /// plain global/local name lookup.
+    #[must_use]
+    pub fn object_id(&self) -> Option<MontyUuid> {
+        self.scope.object_id()
+    }
+
     /// Resumes execution after name resolution.
     ///
-    /// Caches the resolved value in the namespace slot before restoring the VM,
-    /// then either pushes the value onto the stack or raises `NameError`.
+    /// For a plain lookup, caches the resolved value in the namespace slot and
+    /// `Undefined` raises `NameError`; for a host attribute lookup (instance
+    /// or class type) the value is pushed uncached and `Undefined` raises
+    /// `AttributeError`. `Error` raises the host's exception in the sandbox,
+    /// bypassing any `hasattr()` / `getattr()` default.
     pub fn resume(self, result: NameLookupResult, print: PrintWriter<'_>) -> Result<ReplProgress, Box<ReplStartError>> {
-        let Self {
-            name,
-            namespace_slot,
-            is_global,
-            snapshot,
-        } = self;
+        let Self { name, scope, snapshot } = self;
 
         let ReplSnapshot {
             mut repl,
@@ -696,64 +717,34 @@ impl ReplNameLookup {
             vm_state,
         } = snapshot;
 
-        match HeapReader::with(&mut repl.heap, &mut (&executor, print), |reader, (executor, print)| {
-            // Restore the VM first, then convert inside its lifetime
-            let mut vm = VM::restore(
-                vm_state,
-                &executor.module_code,
-                reader,
-                &executor.interns,
-                print.reborrow(),
-                executor.assert_repr_max_bytes,
-            );
+        let (converted, vm_state) =
+            HeapReader::with(&mut repl.heap, &mut (&executor, print), |reader, (executor, print)| {
+                // Restore the VM first, then convert inside its lifetime
+                let mut vm = VM::restore(
+                    vm_state,
+                    &executor.module_code,
+                    reader,
+                    &executor.interns,
+                    print.reborrow(),
+                    executor.assert_repr_max_bytes,
+                );
 
-            // Resolve the name lookup result with the VM alive
-            let vm_result = match result {
-                NameLookupResult::Value(obj) => {
-                    let value = match obj.to_value(&mut vm) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            repl.globals = vm.take_globals();
-                            return Err(MontyException::runtime_error(format!(
-                                "invalid name lookup result: {e}"
-                            )));
-                        }
-                    };
+                // Resolve the name lookup result with the VM alive
+                let answer = LookupAnswer::new(result, &mut vm);
+                let effect = vm.pending_lookup_effect.take();
+                let vm_result = resume_lookup(&mut vm, answer, effect, &scope, &name);
 
-                    // Cache the resolved value in the appropriate slot
-                    let slot_idx = namespace_slot as usize;
-                    let cloned = value.clone_with_heap(&vm);
-                    let slot = if is_global {
-                        &mut vm.globals[slot_idx]
-                    } else {
-                        let stack_base = vm.current_stack_base();
-                        &mut vm.stack[stack_base + slot_idx]
-                    };
-                    let old = mem::replace(slot, cloned);
-                    old.drop_with(&mut vm);
-
-                    vm.push(value);
-                    vm.run_external()
-                }
-                NameLookupResult::Undefined => {
-                    let err: RunError = ExcType::name_error(&name).into();
-                    vm.resume_with_exception(err)
-                }
-            };
-
-            // Convert while VM alive, then snapshot or reclaim globals
-            let converted = convert_frame_exit(vm_result, &mut vm);
-            let vm_state = if converted.needs_snapshot() {
-                Some(vm.snapshot())
-            } else {
-                repl.globals = vm.take_globals();
-                None
-            };
-            Ok((converted, vm_state))
-        }) {
-            Ok((converted, vm_state)) => build_repl_progress(converted, vm_state, executor, repl),
-            Err(error) => Err(Box::new(ReplStartError { repl, error })),
-        }
+                // Convert while VM alive, then snapshot or reclaim globals
+                let converted = convert_frame_exit(vm_result, &mut vm);
+                let vm_state = if converted.needs_snapshot() {
+                    Some(vm.snapshot())
+                } else {
+                    repl.globals = vm.take_globals();
+                    None
+                };
+                (converted, vm_state)
+            });
+        build_repl_progress(converted, vm_state, executor, repl)
     }
 }
 
@@ -782,11 +773,12 @@ impl ReplResolveFutures {
     /// As with the other REPL snapshot types, globals live inside the VM
     /// snapshot while execution is suspended. Recovering the REPL for a
     /// cancelled or abandoned async snippet must put those globals back so
-    /// previously defined REPL bindings remain available.
+    /// previously defined REPL bindings remain available, and releases the
+    /// suspended tasks and stack so nothing leaks into the session heap.
     #[must_use]
     pub fn into_repl(self) -> MontyRepl {
         let Self { mut repl, vm_state, .. } = self;
-        repl.globals = vm_state.globals;
+        repl.globals = vm_state.abandon(&mut repl.heap);
         repl
     }
 
@@ -960,12 +952,12 @@ pub(crate) struct ReplSnapshot {
 impl ReplSnapshot {
     /// Extracts the REPL session, restoring globals from the VM snapshot.
     ///
-    /// When a snapshot is taken, globals live inside the `VMSnapshot`.
-    /// This method creates an empty snapshot from just the globals so the REPL
-    /// can be used for further snippets.
+    /// When a snapshot is taken, globals live inside the `VMSnapshot`; the rest
+    /// of the in-flight state is released so the abandoned snippet leaks nothing
+    /// into the session heap.
     fn into_repl(self) -> MontyRepl {
         let Self { mut repl, vm_state, .. } = self;
-        repl.globals = vm_state.globals;
+        repl.globals = vm_state.abandon(&mut repl.heap);
         repl
     }
 
@@ -1084,13 +1076,13 @@ fn build_repl_progress(
             args,
             kwargs,
             call_id,
-            method_call,
+            object_id,
         } => Ok(ReplProgress::FunctionCall(ReplFunctionCall {
             function_name,
             args,
             kwargs,
             call_id,
-            method_call,
+            object_id,
             snapshot: new_repl_snapshot!(),
         })),
         ConvertedExit::OsCall { function_call, call_id } => Ok(ReplProgress::OsCall(ReplOsCall {
@@ -1104,14 +1096,9 @@ fn build_repl_progress(
             vm_state: vm_state.expect("snapshot should exist for ResolveFutures"),
             pending_call_ids,
         })),
-        ConvertedExit::NameLookup {
+        ConvertedExit::NameLookup { name, scope } => Ok(ReplProgress::NameLookup(ReplNameLookup {
             name,
-            namespace_slot,
-            is_global,
-        } => Ok(ReplProgress::NameLookup(ReplNameLookup {
-            name,
-            namespace_slot,
-            is_global,
+            scope,
             snapshot: new_repl_snapshot!(),
         })),
         ConvertedExit::Error(err) => {

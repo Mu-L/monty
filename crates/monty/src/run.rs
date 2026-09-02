@@ -10,7 +10,7 @@ use ruff_python_stdlib::identifiers::is_identifier;
 
 use crate::{
     bytecode::{Code, CodeBuilder, Compiler, FrameExit, Opcode, VM},
-    exception_private::{ExcTypeExt, RunResult},
+    exception_private::{ExcTypeExt, RunError, RunResult},
     heap::{DropWithContext, Heap, HeapReader},
     intern::{InternerBuilder, Interns, StringId},
     name_map::NameMap,
@@ -18,7 +18,9 @@ use crate::{
     object_bridge::MontyObjectExt,
     parse::{CodeRange, parse, parse_with_interner},
     prepare::{prepare, prepare_with_existing_names},
-    run_progress::{RunProgress, build_run_progress, check_snapshot_from_converted, convert_frame_exit},
+    run_progress::{
+        RunProgress, answer_unserved_lookups, build_run_progress, check_snapshot_from_converted, convert_frame_exit,
+    },
     types::str::StringRepr,
     value::Value,
 };
@@ -444,25 +446,21 @@ impl Executor {
 
     /// Runs module code on an already-configured VM to completion.
     ///
-    /// Executes [`VM::run_module`], then handles `NameLookup` and `ExternalCall`
-    /// exits by raising `NameError` through the VM so tracebacks are properly
-    /// captured. Finally converts the result via [`frame_exit_to_object`].
+    /// Executes [`VM::run_module`], then answers the lookup and `ExternalCall`
+    /// exits no host will serve by raising `NameError` / `AttributeError`
+    /// through the VM so tracebacks are properly captured. Finally converts
+    /// the result via [`frame_exit_to_object`].
     ///
     /// This is the shared non-iterative execution core used by both the standard
     /// `run` path and the REPL's `feed_run` path.
     pub(crate) fn run_to_completion<'h>(&'h self, vm: &mut VM<'h>) -> RunResult<MontyObject> {
         let mut frame_exit_result = vm.run_module();
 
-        // Handle NameLookup and ExternalCall exits by raising NameError through the VM
-        // so that traceback information is properly captured. In the non-iterative path,
-        // there's no host to resolve names or external functions, so these become NameErrors.
+        // In the non-iterative path there's no host to resolve names, lazy
+        // attributes or external functions, so lookups are answered `Undefined`
+        // and a called external function is an undefined name.
         loop {
-            match frame_exit_result {
-                Ok(FrameExit::NameLookup { name_id, .. }) => {
-                    let name = self.interns.get_str(name_id);
-                    let err = ExcType::name_error(name);
-                    frame_exit_result = vm.resume_with_exception(err.into());
-                }
+            match answer_unserved_lookups(frame_exit_result, vm) {
                 Ok(FrameExit::ExternalCall {
                     function_name,
                     args,
@@ -524,7 +522,9 @@ impl Executor {
                 executor.assert_repr_max_bytes,
             );
             executor.populate_inputs(inputs, &mut vm)?;
-            let frame_exit_result = vm.run_module();
+            // Lookups are answered before the globals are taken below: an
+            // armed `hasattr()` / `getattr()` effect runs the module on.
+            let frame_exit_result = answer_unserved_lookups(vm.run_module(), &mut vm);
 
             // Tasks the module left running (a sibling detached from a failed
             // gather, say) hold real references, and are not reachable from
@@ -616,37 +616,42 @@ impl Executor {
 
 /// Converts module/frame exit results into plain `MontyObject` outputs.
 ///
-/// Used by non-iterative execution paths where suspendable outcomes (external calls,
-/// name lookups) are not supported and should produce errors.
+/// Used by non-iterative execution paths: lookups are answered as no host
+/// would (see [`answer_unserved_lookups`]) and the remaining suspendable
+/// outcomes (external calls, futures) produce errors.
 pub(crate) fn frame_exit_to_object(frame_exit_result: RunResult<FrameExit>, vm: &mut VM<'_>) -> RunResult<MontyObject> {
     // Suspensions this path cannot service. The error is built from a borrow
     // so one `drop_with` releases whatever the exit owns, fields added later
     // included.
-    let exit = match frame_exit_result? {
+    let exit = match answer_unserved_lookups(frame_exit_result, vm)? {
         FrameExit::Return(return_value) => return Ok(MontyObject::new(return_value, vm)),
         exit => exit,
     };
-    let error = match &exit {
+    let error: RunError = match &exit {
         FrameExit::Return(_) => unreachable!("returns are handled above"),
         FrameExit::ExternalCall { function_name, .. } => {
             let function_name = function_name.as_str(vm.interns);
             ExcType::not_implemented(format!(
                 "External function '{function_name}' not implemented with standard execution"
             ))
+            .into()
         }
         FrameExit::OsCall { function_call, .. } => ExcType::not_implemented(format!(
             "OS function '{}' not implemented with standard execution",
             function_call.name()
-        )),
+        ))
+        .into(),
         FrameExit::MethodCall { method_name, .. } => {
             let name = method_name.as_str(vm.interns);
-            ExcType::not_implemented(format!("Method call '{name}' not implemented with standard execution"))
+            ExcType::not_implemented(format!("Method call '{name}' not implemented with standard execution")).into()
         }
-        FrameExit::ResolveFutures(_) => ExcType::not_implemented("async futures not supported by standard execution."),
-        FrameExit::NameLookup { name_id, .. } => ExcType::name_error(vm.interns.get_str(*name_id)),
+        FrameExit::ResolveFutures(_) => {
+            ExcType::not_implemented("async futures not supported by standard execution.").into()
+        }
+        FrameExit::NameLookup { .. } | FrameExit::AttrLookup { .. } => unreachable!("lookups are answered above"),
     };
     exit.drop_with(vm);
-    Err(error.into())
+    Err(error)
 }
 
 /// Output from `run_ref_counts` containing reference count and heap information.
