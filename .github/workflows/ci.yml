@@ -531,7 +531,7 @@ jobs:
   # pages never need committing here. The docs-update dispatch then rebuilds
   # the site; with no source pin it resolves monty to the branch tip.
   publish-docs:
-    needs: [check]
+    needs: [check, inspect-python-assets]
     if: success() && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
