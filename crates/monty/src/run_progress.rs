@@ -191,6 +191,11 @@ impl FunctionCall {
     pub fn resume_pending(self, print: PrintWriter<'_>) -> Result<RunProgress, MontyException> {
         self.snapshot.run(ExtFunctionResult::Future(self.call_id), print)
     }
+
+    /// Aborts the feed with an uncatchable exception; see [`OsCall::abort`].
+    pub fn abort(self, exc: MontyException, print: PrintWriter<'_>) -> Result<RunProgress, MontyException> {
+        self.snapshot.abort(exc, print)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +259,14 @@ impl OsCall {
     ) -> Result<RunProgress, MontyException> {
         let result = handler(self.function_call);
         self.snapshot.run(result, print)
+    }
+
+    /// Ends the feed by raising `exc` uncatchably at the suspended call.
+    ///
+    /// The exception builds a traceback but bypasses sandbox handlers. Pending
+    /// file effects roll back. Always returns `Err`.
+    pub fn abort(self, exc: MontyException, print: PrintWriter<'_>) -> Result<RunProgress, MontyException> {
+        self.snapshot.abort(exc, print)
     }
 
     /// Returns the resource tracker while execution is suspended.
@@ -345,6 +358,11 @@ impl NameLookup {
     #[must_use]
     pub fn tracker(&self) -> &ResourceTracker {
         &self.snapshot.heap.tracker
+    }
+
+    /// Aborts the feed with an uncatchable exception; see [`OsCall::abort`].
+    pub fn abort(self, exc: MontyException, print: PrintWriter<'_>) -> Result<RunProgress, MontyException> {
+        self.snapshot.abort(exc, print)
     }
 
     /// Resumes execution after name resolution.
@@ -590,6 +608,17 @@ impl ResolveFutures {
         &self.heap.tracker
     }
 
+    /// Aborts with an uncatchable exception and abandons pending futures.
+    pub fn abort(self, exc: MontyException, print: PrintWriter<'_>) -> Result<RunProgress, MontyException> {
+        let Self {
+            executor,
+            vm_state,
+            heap,
+            ..
+        } = self;
+        abort_restored(executor, vm_state, heap, exc, print)
+    }
+
     /// Forces a GC cycle against the exact root walk used by the live VM.
     ///
     /// This is test-only support for reproducing GC bugs while execution is
@@ -763,6 +792,41 @@ impl Snapshot {
             });
         build_run_progress(converted, vm_state, executor, heap)
     }
+
+    /// Raises `exc` uncatchably at the suspension point.
+    pub(crate) fn abort(self, exc: MontyException, print: PrintWriter<'_>) -> Result<RunProgress, MontyException> {
+        let Self {
+            executor,
+            vm_state,
+            heap,
+        } = self;
+        abort_restored(executor, vm_state, heap, exc, print)
+    }
+}
+
+/// Restores the VM and aborts uncatchably, rolling back any armed OS effect.
+fn abort_restored(
+    executor: Executor,
+    vm_state: VMSnapshot,
+    mut heap: Heap,
+    exc: MontyException,
+    print: PrintWriter<'_>,
+) -> Result<RunProgress, MontyException> {
+    let (converted, vm_state) = HeapReader::with(&mut heap, &mut (&executor, print), |reader, (executor, print)| {
+        let mut vm = VM::restore(
+            vm_state,
+            &executor.module_code,
+            reader,
+            &executor.interns,
+            print.reborrow(),
+            executor.assert_repr_max_bytes,
+        );
+        let vm_result = vm.abort(exc);
+        let converted = convert_frame_exit(vm_result, &mut vm);
+        let vm_state = check_snapshot_from_converted(&converted, vm);
+        (converted, vm_state)
+    });
+    build_run_progress(converted, vm_state, executor, heap)
 }
 
 pub use monty_types::{ExtFunctionResult, NameLookupResult};
