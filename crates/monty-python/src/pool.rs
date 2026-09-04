@@ -173,6 +173,7 @@ impl PyMonty {
         type_check_format = None,
         type_check_color = false,
         assert_message_annotations = AssertAnnotationsArg::default(),
+        print_flush_interval = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn checkout(
@@ -185,6 +186,7 @@ impl PyMonty {
         type_check_format: Option<TypeCheckFormatArg>,
         type_check_color: bool,
         assert_message_annotations: AssertAnnotationsArg,
+        print_flush_interval: Option<f64>,
     ) -> PyResult<PyMontySession> {
         Ok(PyMontySession {
             pool: Arc::clone(&self.pool),
@@ -199,6 +201,7 @@ impl PyMonty {
                     color: type_check_color,
                 },
                 assert_message_annotations,
+                print_flush_interval,
             )?,
             instances: InstanceStore::new(py),
             checkout: Arc::new(AsyncMutex::new(None)),
@@ -545,6 +548,7 @@ impl PyAsyncMonty {
         type_check_format = None,
         type_check_color = false,
         assert_message_annotations = AssertAnnotationsArg::default(),
+        print_flush_interval = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn checkout(
@@ -557,6 +561,7 @@ impl PyAsyncMonty {
         type_check_format: Option<TypeCheckFormatArg>,
         type_check_color: bool,
         assert_message_annotations: AssertAnnotationsArg,
+        print_flush_interval: Option<f64>,
     ) -> PyResult<PyAsyncMontySession> {
         Ok(PyAsyncMontySession {
             pool: Arc::clone(&self.pool),
@@ -571,6 +576,7 @@ impl PyAsyncMonty {
                     color: type_check_color,
                 },
                 assert_message_annotations,
+                print_flush_interval,
             )?,
             instances: InstanceStore::new(py),
             checkout: Arc::new(AsyncMutex::new(None)),
@@ -673,6 +679,7 @@ impl PyAsyncMontyWebsocket {
         type_check_format = None,
         type_check_color = false,
         assert_message_annotations = AssertAnnotationsArg::default(),
+        print_flush_interval = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn checkout(
@@ -685,6 +692,7 @@ impl PyAsyncMontyWebsocket {
         type_check_format: Option<TypeCheckFormatArg>,
         type_check_color: bool,
         assert_message_annotations: AssertAnnotationsArg,
+        print_flush_interval: Option<f64>,
     ) -> PyResult<PyAsyncMontySession> {
         Ok(PyAsyncMontySession {
             pool: Arc::clone(&self.pool),
@@ -699,6 +707,7 @@ impl PyAsyncMontyWebsocket {
                     color: type_check_color,
                 },
                 assert_message_annotations,
+                print_flush_interval,
             )?,
             instances: InstanceStore::new(py),
             checkout: Arc::new(AsyncMutex::new(None)),
@@ -984,8 +993,12 @@ fn parse_pool_config(
     if let Some(max) = max_processes {
         config.max_processes = max;
     }
-    config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
-    config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
+    config.checkout_timeout = checkout_timeout
+        .map(|secs| duration_from_secs("checkout_timeout", secs))
+        .transpose()?;
+    config.request_timeout = request_timeout
+        .map(|secs| duration_from_secs("request_timeout", secs))
+        .transpose()?;
     config.max_checkouts_per_worker = max_checkouts_per_worker;
     config.metrics = pool_metrics();
     Ok(config)
@@ -1101,14 +1114,19 @@ fn parse_websocket_config(
     if let Some(max) = max_processes {
         config.max_processes = max;
     }
-    config.checkout_timeout = checkout_timeout.map(duration_from_secs).transpose()?;
-    config.request_timeout = request_timeout.map(duration_from_secs).transpose()?;
+    config.checkout_timeout = checkout_timeout
+        .map(|secs| duration_from_secs("checkout_timeout", secs))
+        .transpose()?;
+    config.request_timeout = request_timeout
+        .map(|secs| duration_from_secs("request_timeout", secs))
+        .transpose()?;
     config.metrics = pool_metrics();
     Ok(config)
 }
 
 /// Builds the worker-side REPL session config from the (shared) `checkout`
 /// arguments.
+#[expect(clippy::too_many_arguments, reason = "one parameter per checkout argument")]
 pub(crate) fn parse_repl_config(
     py: Python<'_>,
     script_name: &str,
@@ -1117,6 +1135,7 @@ pub(crate) fn parse_repl_config(
     type_check_stubs: Option<&Bound<'_, PyString>>,
     type_check_config: TypeCheckingConfig,
     assert_message_annotations: AssertAnnotationsArg,
+    print_flush_interval: Option<f64>,
 ) -> PyResult<ReplConfig> {
     Ok(ReplConfig {
         script_name: script_name.to_owned(),
@@ -1125,6 +1144,9 @@ pub(crate) fn parse_repl_config(
         type_check_stubs: extract_type_check_stubs(py, type_check_stubs)?,
         type_check_config,
         assert_message_annotations: assert_message_annotations.0,
+        print_flush_interval: print_flush_interval
+            .map(|secs| duration_from_secs("print_flush_interval", secs))
+            .transpose()?,
     })
 }
 
@@ -1804,8 +1826,10 @@ pub(crate) fn pool_err_to_py(py: Python<'_>, err: PoolError) -> PyErr {
     }
 }
 
-fn duration_from_secs(secs: f64) -> PyResult<Duration> {
-    Duration::try_from_secs_f64(secs).map_err(|err| PyValueError::new_err(format!("invalid timeout: {err}")))
+/// Converts a seconds argument to a `Duration`, naming the argument in the
+/// error so a rejected value says which one it was.
+fn duration_from_secs(name: &str, secs: f64) -> PyResult<Duration> {
+    Duration::try_from_secs_f64(secs).map_err(|err| PyValueError::new_err(format!("invalid {name}: {err}")))
 }
 
 /// Locks the shared *pool* slot, ignoring poisoning (a panic elsewhere must
