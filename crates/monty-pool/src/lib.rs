@@ -18,8 +18,8 @@ use monty_types::MontyException;
 use crate::telemetry::Metrics;
 pub use crate::{
     checkout::{
-        Checkout, MountSpec, MountSpecMode, OnPrint, OnRawEvent, PrintFuture, ReplConfig, ResumeValue, TurnEvent,
-        on_print_sync,
+        Checkout, CheckoutOptions, MountSpec, MountSpecMode, OnPrint, OnRawEvent, PrintFuture, ReplConfig, ResumeValue,
+        TurnEvent, on_print_sync,
     },
     pool::Pool,
 };

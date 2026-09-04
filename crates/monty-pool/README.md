@@ -166,7 +166,12 @@ flushing the host exporter.
 - **WebSocket** (`PoolConfig::websocket`) — dial a remote child (or a relay pairing the two
   ends) over `ws://`/`wss://`. These workers are single-use: dialed fresh per checkout,
   never prewarmed or returned to the pool. Isolation is the remote host's responsibility —
-  a remote crash is observed as the connection dropping.
+  a remote crash is observed as the connection dropping. `Pool::checkout_with` takes
+  `CheckoutOptions::connect_headers`, extra headers for that checkout's upgrade request —
+  e.g. a token for a relay in front of the worker. The request carries
+  `User-Agent: monty-pool/<version>`, and with the `telemetry` feature the `traceparent`
+  (and `tracestate`) of `CheckoutOptions::telemetry`, so server-side spans join the
+  caller's trace; a `connect_headers` entry of the same name replaces either.
 
 ## Monty crates
 
