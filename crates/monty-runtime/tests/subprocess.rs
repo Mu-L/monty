@@ -825,6 +825,13 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
         ("s = 'x' * 400_000\n'{0}{0}'.format(s)", 1_231_000),
         ("s = 'x' * 400_000\n'{0:>1000000}'.format(s)", 1_431_791),
         ("s = 'é' * 200_000\n'{0!a}'.format(s)", 1_230_835),
+        // `%` formatting: padding, float digits, integer zero-extension and output growth.
+        ("'%*d' % (2_000_000, 1)", 2_031_460),
+        ("'%.*f' % (1_000_000, 1.0)", 1_160_498),
+        ("'%.*d' % (2_000_000, 1)", 2_031_466),
+        ("s = 'x' * 400_000\n'%s%s' % (s, s)", 1_631_924),
+        ("b'%*d' % (2_000_000, 1)", 2_031_588),
+        ("s = b'x' * 400_000\nb'%s%s' % (s, s)", 1_632_055),
         ("b'x' * 10_000_000", 10_031_269),
         ("[None] * 1_000_000", 16_031_391),
         ("2 ** 10_000_000", 10_031_230),
@@ -874,6 +881,19 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
         assert_eq!(child.feed_complete("1 + 1"), MontyObject::Int(2), "{code}");
         child.shutdown();
     }
+}
+
+/// `inf` and `nan` print as they are, so a huge float precision costs nothing
+/// and must not be charged against the limit.
+#[test]
+fn non_finite_float_precision_is_not_charged() {
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(64 * 1024));
+    assert_eq!(
+        child.feed_complete("'%.2000000000f' % float('inf')"),
+        MontyObject::String("inf".to_owned())
+    );
+    child.shutdown();
 }
 
 /// Announcing a suspension must not cost extra copies of the value being
