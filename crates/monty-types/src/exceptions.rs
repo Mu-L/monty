@@ -23,10 +23,6 @@ pub struct MontyException {
     /// Stack trace of the exception, first is the outermost frame shown first in the traceback
     traceback: Vec<StackFrame>,
     /// Structured payload for exception types that carry more than a message.
-    /// No `skip_serializing_if`: exceptions round-trip through
-    /// non-self-describing snapshot formats where skipped fields break
-    /// deserialization.
-    #[serde(default)]
     data: ExcData,
 }
 
@@ -522,7 +518,7 @@ pub struct UnicodeErrorData {
 #[derive(Debug, Clone, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum UnicodeErrorObject {
     /// A decode error's input `bytes`.
-    Bytes(Vec<u8>),
+    Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
     /// An encode error's input `str`.
     Str(String),
 }
