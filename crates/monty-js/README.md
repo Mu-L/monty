@@ -259,6 +259,23 @@ while (!(snap instanceof MontyComplete)) {
 console.log(snap.output) // 'hello Ada!'
 ```
 
+All three snapshot types expose `position`, a `SourceRange` (`filename`, `start`, `end`) locating the suspending
+expression: the call, the name, or the `await` the main task is blocked on. `start` and `end` are UTF-8 byte offsets
+into the source, `end` exclusive, so slice the encoded source (`new TextEncoder().encode(code)`) rather than the
+string; `filename` is the traceback filename of the source (`<python-input-N>` for the session's N-th feed,
+`<string>` inside `eval()` / `exec()`).
+
+```ts
+import { FunctionSnapshot } from '@pydantic/monty'
+
+const code = 'x = 1\ny = greet(x)'
+const snap = await session.feedStart(code)
+if (snap instanceof FunctionSnapshot) {
+  const { start, end } = snap.position // { filename: '<python-input-0>', start: 10, end: 18 }
+  console.log(new TextDecoder().decode(new TextEncoder().encode(code).subarray(start, end))) // 'greet(x)'
+}
+```
+
 For manual handlers, all three snapshot types expose `traceContext()`, returning an OpenTelemetry `Context`.
 Use the standard OTel API to nest host tracing under the suspension:
 

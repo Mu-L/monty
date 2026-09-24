@@ -213,6 +213,7 @@ test('a suspension answering abort-feed ends the wasm worker', async () => {
       args: new Uint32Array(),
       kwargs: [],
       allowEagerAwait: false,
+      position: { filename: '<python-input-0>', start: 0, end: 7 },
     },
   })
   const requests: string[] = []
