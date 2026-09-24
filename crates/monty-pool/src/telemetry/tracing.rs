@@ -88,6 +88,14 @@ impl Recorder {
         self.adapter_context = Some(context);
     }
 
+    /// Marks the open session span as one resumed on this worker after its
+    /// relay shut down, so a trace shows where the session moved.
+    pub(crate) fn mark_resumed(&mut self) {
+        if let Some(session) = &self.session {
+            session.set_attribute("resumed", true);
+        }
+    }
+
     /// Starts recording one turn; called once the frame is on the wire, so a
     /// rejected oversize frame records nothing.
     pub(crate) fn begin_turn(&mut self, request: &pb::ParentRequest) {
@@ -1107,6 +1115,7 @@ mod tests {
             total_execution_micros: 42,
             max_suspensions: None,
             restored_script_name: None,
+            session_id: None,
             feed_execution_micros: 0,
             max_feed_duration_micros: None,
             max_turn_duration_micros: None,
@@ -1255,6 +1264,7 @@ mod tests {
             total_execution_micros: 42,
             max_suspensions: None,
             restored_script_name: Some("dumped.py".to_owned()),
+            session_id: None,
             feed_execution_micros: 0,
             max_feed_duration_micros: None,
             max_turn_duration_micros: None,
@@ -1308,6 +1318,7 @@ mod tests {
             total_execution_micros: 42,
             max_suspensions: None,
             restored_script_name: Some("restored.py".to_owned()),
+            session_id: None,
             feed_execution_micros: 0,
             max_feed_duration_micros: None,
             max_turn_duration_micros: None,

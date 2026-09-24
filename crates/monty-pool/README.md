@@ -157,12 +157,14 @@ linked SDK or streams raw measurements to the foreign host. Either turns on the 
 pool health
 (`monty.pool.workers.live`, `monty.pool.workers.idle`,
 `monty.pool.workers.suspended`, `monty.pool.checkout.wait`, `monty.pool.worker.terminated`,
-`monty.pool.session.duration`) and per-turn cost (`monty.run.duration`,
+`monty.pool.session.duration`, `monty.pool.session.resumed`) and per-turn cost (`monty.run.duration`,
 `monty.run.execution_time`, `monty.turn.duration`, `monty.run.suspensions`,
 `monty.ext.call.duration`, `monty.snapshot.bytes`, `monty.print.bytes`,
 `monty.wire.frame.bytes`).
 `monty.pool.session.duration` uses `ok` for a clean finish, `error` when the worker is lost, and `abandoned` when a
 live checkout is dropped.
+`monty.pool.session.resumed` counts auto-resume attempts: `ok`, or why the reload failed (`exhausted`,
+`disconnected`, `refused`, `shutdown`, `mismatch`, `timeout`).
 
 Two differences from the spans above. Metrics cover **every** checkout, not only the ones a
 host gave a parent context — an aggregate over traced sessions alone would be misleading —
@@ -204,10 +206,28 @@ input so adapters that do not support metrics continue to work.
 
 A WebSocket connection lost mid-session reports `PoolError::Disconnected`; it cannot distinguish a worker crash
 from a server policy drop.
-A draining server can instead return `PoolError::Shutdown` with an optional session dump.
+A draining server can instead return `PoolError::Shutdown`, naming what to load the session from when it could store
+it.
 The interrupted request did not run, but restoring a suspended dump repeats its host call, which may already have
 had side effects; callbacks used this way should be idempotent.
 A local subprocess claiming shutdown is a protocol violation.
+
+A remote that supports persistence names sessions with an opaque ID, `Checkout::session_id`;
+`ReplConfig::persistence` asks it to store the session or not, and subprocess workers ignore both.
+`Checkout::restore` can accept this ID instead of dump bytes to restore a session's state after a disconnect, whether
+intentional or due to parking from e.g. an idle timeout or a remote restart.
+The remote is free to determine what `Checkout::restore` will do, for example it may lock the existing session to
+other consumers or it may issue a new session.
+A remote without persistence refuses `Checkout::dump` and `Checkout::restore` with `PoolError::Runtime`, and the
+session carries on.
+With `PoolConfig::auto_resume` (the default), a shutdown answering a named session's request is not returned: the
+checkout redials, loads what the `ShutdownDump` named into a new session, re-sends the request and adopts the new
+session's ID.
+The session's host-counted suspension and sleep totals carry over, so a shutdown grants no extra allowance.
+It returns the original `PoolError::Shutdown` if the shutdown named nothing to load, if the new connection fails, or
+if the new session is not in the state the old one was in at the shutdown.
+The redial reuses the checkout's original upgrade headers, so a short-lived token in them can make the resume fail.
+A bare disconnect is never resumed, since the request may have run.
 
 ## Monty crates
 

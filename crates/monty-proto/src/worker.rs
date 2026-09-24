@@ -505,6 +505,8 @@ impl Child {
             print_flush_interval_ms: _,
             // validated and stored when the `Configure` arrived
             os_policy: _,
+            // a relay's concern; the child never stores sessions
+            persistence: _,
         } = *config;
         let limits = limits.unwrap_or_default().into();
         self.script_name = script_name;

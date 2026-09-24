@@ -28,6 +28,10 @@ pub mod worker;
 /// or repurposing a field, changing a field's meaning, or adding one the child
 /// requires. Purely additive changes an older peer can ignore do not need a
 /// bump.
+///
+/// `Configure.persistence` and `ChildEvent.session_id` did not bump it: a
+/// serving relay and its client act on them, children ignore them, and a
+/// child that drops them loses nothing.
 pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Oldest [`PROTOCOL_VERSION`] this build still serves.

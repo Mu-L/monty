@@ -31,8 +31,8 @@ use std::{
 
 use monty_pool::{
     telemetry::{TelemetryAdapterHandle, TelemetryContext},
-    Checkout, CheckoutOptions, MountSpec, MountSpecMode, OnPrint, Pool, PoolConfig, PoolError, PrintFuture, ReplConfig,
-    ResumeValue, TurnEvent,
+    Checkout, CheckoutOptions, MountSpec, MountSpecMode, OnPrint, Persistence, Pool, PoolConfig, PoolError,
+    PrintFuture, ReplConfig, ResumeValue, TurnEvent,
 };
 use monty_types::{
     unstable::{self, NodeId},
@@ -315,6 +315,8 @@ impl NativePool {
                     .map(|ms| duration_from_ms("printFlushInterval", ms))
                     .transpose()?,
                 os_policy,
+                // only a serving relay stores sessions; its default applies
+                persistence: Persistence::ServerDefault,
             },
             checkout: Arc::new(AsyncMutex::new(None)),
         })
