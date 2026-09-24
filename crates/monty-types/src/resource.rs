@@ -31,9 +31,26 @@ use web_time::Instant;
 pub const OOM_EXIT_CODE: i32 = 65;
 /// Allocator-backed live bytes requested through the global allocator
 pub static LIVE_MEMORY: AtomicUsize = AtomicUsize::new(0);
-/// The leanest the process has ever been at an arming point: what the worker
-/// costs to exist, before any session ran.
+/// What the worker costs to exist: the leanest the process has ever been at an
+/// arming point, plus structures it keeps for life (see [`allocate_into_baseline`]).
 pub static BASELINE_MEMORY: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Runs `build` and adds what it leaves allocated to [`BASELINE_MEMORY`], so a
+/// structure the worker keeps for life (the type checker) is not charged to the
+/// session that happened to build it first.
+///
+/// Only accurate while no other thread changes [`LIVE_MEMORY`]. An unset baseline is
+/// left alone: the first arming counts the structure anyway.
+pub fn allocate_into_baseline<T>(build: impl FnOnce() -> T) -> T {
+    let before = LIVE_MEMORY.load(Ordering::Relaxed);
+    let value = build();
+    let cost = LIVE_MEMORY.load(Ordering::Relaxed).saturating_sub(before);
+    // `Err` just means the baseline is still unset
+    let _ = BASELINE_MEMORY.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |baseline| {
+        (baseline != usize::MAX).then(|| baseline.saturating_add(cost))
+    });
+    value
+}
 
 /// Headroom for exception machinery and work between interpreter checkpoints.
 const MEMORY_LIMIT_HEADROOM: usize = 4 * 1024 * 1024;
