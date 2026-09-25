@@ -601,4 +601,7 @@ export interface DispatchResult {
   events: Array<Event>
   maxSuspensions?: bigint
   maxTotalSleepMicros?: bigint
+  feedExecutionMicros: bigint
+  maxFeedDurationMicros?: bigint
+  maxTurnDurationMicros?: bigint
 }

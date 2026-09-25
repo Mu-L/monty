@@ -79,8 +79,7 @@ impl Guest for Component {
             DispatchResult {
                 status: Status::Shutdown,
                 events: vec![Event::FatalError(error.to_owned())],
-                max_suspensions: result.max_suspensions,
-                max_total_sleep_micros: result.max_total_sleep_micros,
+                ..result
             }
         } else {
             result
@@ -100,6 +99,9 @@ fn dispatch(child: &mut Child, request: Request) -> DispatchResult {
                 )))],
                 max_suspensions: None,
                 max_total_sleep_micros: None,
+                feed_execution_micros: 0,
+                max_feed_duration_micros: None,
+                max_turn_duration_micros: None,
             };
         }
     };
@@ -111,6 +113,9 @@ fn dispatch(child: &mut Child, request: Request) -> DispatchResult {
             )))],
             max_suspensions: None,
             max_total_sleep_micros: None,
+            feed_execution_micros: 0,
+            max_feed_duration_micros: None,
+            max_turn_duration_micros: None,
         };
     }
 
@@ -136,6 +141,9 @@ fn dispatch(child: &mut Child, request: Request) -> DispatchResult {
         events: sink.events,
         max_suspensions: None,
         max_total_sleep_micros: None,
+        feed_execution_micros: sink.feed_execution_micros,
+        max_feed_duration_micros: sink.max_feed_duration_micros,
+        max_turn_duration_micros: sink.max_turn_duration_micros,
     }
 }
 
@@ -143,6 +151,9 @@ fn dispatch(child: &mut Child, request: Request) -> DispatchResult {
 #[derive(Default)]
 struct ComponentEventSink {
     events: Vec<Event>,
+    feed_execution_micros: u64,
+    max_feed_duration_micros: Option<u64>,
+    max_turn_duration_micros: Option<u64>,
 }
 
 impl EventSink for ComponentEventSink {
@@ -165,6 +176,9 @@ impl EventSink for ComponentEventSink {
             }
             Ok(())
         } else {
+            self.feed_execution_micros = event.feed_execution_micros;
+            self.max_feed_duration_micros = event.max_feed_duration_micros;
+            self.max_turn_duration_micros = event.max_turn_duration_micros;
             let mut event = event.clone();
             let component_event = match event.kind.take() {
                 Some(pb::child_event::Kind::OsCall(call)) => match PreparedOsEvent::from_proto(call) {
